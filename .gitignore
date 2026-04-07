@@ -1,0 +1,53 @@
+# OS / Editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.coverage
+
+# Node / Frontend
+node_modules/
+dist/
+build/
+
+# Logs / Runtime
+*.log
+logs/
+*.pid
+
+# Archives / Large binaries
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.7z
+*.rar
+*.pdf
+*.xlsx
+*.xls
+
+# Local generated data
+v1-backend/data/
+v1-backend/app/__pycache__/
+
+# JetBrains / Maven / Java
+*.iml
+target/
+out/
+
+# Misc temp
+*.tmp
+*.swp
+*.swo
