@@ -1,0 +1,6 @@
+[Unit]
+Description=IoT Backend Health Check Service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/iot-backend-health.sh
