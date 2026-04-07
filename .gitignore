@@ -51,3 +51,6 @@ out/
 *.tmp
 *.swp
 *.swo
+
+# Local scratch files
+ai.txt
