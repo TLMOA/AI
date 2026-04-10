@@ -45,6 +45,23 @@ header p {
   margin-bottom: 10px;
 }
 
+/* allow form rows to wrap on small widths to avoid controls overlapping */
+.row {
+  flex-wrap: wrap;
+}
+
+/* prevent buttons from shrinking and ensure readable labels */
+.row > button {
+  flex: 0 0 auto;
+  white-space: nowrap;
+}
+
+label {
+  width: 90px;
+  color: var(--muted);
+  flex: 0 0 90px;
+}
+
 label {
   width: 90px;
   color: var(--muted);
@@ -62,6 +79,12 @@ input {
   border-radius: 8px;
   border: 1px solid var(--line);
   padding: 0 10px;
+}
+
+/* flexible inputs/selects to avoid squeezing buttons */
+select, input {
+  min-width: 120px;
+  flex: 0 1 180px;
 }
 
 button {

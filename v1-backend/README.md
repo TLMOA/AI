@@ -48,6 +48,20 @@ NiFi mode environment variables:
 curl http://127.0.0.1:8081/health
 ```
 
+## Large upload note
+
+`/api/v1/upload/inbox_csv` 和相关上传接口在后端本身可以处理 3MB+ 文件；如果浏览器里上传 4MB 左右的 CSV 时报 `TypeError: NetworkError when attempting to fetch resource`，通常不是解析代码问题，而是前面的 nginx / 网关没有放开请求体大小或代理超时。
+
+补充说明：当前这台机器实际运行的是 `docker-nginx-1`，其生效配置里已经是 `client_max_body_size 100M`，`proxy_read_timeout 3600s`，`proxy_send_timeout 3600s`。如果你仍然遇到这个错误，问题更可能在前端访问地址、API_BASE 配置，或别的代理/入口层，而不是这份后端上传代码本身。
+
+可直接在部署机执行：
+
+```bash
+bash ../scripts/apply_nginx_upload_limits.sh
+```
+
+脚本会设置 `client_max_body_size 50M`、`proxy_read_timeout 300s` 和 `proxy_send_timeout 300s`。
+
 ## Implemented APIs
 
 - GET /api/v1/system/executor

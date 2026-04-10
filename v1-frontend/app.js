@@ -414,6 +414,124 @@ async function previewFile(fileId) {
         };
       }
     } else {
+
+  // --- DB export handlers: immediate export and schedule creation ---
+  async function dbTestConn() {
+    const host = document.getElementById('dbHost').value;
+    const port = Number(document.getElementById('dbPort').value || 3306);
+    const database = document.getElementById('dbName').value;
+    const user = document.getElementById('dbUser').value;
+    const password = document.getElementById('dbPassword').value;
+    const cfg = { db_type: 'mysql', driver: 'pymysql', host, port, user, password, database };
+    try {
+      const res = await fetch(`${config.API_BASE}/api/db/test`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(cfg)
+      });
+      const j = await res.json();
+      document.getElementById('dbConnStatus').textContent = j.message || JSON.stringify(j);
+    } catch (e) {
+      document.getElementById('dbConnStatus').textContent = '连接失败: ' + e.message;
+    }
+  }
+
+  async function dbListTables() {
+    const host = document.getElementById('dbHost').value;
+    const port = Number(document.getElementById('dbPort').value || 3306);
+    const database = document.getElementById('dbName').value;
+    const user = document.getElementById('dbUser').value;
+    const password = document.getElementById('dbPassword').value;
+    const cfg = { db_type: 'mysql', driver: 'pymysql', host, port, user, password, database };
+    try {
+      const res = await fetch(`${config.API_BASE}/api/db/list-tables`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(cfg)
+      });
+      const j = await res.json();
+      const sel = document.getElementById('dbTableSelect');
+      sel.innerHTML = '<option value="">-- 先选择 --</option>';
+      if (j && j.tables) {
+        j.tables.forEach(t => {
+          const opt = document.createElement('option'); opt.value = t; opt.textContent = t; sel.appendChild(opt);
+        });
+      }
+    } catch (e) {
+      console.error(e);
+    }
+  }
+
+  async function dbExportImmediate() {
+    const table = document.getElementById('dbTableInput').value || document.getElementById('dbTableSelect').value;
+    if (!table) { document.getElementById('dbExportResult').textContent = '请先选择或输入表名'; return; }
+    const host = document.getElementById('dbHost').value;
+    const port = Number(document.getElementById('dbPort').value || 3306);
+    const database = document.getElementById('dbName').value;
+    const user = document.getElementById('dbUser').value;
+    const password = document.getElementById('dbPassword').value;
+    const format = document.getElementById('dbExportFormat').value || 'CSV';
+    const saveLocation = document.getElementById('dbSaveLocation').value || '';
+    const db_conf = { db_type: 'mysql', driver: 'pymysql', host, port, user, password, database };
+    const job = { owner_id: 'web-user', payload: { table }, db_config: db_conf, file_format: format, destination: { outputDir: saveLocation } };
+    try {
+      const res = await fetch(`${config.API_BASE}/api/export-jobs/trigger`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(job)
+      });
+      const j = await res.json();
+      if (j.ok || j.code === 0) {
+        document.getElementById('dbExportResult').textContent = '导出成功: ' + JSON.stringify(j.data || j);
+      } else {
+        document.getElementById('dbExportResult').textContent = '导出返回: ' + JSON.stringify(j);
+      }
+    } catch (e) {
+      document.getElementById('dbExportResult').textContent = '导出失败: ' + e.message;
+    }
+  }
+
+  async function dbCreateSchedule() {
+    const table = document.getElementById('dbTableInput').value || document.getElementById('dbTableSelect').value;
+    if (!table) { document.getElementById('dbExportResult').textContent = '请先选择或输入表名'; return; }
+    const host = document.getElementById('dbHost').value;
+    const port = Number(document.getElementById('dbPort').value || 3306);
+    const database = document.getElementById('dbName').value;
+    const user = document.getElementById('dbUser').value;
+    const password = document.getElementById('dbPassword').value;
+    const format = document.getElementById('dbExportFormat').value || 'CSV';
+    const freq = document.getElementById('dbFrequencySelect').value || '';
+    const saveLocation = document.getElementById('dbSaveLocation').value || '';
+    if (!freq) { document.getElementById('dbExportResult').textContent = '请选择频率后创建定时任务'; return; }
+    const db_conf = { db_type: 'mysql', driver: 'pymysql', host, port, user, password, database };
+    const payload = { table };
+    const body = {
+      job_name: `export_${database}_${table}`,
+      owner_id: 'web-user',
+      schedule: freq,
+      file_format: format,
+      destination: { outputDir: saveLocation },
+      mode: 'visible',
+      enabled: true,
+      db_config: db_conf,
+      payload,
+    };
+    try {
+      const res = await fetch(`${config.API_BASE}/api/export-jobs`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body)
+      });
+      const j = await res.json();
+      if (j.code === 0 || j.ok) {
+        document.getElementById('dbExportResult').textContent = '创建定时任务成功: ' + JSON.stringify(j.data || j);
+      } else {
+        document.getElementById('dbExportResult').textContent = '创建任务返回: ' + JSON.stringify(j);
+      }
+    } catch (e) {
+      document.getElementById('dbExportResult').textContent = '创建任务失败: ' + e.message;
+    }
+  }
+
+  // attach handlers when DOM ready
+  window.addEventListener('load', () => {
+    const dbTestBtn = document.getElementById('dbTestBtn'); if (dbTestBtn) dbTestBtn.addEventListener('click', dbTestConn);
+    const dbListBtn = document.getElementById('dbListBtn'); if (dbListBtn) dbListBtn.addEventListener('click', dbListTables);
+    const dbExportBtn = document.getElementById('dbExportBtn'); if (dbExportBtn) dbExportBtn.addEventListener('click', dbExportImmediate);
+    const dbScheduleBtn = document.getElementById('dbScheduleBtn'); if (dbScheduleBtn) dbScheduleBtn.addEventListener('click', dbCreateSchedule);
+  });
       editable.style.display = "none";
       state.previewColumns = [];
       state.previewRows = [];

@@ -1,6 +1,7 @@
 import csv
 import json
 import os
+import sys
 import tempfile
 import uuid
 from datetime import datetime
@@ -10,18 +11,35 @@ from typing import Any, Dict, List, Optional
 
 from fastapi import FastAPI, Header, HTTPException, Query, Request, UploadFile, File as UploadFileField
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field, field_validator
 
 
 from .executors import MockExecutor, NiFiExecutor
 from .db_connect import router as db_router
 from . import db_models
+from .export_worker import run_export_job
 import pymysql
 try:
     from zoneinfo import ZoneInfo
 except ImportError:
     from backports.zoneinfo import ZoneInfo
+
+
+    def _init_csv_field_size_limit() -> int:
+        # Python csv 默认字段限制为 131072，较大单列内容会触发解析错误。
+        configured = int(os.getenv("CSV_FIELD_SIZE_LIMIT", "20971520"))
+        limit = max(configured, 131072)
+        while limit >= 131072:
+            try:
+                return csv.field_size_limit(limit)
+            except OverflowError:
+                # 某些平台 C long 上限更小，逐步降低直到可接受范围。
+                limit = limit // 10
+        return csv.field_size_limit(min(sys.maxsize, 131072))
+
+
+    CSV_FIELD_SIZE_LIMIT = _init_csv_field_size_limit()
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 GENERATED_DIR = BASE_DIR / "data" / "generated"
@@ -68,13 +86,6 @@ NIFI_BASE_DIR.mkdir(parents=True, exist_ok=True)
 
 app = FastAPI(title="AI Module V1 Backend", version="0.1.0")
 app.include_router(db_router)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
 
 
 def _operation_from_path(path: str) -> str:
@@ -125,7 +136,27 @@ async def observability_middleware(request: Request, call_next):
                 error_message=str(exc),
                 phase="execute",
             )
-        raise
+        origin = request.headers.get("origin") or "*"
+        return JSONResponse(
+            status_code=500,
+            content=err(5000000, str(exc), trace_id),
+            headers={
+                "Access-Control-Allow-Origin": origin,
+                "Access-Control-Allow-Credentials": "true",
+                "Access-Control-Allow-Methods": "*",
+                "Access-Control-Allow-Headers": "*",
+                "Vary": "Origin",
+            },
+        )
+
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 jobs: Dict[str, Dict[str, Any]] = {}
 files: Dict[str, Dict[str, Any]] = {}
@@ -366,6 +397,154 @@ def create_demo_file(job_id: str, file_format: str = "CSV") -> Dict[str, Any]:
     except Exception:
         pass
     return file_meta
+    
+@app.on_event("startup")
+def _startup():
+    # start background scheduler (no jobs yet)
+    try:
+        start_scheduler()
+    except Exception:
+        pass
+
+@app.on_event("shutdown")
+def _shutdown():
+    try:
+        stop_scheduler()
+    except Exception:
+        pass
+
+
+@app.post("/api/export-jobs/trigger")
+def api_trigger_export(job: Dict[str, Any], request: Request):
+    """Trigger an export job (simple synchronous) - expects job dict in body."""
+    trace_id = make_trace_id(request.headers.get("x-trace-id"))
+    res = run_export_job(job)
+    if res.get("status") == "error":
+        raise HTTPException(status_code=500, detail=res.get("error"))
+    return ok(res, trace_id)
+    
+@app.post("/api/export-jobs")
+def api_create_export(job: Dict[str, Any], request: Request):
+    trace_id = make_trace_id(request.headers.get("x-trace-id"))
+    session = SessionLocal()
+    try:
+        ej = db_models.ExportJobModel(
+            job_name=job.get("job_name") or job.get("name") or "unnamed",
+            owner_id=job.get("owner_id"),
+            schedule=job.get("schedule"),
+            file_format=job.get("file_format", "csv"),
+            destination=job.get("destination", {}),
+            mode=job.get("mode", "visible"),
+            enabled=1 if job.get("enabled") else 0,
+            db_config=job.get("db_config", {}),
+        )
+        session.add(ej)
+        session.commit()
+        session.refresh(ej)
+        # schedule if enabled
+        if ej.enabled and ej.schedule:
+            schedule_job(str(ej.id), ej.schedule, run_export_job, args=[{
+                "id": ej.id,
+                "job_name": ej.job_name,
+                "owner_id": ej.owner_id,
+                "db_config": ej.db_config,
+                "file_format": ej.file_format,
+                "destination": ej.destination,
+            }])
+        return ok({"id": ej.id}, trace_id)
+    finally:
+        session.close()
+
+@app.get("/api/export-jobs")
+def api_list_exports(request: Request):
+    trace_id = make_trace_id(request.headers.get("x-trace-id"))
+    session = SessionLocal()
+    try:
+        rows = session.query(db_models.ExportJobModel).all()
+        out = []
+        for r in rows:
+            out.append({
+                "id": r.id,
+                "job_name": r.job_name,
+                "owner_id": r.owner_id,
+                "schedule": r.schedule,
+                "file_format": r.file_format,
+                "mode": r.mode,
+                "enabled": bool(r.enabled),
+                "created_at": r.created_at.isoformat() if r.created_at else None,
+            })
+        return ok(out, trace_id)
+    finally:
+        session.close()
+
+@app.get("/api/export-jobs/{job_id}")
+def api_get_export(job_id: int, request: Request):
+    trace_id = make_trace_id(request.headers.get("x-trace-id"))
+    session = SessionLocal()
+    try:
+        r = session.query(db_models.ExportJobModel).filter(db_models.ExportJobModel.id == job_id).first()
+        if not r:
+            raise HTTPException(status_code=404, detail="not found")
+        return ok({
+            "id": r.id,
+            "job_name": r.job_name,
+            "owner_id": r.owner_id,
+            "schedule": r.schedule,
+            "file_format": r.file_format,
+            "destination": r.destination,
+            "mode": r.mode,
+            "enabled": bool(r.enabled),
+            "db_config": r.db_config,
+            "last_run": r.last_run.isoformat() if r.last_run else None,
+        }, trace_id)
+    finally:
+        session.close()
+
+@app.patch("/api/export-jobs/{job_id}")
+def api_patch_export(job_id: int, patch: Dict[str, Any], request: Request):
+    trace_id = make_trace_id(request.headers.get("x-trace-id"))
+    session = SessionLocal()
+    try:
+        r = session.query(db_models.ExportJobModel).filter(db_models.ExportJobModel.id == job_id).first()
+        if not r:
+            raise HTTPException(status_code=404, detail="not found")
+        # simple fields
+        for k in ("job_name", "schedule", "file_format", "mode", "destination", "db_config"):
+            if k in patch:
+                setattr(r, k, patch[k])
+        if "enabled" in patch:
+            r.enabled = 1 if patch["enabled"] else 0
+        session.commit()
+        # manage scheduling
+        if r.enabled and r.schedule:
+            schedule_job(str(r.id), r.schedule, run_export_job, args=[{
+                "id": r.id,
+                "job_name": r.job_name,
+                "owner_id": r.owner_id,
+                "db_config": r.db_config,
+                "file_format": r.file_format,
+                "destination": r.destination,
+            }])
+        else:
+            remove_scheduled(str(r.id))
+        return ok({"id": r.id}, trace_id)
+    finally:
+        session.close()
+
+@app.delete("/api/export-jobs/{job_id}")
+def api_delete_export(job_id: int, request: Request):
+    trace_id = make_trace_id(request.headers.get("x-trace-id"))
+    session = SessionLocal()
+    try:
+        r = session.query(db_models.ExportJobModel).filter(db_models.ExportJobModel.id == job_id).first()
+        if not r:
+            raise HTTPException(status_code=404, detail="not found")
+        remove_scheduled(str(r.id))
+        session.delete(r)
+        session.commit()
+        return ok({"deleted": True}, trace_id)
+    finally:
+        session.close()
 
 
 def _write_ndjson(path: Path, columns: List[str], rows: List[Dict[str, Any]], append: bool = False) -> None:
@@ -1149,6 +1328,136 @@ async def upload_file(file: UploadFile = UploadFileField(...)):
     return ok(meta, make_trace_id(None))
 
 
+@app.post("/api/v1/upload")
+async def upload_with_mode(request: Request,
+                           file: UploadFile = UploadFileField(...),
+                           conversionMode: Optional[str] = Query(default="local"),
+                           username: Optional[str] = Query(default="user"),
+                           convertType: Optional[str] = Query(default=None),
+                           columns: Optional[str] = Query(default=None),
+                           x_trace_id: Optional[str] = Header(default=None)):
+    """Unified upload that supports conversionMode: local | nifi | both.
+    For PoC: local mode runs a demo conversion (create_demo_file), nifi mode writes file to inbox and leaves job pending.
+    """
+    trace_id = make_trace_id(x_trace_id or request.state.trace_id)
+    job_id = f"job_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:4]}"
+    job = {
+        "jobId": job_id,
+        "jobType": "UPLOAD",
+        "status": "PENDING",
+        "progress": 0,
+        "source": {"fileName": file.filename},
+        "target": {"format": (Path(file.filename).suffix.lstrip('.') or '').upper()},
+        "errorCode": "",
+        "errorMessage": "",
+        "nifiFlowId": "",
+        "createdAt": now_iso(),
+        "startedAt": None,
+        "finishedAt": None,
+        "outputs": [],
+    }
+    jobs[job_id] = job
+
+    # persist job to DB
+    try:
+        db = SessionLocal()
+        jm = db_models.JobModel(job_id=job_id, job_type=job["jobType"], status=job["status"], progress=job["progress"], payload=job)
+        db.add(jm)
+        db.commit()
+    except Exception:
+        pass
+
+    # save uploaded file to a temp location
+    filename = f"{username}_{uuid.uuid4().hex[:8]}_{file.filename}"
+    content = await file.read()
+    suffix = Path(file.filename or "").suffix.lower()
+    saved_path = GENERATED_DIR / filename
+    saved_path.write_bytes(content)
+    register_existing_file(saved_path, suffix.lstrip('.') or 'file')
+
+    import asyncio
+
+    async def _handle_local(job_id: str, fmt: str):
+        # simulate conversion / processing for PoC
+        job = jobs.get(job_id)
+        if not job:
+            return
+        job["status"] = "PROCESSING"
+        job["startedAt"] = now_iso()
+        try:
+            out_meta = create_demo_file(job_id, file_format=(fmt or "CSV"))
+            job.setdefault("outputs", []).append(out_meta["fileId"])
+            job["status"] = "SUCCEEDED"
+            job["progress"] = 100
+            job["finishedAt"] = now_iso()
+        except Exception as e:
+            job["status"] = "FAILED"
+            job["errorMessage"] = str(e)
+            job["finishedAt"] = now_iso()
+
+    async def _handle_nifi(job_id: str, path: Path):
+        # write to inbox based on suffix so NiFi can pick it up
+        job = jobs.get(job_id)
+        if not job:
+            return
+        job["status"] = "PENDING"
+        job["startedAt"] = now_iso()
+        try:
+            ext = path.suffix.lower()
+            if ext == ".csv":
+                dest = INBOX_CSV_DIR / path.name
+            elif ext == ".json":
+                dest = INBOX_JSON_DIR / path.name
+            elif ext == ".tsv":
+                dest = INBOX_TSV_DIR / path.name
+            else:
+                dest = INBOX_CSV_DIR / path.name
+            dest.write_bytes(path.read_bytes())
+            # register inbox file
+            meta = register_existing_file(dest, _guess_file_format(dest))
+            job.setdefault("nifiFiles", []).append(meta["fileId"])
+            # keep job pending until NiFi calls back
+        except Exception as e:
+            job["status"] = "FAILED"
+            job["errorMessage"] = str(e)
+            job["finishedAt"] = now_iso()
+
+    mode = (conversionMode or "local").lower()
+    fmt = suffix.lstrip('.') or 'csv'
+    if mode in {"local", "both"}:
+        asyncio.create_task(_handle_local(job_id, fmt))
+    if mode in {"nifi", "both"}:
+        asyncio.create_task(_handle_nifi(job_id, saved_path))
+
+    return ok({"jobId": job_id, "status": jobs[job_id]["status"]}, trace_id)
+
+
+@app.post("/api/v1/nifi-callback")
+def nifi_callback(payload: Dict[str, Any], x_trace_id: Optional[str] = Header(default=None)):
+    """NiFi calls this after processing a file to update job status.
+    Expected payload: { jobId, status: 'SUCCEEDED'|'FAILED', filePath, rowCount, traceId }
+    """
+    trace_id = make_trace_id(x_trace_id)
+    job_id = payload.get("jobId")
+    if not job_id or job_id not in jobs:
+        return err(1001404, "job not found", trace_id)
+    job = jobs[job_id]
+    status = payload.get("status", "SUCCEEDED")
+    file_path = payload.get("filePath")
+    row_count = payload.get("rowCount")
+    error = payload.get("errorMessage")
+    if file_path:
+        p = Path(file_path)
+        if p.exists():
+            meta = register_existing_file(p, _guess_file_format(p))
+            job.setdefault("outputs", []).append(meta["fileId"])
+    job["status"] = "SUCCEEDED" if status == "SUCCEEDED" else "FAILED"
+    job["finishedAt"] = now_iso()
+    if error:
+        job["errorMessage"] = error
+    return ok({"jobId": job_id, "status": job["status"]}, trace_id)
+
+
 @app.post("/api/v1/upload/inbox_csv")
 async def upload_inbox_csv(
     request: Request,
@@ -1165,6 +1474,7 @@ async def upload_inbox_csv(
     # register in file index
     meta = register_existing_file(dest, "csv")
     # single conversion route: csv_to_json or csv_to_tsv
+    target_path = ""
     try:
         text = dest.read_text(encoding="utf-8")
         lines = text.splitlines()
@@ -1195,7 +1505,6 @@ async def upload_inbox_csv(
             }
             return err(1002401, "csv has no data rows; if file has no header please provide columns", trace_id)
 
-        target_path = ""
         if rows:
             convert = (convertType or "csv_to_json").lower()
             if convert == "csv_to_tsv":
@@ -1210,8 +1519,17 @@ async def upload_inbox_csv(
                 _write_ndjson(out_path, cols, rows)
                 _register_and_return_meta(out_path, "json")
                 target_path = str(out_path)
-    except Exception:
-        pass
+    except Exception as ex:
+        request.state.observation = {
+            "operation": f"upload_{(convertType or 'csv_to_json').lower()}",
+            "status": "FAILED",
+            "sourcePath": str(dest),
+            "targetPath": target_path,
+            "errorCode": "1002500",
+            "errorMessage": f"csv convert failed: {str(ex)}",
+            "phase": "execute",
+        }
+        return err(1002500, f"csv convert failed: {str(ex)}", trace_id)
     request.state.observation = {
         "operation": f"upload_{(convertType or 'csv_to_json').lower()}",
         "status": "SUCCEEDED",
@@ -1246,8 +1564,8 @@ async def upload_inbox_json(
     dest.write_bytes(content)
     meta = register_existing_file(dest, "json")
     # single conversion route: json_to_csv or json_to_tsv
+    target_path = ""
     try:
-        target_path = ""
         text = dest.read_text(encoding="utf-8")
         lines = text.splitlines()
         objs = []
@@ -1278,8 +1596,17 @@ async def upload_inbox_json(
                 _write_csv(out_path, cols, objs)
                 _register_and_return_meta(out_path, "csv")
                 target_path = str(out_path)
-    except Exception:
-        pass
+    except Exception as ex:
+        request.state.observation = {
+            "operation": f"upload_{(convertType or 'json_to_csv').lower()}",
+            "status": "FAILED",
+            "sourcePath": str(dest),
+            "targetPath": target_path,
+            "errorCode": "1002500",
+            "errorMessage": f"json convert failed: {str(ex)}",
+            "phase": "execute",
+        }
+        return err(1002500, f"json convert failed: {str(ex)}", trace_id)
     request.state.observation = {
         "operation": f"upload_{(convertType or 'json_to_csv').lower()}",
         "status": "SUCCEEDED",
@@ -1315,8 +1642,8 @@ async def upload_inbox_tsv(
     dest.write_bytes(content)
     meta = register_existing_file(dest, "tsv")
     # single conversion route: tsv_to_json or tsv_to_csv
+    target_path = ""
     try:
-        target_path = ""
         lines = dest.read_text(encoding="utf-8").splitlines()
         header = _parse_columns_arg(columns)
         data_lines = lines
@@ -1356,8 +1683,17 @@ async def upload_inbox_tsv(
                 target_path = str(out_path)
         else:
             return err(1002401, "tsv header is empty; please provide columns", trace_id)
-    except Exception:
-        pass
+    except Exception as ex:
+        request.state.observation = {
+            "operation": f"upload_{(convertType or 'tsv_to_json').lower()}",
+            "status": "FAILED",
+            "sourcePath": str(dest),
+            "targetPath": target_path,
+            "errorCode": "1002500",
+            "errorMessage": f"tsv convert failed: {str(ex)}",
+            "phase": "execute",
+        }
+        return err(1002500, f"tsv convert failed: {str(ex)}", trace_id)
     request.state.observation = {
         "operation": f"upload_{(convertType or 'tsv_to_json').lower()}",
         "status": "SUCCEEDED",

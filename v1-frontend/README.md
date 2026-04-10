@@ -4,16 +4,18 @@
 
 ```bash
 cd v1-frontend
-python -m http.server 5174
+python serve.py
 ```
 
 Open: http://127.0.0.1:5174
+
+For other machines on the same LAN, open: `http://202.113.76.55:5174`
 
 ## Config
 
 Edit `config.js`:
 
-- `API_BASE`: backend base url (`http://127.0.0.1:8081/api/v1`)
+- `API_BASE`: backend base url (`/api/v1` by default, proxied by `serve.py`)
 - `USE_MOCK_API`: true to use frontend mock adapter
 
 ## Current pages

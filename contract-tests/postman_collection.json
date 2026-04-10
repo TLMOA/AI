@@ -1,0 +1,109 @@
+{
+  "info": {
+    "_postman_id": "contract-v1-sample",
+    "name": "contract-v1-sample",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "item": [
+    {
+      "name": "POST /api/v1/export/mysql",
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "Content-Type", "value": "application/json" }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"host\": \"127.0.0.1\",\n  \"port\": 3306,\n  \"user\": \"root\",\n  \"password\": \"pwd\",\n  \"db\": \"test\",\n  \"table\": \"sensor\",\n  \"where\": \"1=1\",\n  \"format\": \"CSV\",\n  \"append_to_latest\": false\n}"
+        },
+        "url": {
+          "raw": "{{baseUrl}}/api/v1/export/mysql",
+          "host": ["{{baseUrl}}"],
+          "path": ["api","v1","export","mysql"]
+        }
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "exec": [
+              "pm.test('response has code and traceId', function () {",
+              "  var json = pm.response.json();",
+              "  pm.expect(json).to.have.property('code');",
+              "  pm.expect(json).to.have.property('traceId');",
+              "});"
+            ],
+            "type": "text/javascript"
+          }
+        }
+      ]
+    },
+    {
+      "name": "POST /api/v1/upload/inbox_csv",
+      "request": {
+        "method": "POST",
+        "header": [],
+        "body": {
+          "mode": "formdata",
+          "formdata": [
+            { "key": "file", "type": "file", "src": "" },
+            { "key": "username", "value": "testuser" },
+            { "key": "convertType", "value": "csv_to_json" }
+          ]
+        },
+        "url": {
+          "raw": "{{baseUrl}}/api/v1/upload/inbox_csv?username=testuser&convertType=csv_to_json",
+          "host": ["{{baseUrl}}"],
+          "path": ["api","v1","upload","inbox_csv"]
+        }
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "exec": [
+              "pm.test('upload response has code and data', function () {",
+              "  var json = pm.response.json();",
+              "  pm.expect(json).to.have.property('code');",
+              "  pm.expect(json).to.have.property('data');",
+              "});"
+            ],
+            "type": "text/javascript"
+          }
+        }
+      ]
+    },
+    {
+      "name": "POST /api/v1/tags/manual-table",
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "Content-Type", "value": "application/json" }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"fileId\": \"file_demo\",\n  \"operator\": \"testuser\",\n  \"changes\": [ { \"rowId\": \"1\", \"column\": \"status\", \"value\": \"FAULT\" } ],\n  \"renameColumns\": []\n}"
+        },
+        "url": {
+          "raw": "{{baseUrl}}/api/v1/tags/manual-table",
+          "host": ["{{baseUrl}}"],
+          "path": ["api","v1","tags","manual-table"]
+        }
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "exec": [
+              "pm.test('tags response has code', function () {",
+              "  var json = pm.response.json();",
+              "  pm.expect(json).to.have.property('code');",
+              "});"
+            ],
+            "type": "text/javascript"
+          }
+        }
+      ]
+    }
+  ]
+}

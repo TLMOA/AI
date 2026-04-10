@@ -40,6 +40,22 @@ class TagModel(BASE):
     created_at = Column(DateTime, default=datetime.utcnow)
 
 
+class ExportJobModel(BASE):
+    __tablename__ = "export_jobs"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    job_name = Column(String(128), nullable=False)
+    owner_id = Column(String(64), nullable=True)
+    schedule = Column(String(64), nullable=True)
+    file_format = Column(String(32), default="csv")
+    destination = Column(JSON, default={})
+    mode = Column(String(32), default="visible")
+    enabled = Column(Integer, default=0)
+    last_run = Column(DateTime, nullable=True)
+    status = Column(String(64), nullable=True)
+    db_config = Column(JSON, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
 def get_engine(db_path: Path):
     url = f"sqlite:///{db_path}"
     engine = create_engine(url, connect_args={"check_same_thread": False})

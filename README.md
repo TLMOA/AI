@@ -3,12 +3,19 @@
 本仓库用于 AI 模块 V1 的后端 + 前端联调与验收。
 当前已形成可演示闭环：导出、上传转换、打标、文件预览编辑、可观测日志。
 
+**项目优先级：`智慧平台模块详细开发方案.pdf` 为本仓库最高优先级方案。**
+
 ## 目录说明
 
 - `v1-backend/`：FastAPI 后端
 - `v1-frontend/`：前端页面（静态）
 - `V1执行清单/`：需求、验收、执行记录
+- `V1执行清单nifi/`：V1 阶段 NiFi 统一实施文档与执行清单
 - `test-data/`：测试样例文件（含有表头/无表头 TSV）
+
+## NiFi V1 主文档
+
+- `V1执行清单nifi/V1-NiFi统一实施总方案.md`
 
 ## 快速启动
 
@@ -32,32 +39,24 @@ pip install -r requirements-py38.txt
 
 ```bash
 cd v1-frontend
-python -m http.server 5174
+python serve.py
 ```
 
 打开：`http://127.0.0.1:5174`
 
-## 当前验收状态
+同一局域网其他机器可访问：`http://202.113.76.55:5174`
 
-- 导出链路：CSV / JSON / TSV 通过，where 分流可区分记录数
-- 上传转换链路：6 条转换通过
-- 打标链路：manual-table 通过，产物落 `tagged_output`
-- 可观测：`traceId + STARTED/SUCCEEDED/FAILED + durationMs` 可检索
-- 前端上传结果：已支持三行展示（成功信息、上传路径、转换路径）
+如果前端是通过 nginx 或其他反向代理访问后端，且上传较大 CSV 时出现 `TypeError: NetworkError when attempting to fetch resource`，请先放开上传限制：
 
-详见：`V1执行清单/需求规格-NiFi-文件输出.md`
+```bash
+bash scripts/apply_nginx_upload_limits.sh
+```
+
+该脚本会把 nginx 上传体积限制调大到 50M，并延长代理超时，适合本项目的 CSV/JSON 上传场景。
 
 ## 常用命令
 
 ```bash
-# 查看后端健康
 curl http://127.0.0.1:8081/health
-
-# 查看 git 近期提交
 git log --oneline -n 5
 ```
-
-## GitHub 远程
-
-- 远程仓库：`https://github.com/TLMOA/AI.git`
-- 默认分支：`main`

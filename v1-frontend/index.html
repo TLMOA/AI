@@ -98,7 +98,18 @@
         <select id="dbExportFormat"><option>CSV</option><option>JSON</option><option>TSV</option></select>
         <label>追加到 latest</label>
         <input id="dbAppendLatest" type="checkbox" />
+        <label>频率</label>
+        <select id="dbFrequencySelect">
+          <option value="">立即</option>
+          <option value="5m">5m</option>
+          <option value="15m">15m</option>
+          <option value="1h">1h</option>
+          <option value="daily">每日</option>
+        </select>
+        <label>保存位置</label>
+        <input id="dbSaveLocation" type="text" placeholder="例如 /home/yhz/nifi-data/output_csv" />
         <button id="dbExportBtn">导出并写入 NiFi 输出目录</button>
+        <button id="dbScheduleBtn">创建定时任务</button>
       </div>
       <p id="dbConnStatus"></p>
       <p id="dbExportResult"></p>

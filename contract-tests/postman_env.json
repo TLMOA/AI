@@ -1,0 +1,13 @@
+{
+  "id": "contract-env",
+  "name": "contract-env",
+  "values": [
+    {
+      "key": "baseUrl",
+      "value": "http://localhost:8081",
+      "enabled": true
+n    }
+  ],
+  "timestamp": 0,
+  "synced": false
+}
