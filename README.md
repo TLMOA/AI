@@ -60,3 +60,25 @@ bash scripts/apply_nginx_upload_limits.sh
 curl http://127.0.0.1:8081/health
 git log --oneline -n 5
 ```
+
+## 断电后自动恢复（开机自启）
+
+若希望电脑断电/重启后，前后端服务自动恢复：
+
+```bash
+bash scripts/install_autostart_services.sh
+```
+
+安装后会启用以下 systemd 单元：
+
+- `iot-backend.service`（后端 FastAPI）
+- `iot-frontend.service`（前端静态服务 + `/api/v1` 代理）
+- `iot-backend-health.timer`（后端健康检查定时器）
+
+可用以下命令查看状态：
+
+```bash
+systemctl status iot-backend.service
+systemctl status iot-frontend.service
+systemctl status iot-backend-health.timer
+```

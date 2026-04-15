@@ -1,0 +1,22 @@
+[0;1;34m# /etc/systemd/system/iot-backend.service[0m
+[Unit]
+Description=IoT V1 Backend (FastAPI) - system
+After=network-online.target nifi.service remote-fs.target
+Wants=network-online.target nifi.service remote-fs.target
+# remote-fs.target covers network-mounted filesystems; nifi.service is optional
+# Using Wants/After (not Requires) so startup won't fail if those units are absent.
+
+[Service]
+Type=simple
+User=yhz
+WorkingDirectory=/home/yhz/iot/v1-backend
+ExecStart=/home/yhz/iot/v1-backend/.venv/bin/python -m uvicorn app.main:app --host 127.0.0.1 --port 8081
+Restart=always
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+
+# Optional pre-start wait: allow network and mounts to be ready before binding
+ExecStartPre=/bin/sleep 2
+
+[Install]
+WantedBy=multi-user.target

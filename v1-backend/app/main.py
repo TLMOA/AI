@@ -1,13 +1,14 @@
 import csv
 import json
 import os
+import shutil
 import sys
 import tempfile
 import uuid
 from datetime import datetime
 from pathlib import Path
 from time import perf_counter
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import FastAPI, Header, HTTPException, Query, Request, UploadFile, File as UploadFileField
 from fastapi.middleware.cors import CORSMiddleware
@@ -19,6 +20,8 @@ from .executors import MockExecutor, NiFiExecutor
 from .db_connect import router as db_router
 from . import db_models
 from .export_worker import run_export_job
+from .engine_factory import engine_from_config
+from .scheduler import start_scheduler, stop_scheduler, schedule_job, remove_scheduled
 import pymysql
 try:
     from zoneinfo import ZoneInfo
@@ -73,6 +76,10 @@ CSV_TO_TSV_DIR = Path(os.getenv("CSV_TO_TSV_DIR", "/home/yhz/nifi-data/csv_to_ts
 TSV_TO_CSV_DIR = Path(os.getenv("TSV_TO_CSV_DIR", "/home/yhz/nifi-data/tsv_to_csv"))
 TAGGED_OUTPUT_DIR = Path(os.getenv("TAGGED_OUTPUT_DIR", "/home/yhz/nifi-data/tagged_output"))
 NIFI_BASE_DIR = Path(os.getenv("NIFI_BASE_DIR", "/home/yhz/nifi-data"))
+NIFI_OUTPUT_JSON_DIR = Path(os.getenv("NIFI_OUTPUT_JSON_DIR", "/home/yhz/nifi-data/output_json"))
+IN_DATA_BASE_DIR = Path(os.getenv("IN_DATA_BASE_DIR", "/home/yhz/in_data"))
+DEFAULT_FACTORY_ID = os.getenv("DEFAULT_FACTORY_ID", "factory-001")
+FACTORY_REPORT_FILE = GENERATED_DIR / "factory_reports.ndjson"
 OUTPUT_TSV_DIR.mkdir(parents=True, exist_ok=True)
 INBOX_TSV_DIR.mkdir(parents=True, exist_ok=True)
 CSV_TO_JSON_DIR.mkdir(parents=True, exist_ok=True)
@@ -83,6 +90,8 @@ CSV_TO_TSV_DIR.mkdir(parents=True, exist_ok=True)
 TSV_TO_CSV_DIR.mkdir(parents=True, exist_ok=True)
 TAGGED_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 NIFI_BASE_DIR.mkdir(parents=True, exist_ok=True)
+NIFI_OUTPUT_JSON_DIR.mkdir(parents=True, exist_ok=True)
+IN_DATA_BASE_DIR.mkdir(parents=True, exist_ok=True)
 
 app = FastAPI(title="AI Module V1 Backend", version="0.1.0")
 app.include_router(db_router)
@@ -330,6 +339,212 @@ def _emit_structured_log(
     print(json.dumps(record, ensure_ascii=False, default=str))
 
 
+def _normalize_factory_id(value: Optional[str]) -> str:
+    return (value or "").strip() or DEFAULT_FACTORY_ID
+
+
+def _append_factory_report(report: Dict[str, Any]) -> None:
+    FACTORY_REPORT_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with FACTORY_REPORT_FILE.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(report, ensure_ascii=False, default=str))
+        f.write("\n")
+
+
+def _read_factory_reports() -> List[Dict[str, Any]]:
+    if not FACTORY_REPORT_FILE.exists():
+        return []
+    out: List[Dict[str, Any]] = []
+    with FACTORY_REPORT_FILE.open("r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                out.append(json.loads(line))
+            except Exception:
+                continue
+    return out
+
+
+def _build_export_runtime_payload(row: db_models.ExportJobModel) -> Dict[str, Any]:
+    session = SessionLocal()
+    resolved_db_config: Dict[str, Any] = {}
+    if isinstance(row.db_config, dict):
+        resolved_db_config = dict(row.db_config)
+    try:
+        if getattr(row, "connection_profile_id", None):
+            profile = (
+                session.query(db_models.ConnectionProfileModel)
+                .filter(db_models.ConnectionProfileModel.id == row.connection_profile_id)
+                .first()
+            )
+            if profile and profile.enabled:
+                resolved_db_config = _profile_to_db_config(profile, resolved_db_config)
+    finally:
+        session.close()
+
+    payload = {}
+    if isinstance(resolved_db_config, dict) and resolved_db_config.get("table"):
+        payload = {"table": resolved_db_config.get("table")}
+    return {
+        "id": row.id,
+        "job_name": row.job_name,
+        "factory_id": _normalize_factory_id(row.factory_id),
+        "owner_id": row.owner_id,
+        "db_config": resolved_db_config,
+        "connection_profile_id": getattr(row, "connection_profile_id", None),
+        "file_format": row.file_format,
+        "destination": row.destination,
+        "payload": payload,
+    }
+
+
+def _profile_to_db_config(profile: db_models.ConnectionProfileModel, override: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    cfg: Dict[str, Any] = {}
+    if isinstance(profile.extra, dict):
+        cfg.update(profile.extra)
+
+    cfg.update({
+        "db_type": profile.db_type,
+        "driver": profile.driver,
+        "host": profile.host,
+        "port": profile.port,
+        "database": profile.database,
+        "user": profile.username,
+        "dsn": profile.dsn,
+    })
+
+    # MVP secret resolver: secret_ref can be raw password or JSON string.
+    secret_ref = (profile.secret_ref or "").strip()
+    if secret_ref:
+        try:
+            secret_payload = json.loads(secret_ref)
+            if isinstance(secret_payload, dict):
+                if secret_payload.get("password"):
+                    cfg["password"] = secret_payload.get("password")
+                if secret_payload.get("dsn") and not cfg.get("dsn"):
+                    cfg["dsn"] = secret_payload.get("dsn")
+        except Exception:
+            cfg["password"] = secret_ref
+
+    if isinstance(override, dict):
+        cfg.update({k: v for k, v in override.items() if v not in (None, "")})
+
+    return cfg
+
+
+def _persist_to_in_data(factory_id: str, job_id: int, src_path: str) -> str:
+    """Copy fetched file to local in_data directory and return the persisted path."""
+    if not src_path:
+        return ""
+    src = Path(src_path)
+    if not src.exists() or not src.is_file():
+        return src_path
+    target_dir = IN_DATA_BASE_DIR / factory_id / str(job_id)
+    target_dir.mkdir(parents=True, exist_ok=True)
+    target = target_dir / src.name
+    shutil.copy2(src, target)
+    return str(target)
+
+
+def _collect_local_files(root: Path, source_type: str) -> List[Dict[str, Any]]:
+    if not root.exists() or not root.is_dir():
+        return []
+    out: List[Dict[str, Any]] = []
+    for p in root.rglob("*"):
+        if not p.is_file():
+            continue
+        try:
+            stat = p.stat()
+        except Exception:
+            continue
+        out.append({
+            "name": p.name,
+            "path": str(p),
+            "size": stat.st_size,
+            "format": (_guess_file_format(p) or "FILE").upper(),
+            "sourceType": source_type,
+            "mtime": datetime.fromtimestamp(stat.st_mtime).isoformat(timespec="seconds"),
+            "mtime_ts": stat.st_mtime,
+        })
+    return out
+
+
+def _infer_nifi_source_type(top_level_dir: str) -> str:
+    name = (top_level_dir or "").strip().lower()
+    if name in {"output_csv", "output_json", "output_tsv", "exports"}:
+        return "manual_db_export"
+    if name in {"inbox_csv", "inbox_json", "inbox_tsv"}:
+        return "uploaded_raw"
+    if name in {
+        "csv_to_json",
+        "json_to_csv",
+        "tsv_to_json",
+        "json_to_tsv",
+        "csv_to_tsv",
+        "tsv_to_csv",
+        "tagged_output",
+    }:
+        return "uploaded_converted"
+    return "manual_db_export"
+
+
+def _build_filesystem_tree(root: Path, label: Optional[str] = None, max_depth: int = 6) -> Optional[Dict[str, Any]]:
+    if not root.exists() or not root.is_dir():
+        return None
+
+    def walk(path: Path, depth: int) -> Dict[str, Any]:
+        node = {
+            "name": label if depth == 0 and label else path.name,
+            "path": str(path),
+            "type": "directory",
+            "children": [],
+        }
+        if depth >= max_depth:
+            return node
+        try:
+            entries = sorted(path.iterdir(), key=lambda p: (p.is_file(), p.name.lower()))
+        except Exception:
+            return node
+        for entry in entries:
+            if entry.name.startswith("."):
+                continue
+            if entry.is_dir():
+                node["children"].append(walk(entry, depth + 1))
+        return node
+
+    return walk(root, 0)
+
+
+def _copy_path_to_in_data(src: Path, factory_id: str, base_name: Optional[str] = None) -> List[str]:
+    if not src.exists():
+        raise HTTPException(status_code=404, detail="source path not found")
+    copied: List[str] = []
+    target_base = IN_DATA_BASE_DIR / factory_id
+    target_base.mkdir(parents=True, exist_ok=True)
+
+    if src.is_file():
+        rel_name = base_name or src.name
+        target = target_base / rel_name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, target)
+        copied.append(str(target))
+        return copied
+
+    for file_path in src.rglob("*"):
+        if not file_path.is_file():
+            continue
+        try:
+            rel = file_path.relative_to(src)
+        except Exception:
+            rel = Path(file_path.name)
+        target = target_base / (base_name or src.name) / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(file_path, target)
+        copied.append(str(target))
+    return copied
+
+
 def create_demo_file(job_id: str, file_format: str = "CSV") -> Dict[str, Any]:
     ext = file_format.lower()
     file_id = f"file_{uuid.uuid4().hex[:10]}"
@@ -400,9 +615,18 @@ def create_demo_file(job_id: str, file_format: str = "CSV") -> Dict[str, Any]:
     
 @app.on_event("startup")
 def _startup():
-    # start background scheduler (no jobs yet)
+    # start background scheduler and recover enabled jobs from DB
     try:
         start_scheduler()
+        session = SessionLocal()
+        try:
+            rows = session.query(db_models.ExportJobModel).all()
+            for r in rows:
+                if not r.enabled or not r.schedule:
+                    continue
+                schedule_job(str(r.id), r.schedule, run_export_job, args=[_build_export_runtime_payload(r)])
+        finally:
+            session.close()
     except Exception:
         pass
 
@@ -415,6 +639,7 @@ def _shutdown():
 
 
 @app.post("/api/export-jobs/trigger")
+@app.post("/api/v1/export-jobs/trigger")
 def api_trigger_export(job: Dict[str, Any], request: Request):
     """Trigger an export job (simple synchronous) - expects job dict in body."""
     trace_id = make_trace_id(request.headers.get("x-trace-id"))
@@ -424,12 +649,14 @@ def api_trigger_export(job: Dict[str, Any], request: Request):
     return ok(res, trace_id)
     
 @app.post("/api/export-jobs")
+@app.post("/api/v1/export-jobs")
 def api_create_export(job: Dict[str, Any], request: Request):
     trace_id = make_trace_id(request.headers.get("x-trace-id"))
     session = SessionLocal()
     try:
         ej = db_models.ExportJobModel(
             job_name=job.get("job_name") or job.get("name") or "unnamed",
+            factory_id=_normalize_factory_id(job.get("factory_id")),
             owner_id=job.get("owner_id"),
             schedule=job.get("schedule"),
             file_format=job.get("file_format", "csv"),
@@ -437,40 +664,47 @@ def api_create_export(job: Dict[str, Any], request: Request):
             mode=job.get("mode", "visible"),
             enabled=1 if job.get("enabled") else 0,
             db_config=job.get("db_config", {}),
+            connection_profile_id=job.get("connection_profile_id"),
         )
         session.add(ej)
         session.commit()
         session.refresh(ej)
         # schedule if enabled
         if ej.enabled and ej.schedule:
-            schedule_job(str(ej.id), ej.schedule, run_export_job, args=[{
-                "id": ej.id,
-                "job_name": ej.job_name,
-                "owner_id": ej.owner_id,
-                "db_config": ej.db_config,
-                "file_format": ej.file_format,
-                "destination": ej.destination,
-            }])
+            runtime_payload = _build_export_runtime_payload(ej)
+            if job.get("payload"):
+                runtime_payload["payload"] = job.get("payload")
+            schedule_job(str(ej.id), ej.schedule, run_export_job, args=[runtime_payload])
         return ok({"id": ej.id}, trace_id)
     finally:
         session.close()
 
 @app.get("/api/export-jobs")
-def api_list_exports(request: Request):
+@app.get("/api/v1/export-jobs")
+def api_list_exports(request: Request, factory_id: Optional[str] = Query(default=None)):
     trace_id = make_trace_id(request.headers.get("x-trace-id"))
     session = SessionLocal()
     try:
-        rows = session.query(db_models.ExportJobModel).all()
+        q = session.query(db_models.ExportJobModel)
+        resolved_factory = _normalize_factory_id(factory_id) if factory_id is not None else None
+        if resolved_factory:
+            q = q.filter(
+                (db_models.ExportJobModel.factory_id == resolved_factory)
+                | (db_models.ExportJobModel.factory_id.is_(None))
+            )
+        rows = q.all()
         out = []
         for r in rows:
             out.append({
                 "id": r.id,
                 "job_name": r.job_name,
+                "factory_id": _normalize_factory_id(r.factory_id),
                 "owner_id": r.owner_id,
                 "schedule": r.schedule,
                 "file_format": r.file_format,
                 "mode": r.mode,
                 "enabled": bool(r.enabled),
+                "connection_profile_id": getattr(r, "connection_profile_id", None),
                 "created_at": r.created_at.isoformat() if r.created_at else None,
             })
         return ok(out, trace_id)
@@ -478,6 +712,7 @@ def api_list_exports(request: Request):
         session.close()
 
 @app.get("/api/export-jobs/{job_id}")
+@app.get("/api/v1/export-jobs/{job_id}")
 def api_get_export(job_id: int, request: Request):
     trace_id = make_trace_id(request.headers.get("x-trace-id"))
     session = SessionLocal()
@@ -488,6 +723,7 @@ def api_get_export(job_id: int, request: Request):
         return ok({
             "id": r.id,
             "job_name": r.job_name,
+            "factory_id": _normalize_factory_id(r.factory_id),
             "owner_id": r.owner_id,
             "schedule": r.schedule,
             "file_format": r.file_format,
@@ -495,12 +731,14 @@ def api_get_export(job_id: int, request: Request):
             "mode": r.mode,
             "enabled": bool(r.enabled),
             "db_config": r.db_config,
+            "connection_profile_id": getattr(r, "connection_profile_id", None),
             "last_run": r.last_run.isoformat() if r.last_run else None,
         }, trace_id)
     finally:
         session.close()
 
 @app.patch("/api/export-jobs/{job_id}")
+@app.patch("/api/v1/export-jobs/{job_id}")
 def api_patch_export(job_id: int, patch: Dict[str, Any], request: Request):
     trace_id = make_trace_id(request.headers.get("x-trace-id"))
     session = SessionLocal()
@@ -509,22 +747,21 @@ def api_patch_export(job_id: int, patch: Dict[str, Any], request: Request):
         if not r:
             raise HTTPException(status_code=404, detail="not found")
         # simple fields
-        for k in ("job_name", "schedule", "file_format", "mode", "destination", "db_config"):
+        for k in ("job_name", "schedule", "file_format", "mode", "destination", "db_config", "factory_id", "connection_profile_id"):
             if k in patch:
-                setattr(r, k, patch[k])
+                if k == "factory_id":
+                    setattr(r, k, _normalize_factory_id(patch[k]))
+                else:
+                    setattr(r, k, patch[k])
         if "enabled" in patch:
             r.enabled = 1 if patch["enabled"] else 0
         session.commit()
         # manage scheduling
         if r.enabled and r.schedule:
-            schedule_job(str(r.id), r.schedule, run_export_job, args=[{
-                "id": r.id,
-                "job_name": r.job_name,
-                "owner_id": r.owner_id,
-                "db_config": r.db_config,
-                "file_format": r.file_format,
-                "destination": r.destination,
-            }])
+            runtime_payload = _build_export_runtime_payload(r)
+            if patch.get("payload"):
+                runtime_payload["payload"] = patch.get("payload")
+            schedule_job(str(r.id), r.schedule, run_export_job, args=[runtime_payload])
         else:
             remove_scheduled(str(r.id))
         return ok({"id": r.id}, trace_id)
@@ -532,6 +769,7 @@ def api_patch_export(job_id: int, patch: Dict[str, Any], request: Request):
         session.close()
 
 @app.delete("/api/export-jobs/{job_id}")
+@app.delete("/api/v1/export-jobs/{job_id}")
 def api_delete_export(job_id: int, request: Request):
     trace_id = make_trace_id(request.headers.get("x-trace-id"))
     session = SessionLocal()
@@ -545,6 +783,430 @@ def api_delete_export(job_id: int, request: Request):
         return ok({"deleted": True}, trace_id)
     finally:
         session.close()
+
+
+def _serialize_connection_profile(row: db_models.ConnectionProfileModel, include_sensitive: bool = False) -> Dict[str, Any]:
+    payload = {
+        "id": row.id,
+        "name": row.name,
+        "db_type": row.db_type,
+        "driver": row.driver,
+        "host": row.host,
+        "port": row.port,
+        "database": row.database,
+        "username": row.username,
+        "dsn": row.dsn,
+        "enabled": bool(row.enabled),
+        "owner_id": row.owner_id,
+        "extra": row.extra or {},
+        "display": f"{row.name} ({row.db_type})",
+        "created_at": row.created_at.isoformat() if row.created_at else None,
+        "updated_at": row.updated_at.isoformat() if row.updated_at else None,
+    }
+    if include_sensitive:
+        payload["secret_ref"] = row.secret_ref
+    return payload
+
+
+@app.get("/api/connection-profiles")
+@app.get("/api/v1/connection-profiles")
+def api_list_connection_profiles(
+    request: Request,
+    enabled: Optional[bool] = Query(default=None),
+):
+    trace_id = make_trace_id(request.headers.get("x-trace-id"))
+    session = SessionLocal()
+    try:
+        q = session.query(db_models.ConnectionProfileModel)
+        if enabled is not None:
+            q = q.filter(db_models.ConnectionProfileModel.enabled == (1 if enabled else 0))
+        rows = q.order_by(db_models.ConnectionProfileModel.id.asc()).all()
+        return ok([_serialize_connection_profile(r, include_sensitive=False) for r in rows], trace_id)
+    finally:
+        session.close()
+
+
+@app.get("/api/connection-profiles/{profile_id}")
+@app.get("/api/v1/connection-profiles/{profile_id}")
+def api_get_connection_profile(profile_id: int, request: Request):
+    trace_id = make_trace_id(request.headers.get("x-trace-id"))
+    session = SessionLocal()
+    try:
+        row = (
+            session.query(db_models.ConnectionProfileModel)
+            .filter(db_models.ConnectionProfileModel.id == profile_id)
+            .first()
+        )
+        if not row:
+            raise HTTPException(status_code=404, detail="connection profile not found")
+        return ok(_serialize_connection_profile(row, include_sensitive=False), trace_id)
+    finally:
+        session.close()
+
+
+@app.post("/api/connection-profiles")
+@app.post("/api/v1/connection-profiles")
+def api_create_connection_profile(payload: Dict[str, Any], request: Request):
+    trace_id = make_trace_id(request.headers.get("x-trace-id"))
+    session = SessionLocal()
+    try:
+        row = db_models.ConnectionProfileModel(
+            name=str(payload.get("name") or "").strip() or f"profile-{uuid.uuid4().hex[:6]}",
+            db_type=str(payload.get("db_type") or "mysql").strip().lower(),
+            driver=payload.get("driver"),
+            host=payload.get("host"),
+            port=payload.get("port"),
+            database=payload.get("database"),
+            username=payload.get("username"),
+            secret_ref=payload.get("secret_ref") or payload.get("password"),
+            dsn=payload.get("dsn"),
+            extra=payload.get("extra") if isinstance(payload.get("extra"), dict) else {},
+            owner_id=payload.get("owner_id"),
+            enabled=1 if payload.get("enabled", True) else 0,
+            updated_at=datetime.utcnow(),
+        )
+        session.add(row)
+        session.commit()
+        session.refresh(row)
+        return ok(_serialize_connection_profile(row, include_sensitive=False), trace_id)
+    finally:
+        session.close()
+
+
+@app.put("/api/connection-profiles/{profile_id}")
+@app.put("/api/v1/connection-profiles/{profile_id}")
+def api_update_connection_profile(profile_id: int, payload: Dict[str, Any], request: Request):
+    trace_id = make_trace_id(request.headers.get("x-trace-id"))
+    session = SessionLocal()
+    try:
+        row = (
+            session.query(db_models.ConnectionProfileModel)
+            .filter(db_models.ConnectionProfileModel.id == profile_id)
+            .first()
+        )
+        if not row:
+            raise HTTPException(status_code=404, detail="connection profile not found")
+
+        for key in ("name", "db_type", "driver", "host", "port", "database", "username", "dsn", "owner_id"):
+            if key in payload:
+                setattr(row, key, payload.get(key))
+        if "enabled" in payload:
+            row.enabled = 1 if payload.get("enabled") else 0
+        if "secret_ref" in payload:
+            row.secret_ref = payload.get("secret_ref")
+        elif "password" in payload:
+            row.secret_ref = payload.get("password")
+        if "extra" in payload and isinstance(payload.get("extra"), dict):
+            row.extra = payload.get("extra")
+        row.updated_at = datetime.utcnow()
+
+        session.commit()
+        session.refresh(row)
+        return ok(_serialize_connection_profile(row, include_sensitive=False), trace_id)
+    finally:
+        session.close()
+
+
+@app.delete("/api/connection-profiles/{profile_id}")
+@app.delete("/api/v1/connection-profiles/{profile_id}")
+def api_delete_connection_profile(profile_id: int, request: Request):
+    trace_id = make_trace_id(request.headers.get("x-trace-id"))
+    session = SessionLocal()
+    try:
+        row = (
+            session.query(db_models.ConnectionProfileModel)
+            .filter(db_models.ConnectionProfileModel.id == profile_id)
+            .first()
+        )
+        if not row:
+            raise HTTPException(status_code=404, detail="connection profile not found")
+
+        linked = (
+            session.query(db_models.ExportJobModel)
+            .filter(db_models.ExportJobModel.connection_profile_id == profile_id)
+            .count()
+        )
+        if linked > 0:
+            raise HTTPException(status_code=409, detail="profile is used by export jobs")
+
+        session.delete(row)
+        session.commit()
+        return ok({"deleted": True}, trace_id)
+    finally:
+        session.close()
+
+
+@app.post("/api/connection-profiles/{profile_id}/test")
+@app.post("/api/v1/connection-profiles/{profile_id}/test")
+def api_test_connection_profile(profile_id: int, payload: Dict[str, Any], request: Request):
+    trace_id = make_trace_id(request.headers.get("x-trace-id"))
+    session = SessionLocal()
+    try:
+        row = (
+            session.query(db_models.ConnectionProfileModel)
+            .filter(db_models.ConnectionProfileModel.id == profile_id)
+            .first()
+        )
+        if not row:
+            raise HTTPException(status_code=404, detail="connection profile not found")
+
+        override = payload.get("override") if isinstance(payload.get("override"), dict) else {}
+        cfg = _profile_to_db_config(row, override)
+
+        try:
+            engine = engine_from_config(cfg)
+            with engine.connect() as conn:
+                conn.exec_driver_sql("SELECT 1")
+            return ok({"ok": True, "message": "connected"}, trace_id)
+        except Exception as exc:
+            return ok({"ok": False, "message": str(exc)}, trace_id)
+    finally:
+        session.close()
+
+
+@app.post("/api/internal/factory-reports")
+@app.post("/api/v1/internal/factory-reports")
+def api_ingest_factory_report(payload: Dict[str, Any], request: Request):
+    trace_id = make_trace_id(request.headers.get("x-trace-id"))
+    record = {
+        "factory_id": _normalize_factory_id(payload.get("factory_id")),
+        "job_id": str(payload.get("job_id") or ""),
+        "batch_id": str(payload.get("batch_id") or ""),
+        "status": str(payload.get("status") or "unknown"),
+        "rows": int(payload.get("rows") or 0),
+        "file_path": str(payload.get("file_path") or ""),
+        "message": str(payload.get("message") or ""),
+        "reported_at": payload.get("reported_at") or now_iso(),
+        "received_at": now_iso(),
+    }
+    _append_factory_report(record)
+    return ok({"accepted": True}, trace_id)
+
+
+@app.get("/api/internal/factory-reports")
+@app.get("/api/v1/internal/factory-reports")
+def api_list_factory_reports(request: Request, factory_id: Optional[str] = Query(default=None), limit: int = Query(default=50, ge=1, le=500)):
+    trace_id = make_trace_id(request.headers.get("x-trace-id"))
+    items = _read_factory_reports()
+    if factory_id is not None:
+        resolved_factory = _normalize_factory_id(factory_id)
+        items = [x for x in items if _normalize_factory_id(x.get("factory_id")) == resolved_factory]
+    items = list(reversed(items))[:limit]
+    return ok(items, trace_id)
+
+
+@app.get("/api/internal/factory-jobs")
+@app.get("/api/v1/internal/factory-jobs")
+def api_list_factory_jobs(request: Request, factory_id: Optional[str] = Query(default=None)):
+    trace_id = make_trace_id(request.headers.get("x-trace-id"))
+    resolved_factory = _normalize_factory_id(factory_id)
+    session = SessionLocal()
+    try:
+        rows = (
+            session.query(db_models.ExportJobModel)
+            .filter(
+                (db_models.ExportJobModel.factory_id == resolved_factory)
+                | (db_models.ExportJobModel.factory_id.is_(None))
+            )
+            .all()
+        )
+        out = []
+        for r in rows:
+            table_name = None
+            if isinstance(r.db_config, dict):
+                table_name = r.db_config.get("table")
+            out.append({
+                "id": r.id,
+                "job_name": r.job_name,
+                "factory_id": _normalize_factory_id(r.factory_id),
+                "table": table_name,
+                "schedule": r.schedule,
+                "file_format": r.file_format,
+                "connection_profile_id": getattr(r, "connection_profile_id", None),
+                "enabled": bool(r.enabled),
+                "last_run": r.last_run.isoformat() if r.last_run else None,
+                "status": r.status,
+            })
+        return ok(out, trace_id)
+    finally:
+        session.close()
+
+
+@app.post("/api/internal/factory-jobs/{job_id}/fetch")
+@app.post("/api/v1/internal/factory-jobs/{job_id}/fetch")
+def api_fetch_factory_job(job_id: int, request: Request, factory_id: Optional[str] = Query(default=None)):
+    trace_id = make_trace_id(request.headers.get("x-trace-id"))
+    resolved_factory = _normalize_factory_id(factory_id)
+    session = SessionLocal()
+    try:
+        row = session.query(db_models.ExportJobModel).filter(db_models.ExportJobModel.id == job_id).first()
+        if not row:
+            raise HTTPException(status_code=404, detail="factory job not found")
+        if _normalize_factory_id(row.factory_id) != resolved_factory:
+            raise HTTPException(status_code=404, detail="factory job not found")
+
+        # backfill legacy records so subsequent filtering is explicit and stable
+        if not row.factory_id:
+            row.factory_id = resolved_factory
+
+        runtime_payload = _build_export_runtime_payload(row)
+        result = run_export_job(runtime_payload)
+
+        persisted_path = _persist_to_in_data(resolved_factory, row.id, str(result.get("path") or ""))
+        if persisted_path:
+            result["path"] = persisted_path
+
+        row.last_run = datetime.utcnow()
+        row.status = result.get("status") or "unknown"
+        session.commit()
+
+        _append_factory_report({
+            "factory_id": resolved_factory,
+            "job_id": str(row.id),
+            "batch_id": f"manual_{now_ts()}",
+            "status": str(result.get("status") or "unknown"),
+            "rows": int(result.get("rows") or 0),
+            "file_path": str(result.get("path") or ""),
+            "message": str(result.get("error") or "manual_fetch"),
+            "reported_at": now_iso(),
+            "received_at": now_iso(),
+        })
+
+        if result.get("status") == "error":
+            raise HTTPException(status_code=500, detail=result.get("error") or "fetch failed")
+
+        return ok({
+            "job_id": row.id,
+            "factory_id": resolved_factory,
+            **result,
+        }, trace_id)
+    finally:
+        session.close()
+
+
+@app.get("/api/internal/factory-assets")
+@app.get("/api/v1/internal/factory-assets")
+def api_list_factory_assets(
+    request: Request,
+    factory_id: Optional[str] = Query(default=None),
+    path: Optional[str] = Query(default=None),
+    limit: int = Query(default=200, ge=1, le=2000),
+):
+    trace_id = make_trace_id(request.headers.get("x-trace-id"))
+    resolved_factory = _normalize_factory_id(factory_id)
+
+    def _infer_in_data_source_type(file_path: Path) -> str:
+        try:
+            rel_parts = file_path.relative_to(IN_DATA_BASE_DIR).parts
+        except Exception:
+            rel_parts = file_path.parts
+        for part in rel_parts:
+            inferred = _infer_nifi_source_type(part)
+            if inferred != "manual_db_export" or part.lower() in {
+                "output_csv",
+                "output_json",
+                "output_tsv",
+                "exports",
+                "inbox_csv",
+                "inbox_json",
+                "inbox_tsv",
+                "csv_to_json",
+                "json_to_csv",
+                "tsv_to_json",
+                "json_to_tsv",
+                "csv_to_tsv",
+                "tsv_to_csv",
+                "tagged_output",
+            }:
+                return inferred
+        return "scheduled_fetch"
+
+    assets: List[Dict[str, Any]] = []
+    if IN_DATA_BASE_DIR.exists() and IN_DATA_BASE_DIR.is_dir():
+        for file_path in IN_DATA_BASE_DIR.rglob("*"):
+            if not file_path.is_file():
+                continue
+            try:
+                stat = file_path.stat()
+            except Exception:
+                continue
+            existing = next((meta for meta in files.values() if str(meta.get("storagePath", "")) == str(file_path)), None)
+            if existing is None:
+                existing = register_existing_file(file_path, _guess_file_format(file_path) or "FILE")
+            item = dict(existing)
+            item.update({
+                "path": item.get("storagePath", str(file_path)),
+                "name": item.get("fileName", file_path.name),
+                "size": item.get("fileSize", stat.st_size),
+                "format": item.get("fileFormat", (_guess_file_format(file_path) or "FILE").upper()),
+                "sourceType": _infer_in_data_source_type(file_path),
+                "mtime": datetime.fromtimestamp(stat.st_mtime).isoformat(timespec="seconds"),
+                "mtime_ts": stat.st_mtime,
+            })
+            assets.append(item)
+
+    if path:
+        normalized_path = str(Path(path).expanduser())
+        assets = [x for x in assets if str(x.get("path", "")).startswith(normalized_path)]
+
+    assets.sort(key=lambda x: x.get("mtime_ts") or 0, reverse=True)
+    assets = assets[:limit]
+    for item in assets:
+        item.pop("mtime_ts", None)
+
+    return ok({
+        "factory_id": resolved_factory,
+        "total": len(assets),
+        "items": assets,
+    }, trace_id)
+
+
+@app.get("/api/internal/factory-tree")
+@app.get("/api/v1/internal/factory-tree")
+def api_get_factory_tree(request: Request, factory_id: Optional[str] = Query(default=None)):
+    trace_id = make_trace_id(request.headers.get("x-trace-id"))
+    resolved_factory = _normalize_factory_id(factory_id)
+    roots = []
+    tree = _build_filesystem_tree(IN_DATA_BASE_DIR, label="in_data", max_depth=6)
+    if tree:
+        roots.append(tree)
+    return ok({"factory_id": resolved_factory, "roots": roots}, trace_id)
+
+
+@app.post("/api/internal/factory-tree/fetch")
+@app.post("/api/v1/internal/factory-tree/fetch")
+def api_fetch_factory_tree(payload: Dict[str, Any], request: Request):
+    trace_id = make_trace_id(request.headers.get("x-trace-id"))
+    resolved_factory = _normalize_factory_id(payload.get("factory_id"))
+    source_path = Path(str(payload.get("path") or "")).expanduser()
+    if not str(source_path):
+        raise HTTPException(status_code=400, detail="path is required")
+    if not source_path.exists():
+        raise HTTPException(status_code=404, detail="source path not found")
+
+    allowed_roots = [NIFI_BASE_DIR.resolve(), IN_DATA_BASE_DIR.resolve()]
+    try:
+        resolved_source = source_path.resolve()
+    except Exception:
+        raise HTTPException(status_code=400, detail="invalid path")
+
+    if not any(str(resolved_source).startswith(str(root)) for root in allowed_roots):
+        raise HTTPException(status_code=403, detail="path not allowed")
+
+    copied = _copy_path_to_in_data(resolved_source, resolved_factory, base_name=payload.get("alias"))
+    record = {
+        "factory_id": resolved_factory,
+        "job_id": str(payload.get("job_id") or ""),
+        "batch_id": str(payload.get("batch_id") or f"tree_{now_ts()}"),
+        "status": "ok",
+        "rows": len(copied),
+        "file_path": str(IN_DATA_BASE_DIR / resolved_factory),
+        "message": f"copied {len(copied)} files",
+        "reported_at": now_iso(),
+        "received_at": now_iso(),
+    }
+    _append_factory_report(record)
+    return ok({"factory_id": resolved_factory, "copied": copied, "count": len(copied)}, trace_id)
 
 
 def _write_ndjson(path: Path, columns: List[str], rows: List[Dict[str, Any]], append: bool = False) -> None:
@@ -615,7 +1277,7 @@ def _write_tsv_atomic(path: Path, columns: List[str], rows: List[Dict[str, Any]]
             tmp_path.unlink(missing_ok=True)
 
 
-def _read_file_records(file_path: Path, fmt: str) -> (List[str], List[Dict[str, Any]]):
+def _read_file_records(file_path: Path, fmt: str) -> Tuple[List[str], List[Dict[str, Any]]]:
     fmt = fmt.upper()
     if fmt == "CSV":
         text = file_path.read_text(encoding="utf-8")
@@ -749,7 +1411,7 @@ def _connect_mysql(host: str, port: int, user: str, password: str, db: str):
     return pymysql.connect(host=host, port=port, user=user, password=password, db=db, charset="utf8mb4", cursorclass=pymysql.cursors.DictCursor)
 
 
-def _export_table_to_rows(conn, table: str, where: str = "") -> (List[str], List[Dict[str, Any]]):
+def _export_table_to_rows(conn, table: str, where: str = "") -> Tuple[List[str], List[Dict[str, Any]]]:
     with conn.cursor() as cur:
         q = f"SELECT * FROM `{table}`"
         if where:
@@ -828,18 +1490,19 @@ def _sync_nifi_files() -> None:
         if p:
             known_paths.add(p)
 
-    if not NIFI_BASE_DIR.exists() or not NIFI_BASE_DIR.is_dir():
-        return
+    for root in [NIFI_BASE_DIR, IN_DATA_BASE_DIR]:
+        if not root.exists() or not root.is_dir():
+            continue
 
-    for p in NIFI_BASE_DIR.rglob("*"):
-        if not p.is_file():
-            continue
-        p_str = str(p)
-        if p_str in known_paths:
-            continue
-        fmt = _guess_file_format(p)
-        register_existing_file(p, fmt)
-        known_paths.add(p_str)
+        for p in root.rglob("*"):
+            if not p.is_file():
+                continue
+            p_str = str(p)
+            if p_str in known_paths:
+                continue
+            fmt = _guess_file_format(p)
+            register_existing_file(p, fmt)
+            known_paths.add(p_str)
 
 
 @app.on_event("startup")
