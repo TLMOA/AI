@@ -1,0 +1,235 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>AI模块V1前端（简化版）</title>
+  <link rel="stylesheet" href="./styles.css" />
+</head>
+<body>
+  <div class="app">
+    <header>
+      <h1>AI模块V1控制台</h1>
+      <p>简化可改造版（JetLinks联调开关默认关闭）</p>
+    </header>
+
+    <section class="card">
+      <h2>创建任务</h2>
+      <div class="row">
+        <label>任务类型</label>
+        <select id="jobType">
+          <option value="CONVERT" title="数据格式转换（例如 CSV <-> JSON）">CONVERT</option>
+          <option value="TAG_AUTO" title="自动打标签：按规则自动标注数据">TAG_AUTO</option>
+          <option value="COPY_MULTI_FORMAT" title="复制多种输出格式（同时生成 CSV/JSON/TSV）">COPY_MULTI_FORMAT</option>
+          <option value="IMPORT_EXTERNAL" title="导入到外部系统/数据库的任务">IMPORT_EXTERNAL</option>
+          <option value="TAG_MANUAL" title="手动标注：用户在前端打开文件并手工标注">TAG_MANUAL</option>
+        </select>
+      </div>
+      <div class="row">
+        <label>输出格式</label>
+        <select id="format">
+          <option value="CSV">CSV</option>
+          <option value="JSON">JSON</option>
+          <option value="TSV">TSV</option>
+        </select>
+      </div>
+      <button id="createBtn">创建任务</button>
+      <p id="createResult"></p>
+    </section>
+
+    <section class="card">
+      <h2>任务列表</h2>
+      <button id="refreshBtn">刷新列表</button>
+      <table>
+        <thead>
+          <tr><th>jobId</th><th>类型</th><th>状态</th><th>进度</th><th>操作</th></tr>
+        </thead>
+        <tbody id="jobTable"></tbody>
+      </table>
+    </section>
+
+    <section class="card">
+      <h2>任务详情</h2>
+      <p id="jobDetail">请选择任务</p>
+      <h3>产物</h3>
+      <ul id="outputs"></ul>
+    </section>
+
+    <section class="card">
+      <h2>触发 NiFi 流程</h2>
+      <p>快速触发项目中的五个流程（会创建任务并展示进度）</p>
+      <div class="row">
+        <button class="nifi-btn" data-type="CONVERT">触发 CONVERT</button>
+        <button class="nifi-btn" data-type="TAG_AUTO">触发 TAG_AUTO</button>
+        <button class="nifi-btn" data-type="COPY_MULTI_FORMAT">触发 COPY_MULTI_FORMAT</button>
+        <button class="nifi-btn" data-type="IMPORT_EXTERNAL">触发 IMPORT_EXTERNAL</button>
+        <button class="nifi-btn" data-type="TAG_MANUAL">触发 TAG_MANUAL</button>
+      </div>
+      <p>输出文件位置：后端本地生成目录为 <code>/home/yhz/iot/v1-backend/data/generated/</code>；若使用真实 NiFi，NiFi 输出目录为 <code>/home/yhz/nifi-data/output_csv/</code></p>
+    </section>
+
+    <section class="card">
+      <h2>数据库导出（MySQL）</h2>
+      <div class="row">
+        <label>Host</label>
+        <input id="dbHost" type="text" value="127.0.0.1" />
+        <label>Port</label>
+        <input id="dbPort" type="number" value="3306" />
+      </div>
+      <div class="row">
+        <label>Database</label>
+        <input id="dbName" type="text" value="nifi" />
+        <label>User</label>
+        <input id="dbUser" type="text" value="root" />
+        <label>Password</label>
+        <input id="dbPassword" type="password" value="root" />
+      </div>
+      <div class="row">
+        <label>Table</label>
+        <select id="dbTableSelect"><option value="">-- 先列表 --</option></select>
+        <input id="dbTableInput" type="text" placeholder="或手动输入表名（例如 sensor_data）" />
+        <label>Where</label>
+        <input id="dbWhere" type="text" placeholder="可选，例如 id > 100" />
+      </div>
+      <div class="row">
+        <button id="dbTestBtn">测试连接</button>
+        <button id="dbListBtn">列出表</button>
+        <label>格式</label>
+        <select id="dbExportFormat"><option>CSV</option><option>JSON</option><option>TSV</option></select>
+        <label>追加到 latest</label>
+        <input id="dbAppendLatest" type="checkbox" />
+        <label>频率</label>
+        <select id="dbFrequencySelect">
+          <option value="">立即</option>
+          <option value="5m">5m</option>
+          <option value="15m">15m</option>
+          <option value="1h">1h</option>
+          <option value="daily">每日</option>
+        </select>
+        <label>保存位置</label>
+        <input id="dbSaveLocation" type="text" placeholder="例如 /home/yhz/nifi-data/output_csv" />
+        <button id="dbExportBtn">导出并写入 NiFi 输出目录</button>
+        <button id="dbScheduleBtn">创建定时任务</button>
+      </div>
+      <p id="dbConnStatus"></p>
+      <p id="dbExportResult"></p>
+    </section>
+
+    <section class="card">
+      <h2>文件中心</h2>
+      <div class="row">
+        <label>格式筛选</label>
+        <select id="fileFormatFilter">
+          <option value="">全部</option>
+          <option value="CSV">CSV</option>
+          <option value="JSON">JSON</option>
+          <option value="TSV">TSV</option>
+        </select>
+        <button id="loadFilesBtn">加载文件</button>
+      </div>
+      <div class="row">
+        <div style="min-width:280px;max-width:360px;flex:1;">
+          <h3 style="margin:0 0 8px 0;">目录树（nifi-data）</h3>
+          <div id="fileTree" class="small" style="max-height:260px;overflow:auto;border:1px solid #ddd;padding:8px;"></div>
+        </div>
+        <div style="flex:2;min-width:520px;">
+          <h3 style="margin:0 0 8px 0;">当前目录文件</h3>
+          <p id="currentDirLabel" class="small"></p>
+          <div id="fileTableWrapper">
+            <table>
+              <thead>
+                <tr><th>fileId</th><th>文件名</th><th>格式</th><th>大小</th><th>操作</th></tr>
+              </thead>
+              <tbody id="fileTable"></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+      <h3>文件预览 / 标签编辑区（类 Excel）</h3>
+      <div class="row">
+        <label>offset</label>
+        <input id="previewOffset" type="number" min="0" value="0" />
+        <label>limit</label>
+        <input id="previewLimit" type="number" min="1" value="20" />
+        <button id="previewReloadBtn">刷新预览</button>
+        <button id="openEditorModalBtn" class="secondary">弹窗编辑</button>
+      </div>
+      <div id="filePreviewContainer">
+        <div class="row" id="editorModalBar" style="display:none;justify-content:space-between;">
+          <strong>标签编辑弹窗</strong>
+          <button id="closeEditorModalBtn" class="secondary">关闭弹窗</button>
+        </div>
+        <pre id="filePreview">请选择文件并点击预览</pre>
+        <div id="editablePreview" style="display:none">
+          <p>点击任意单元格即可编辑，支持多轮修改。保存后会生成新的 tagged_output 文件。</p>
+          <div id="editableTableWrapper"></div>
+          <div class="row">
+            <button id="addFieldBtn" class="secondary">新增字段</button>
+            <button id="saveTagsBtn">保存标签</button>
+            <span id="saveTagsResult"></span>
+          </div>
+        </div>
+      </div>
+      <div id="previewContainerPlaceholder"></div>
+      <div id="previewModal" class="preview-modal-shell" style="display:none;">
+        <div class="preview-modal-backdrop" id="previewModalBackdrop"></div>
+        <div class="preview-modal-panel">
+          <div class="row preview-modal-header">
+            <strong>标签编辑弹窗</strong>
+            <button id="closePreviewModalBtn" class="secondary" type="button">关闭弹窗</button>
+          </div>
+          <div id="previewModalMount"></div>
+        </div>
+      </div>
+      <div id="editorModalBackdrop" class="editor-modal-backdrop" style="display:none;"></div>
+    </section>
+
+    <section class="card">
+      <h2>标签中心（本地打标模式）</h2>
+      <p>本地打标模式：自动标签和文件中心编辑结果都会在后端本地生成新文件，统一落到 <code>/home/yhz/nifi-data/tagged_output/</code>。</p>
+      <div class="row">
+        <label>规则（自动标签用）</label>
+        <select id="tagRuleSelect"></select>
+        <button id="loadRulesBtn">刷新规则</button>
+      </div>
+
+      <h3>自动标签</h3>
+      <p>输入 fileId 后点击“触发自动标签”，系统会按规则生成带 auto_tag 字段的本地结果文件。</p>
+      <div class="row">
+        <label>fileId</label>
+        <input id="autoTagFileId" type="text" placeholder="输入 fileId" />
+        <button id="autoTagBtn">触发自动标签</button>
+      </div>
+      <p>手动编辑请在文件中心进行，已不再单独提供“手动标签”表单入口。</p>
+      <p id="tagResult"></p>
+    </section>
+
+    <section class="card">
+      <h2>用户上传转化</h2>
+      <div class="row">
+        <label>来源类型</label>
+        <select id="uploadFormat">
+          <option value="CSV">CSV -> JSON</option>
+          <option value="JSON">JSON -> CSV</option>
+          <option value="CSV_TO_TSV">CSV -> TSV</option>
+          <option value="TSV_TO_CSV">TSV -> CSV</option>
+          <option value="JSON_TO_TSV">JSON -> TSV</option>
+          <option value="TSV_TO_JSON">TSV -> JSON</option>
+        </select>
+        <label>用户名/会话</label>
+        <input id="uploadUserName" type="text" value="user" />
+      </div>
+      <div class="row">
+        <label>无表头时列名</label>
+        <input id="uploadColumns" type="text" placeholder="可选，逗号分隔，例如 id,name,value" />
+      </div>
+      <input type="file" id="fileInput" />
+      <button id="uploadBtn">上传并自动转换</button>
+      <p id="uploadHint">六条转换已独立：CSV->JSON、JSON->CSV、CSV->TSV、TSV->CSV、JSON->TSV、TSV->JSON；每次只执行一条转换并写入对应目录。若源文件无表头，请填写“无表头时列名”。</p>
+      <p id="uploadResult"></p>
+    </section>
+  </div>
+  <script src="./config.js?v=20260404_1"></script>
+  <script src="./app.js?v=20260407_2"></script>
+</body>
+</html>
