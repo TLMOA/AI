@@ -10,7 +10,7 @@ from pathlib import Path
 from time import perf_counter
 from typing import Any, Dict, List, Optional, Tuple
 
-from fastapi import FastAPI, Header, HTTPException, Query, Request, UploadFile, File as UploadFileField
+from fastapi import FastAPI, Header, HTTPException, Query, Request, UploadFile, File as UploadFileField, Body
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field, field_validator
@@ -20,7 +20,6 @@ from .executors import MockExecutor, NiFiExecutor
 from .db_connect import router as db_router
 from . import db_models
 from .export_worker import run_export_job
-from .engine_factory import engine_from_config
 from .scheduler import start_scheduler, stop_scheduler, schedule_job, remove_scheduled
 import pymysql
 try:
@@ -343,6 +342,42 @@ def _normalize_factory_id(value: Optional[str]) -> str:
     return (value or "").strip() or DEFAULT_FACTORY_ID
 
 
+def _safe_relative_to(path: Path, root: Path) -> Optional[Path]:
+    try:
+        return path.resolve().relative_to(root.resolve())
+    except Exception:
+        return None
+
+
+def _mirror_to_in_data(file_path: Path, factory_id: str = DEFAULT_FACTORY_ID) -> Optional[Path]:
+    """Mirror a source file into the in_data archive tree.
+
+    Current project convention keeps one factory per deployment, so we mirror
+    NIFI_BASE_DIR content into /in_data/<factory_id>/... while preserving the
+    original relative path under NIFI_BASE_DIR.
+    """
+    if not file_path.exists() or not file_path.is_file():
+        return None
+
+    in_data_root = IN_DATA_BASE_DIR.resolve()
+    try:
+        resolved = file_path.resolve()
+    except Exception:
+        return None
+
+    if str(resolved).startswith(str(in_data_root)):
+        return resolved
+
+    rel = _safe_relative_to(resolved, NIFI_BASE_DIR)
+    if rel is None:
+        rel = Path(file_path.name)
+
+    target = IN_DATA_BASE_DIR / factory_id / rel
+    target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(resolved, target)
+    return target
+
+
 def _append_factory_report(report: Dict[str, Any]) -> None:
     FACTORY_REPORT_FILE.parent.mkdir(parents=True, exist_ok=True)
     with FACTORY_REPORT_FILE.open("a", encoding="utf-8") as f:
@@ -367,70 +402,19 @@ def _read_factory_reports() -> List[Dict[str, Any]]:
 
 
 def _build_export_runtime_payload(row: db_models.ExportJobModel) -> Dict[str, Any]:
-    session = SessionLocal()
-    resolved_db_config: Dict[str, Any] = {}
-    if isinstance(row.db_config, dict):
-        resolved_db_config = dict(row.db_config)
-    try:
-        if getattr(row, "connection_profile_id", None):
-            profile = (
-                session.query(db_models.ConnectionProfileModel)
-                .filter(db_models.ConnectionProfileModel.id == row.connection_profile_id)
-                .first()
-            )
-            if profile and profile.enabled:
-                resolved_db_config = _profile_to_db_config(profile, resolved_db_config)
-    finally:
-        session.close()
-
     payload = {}
-    if isinstance(resolved_db_config, dict) and resolved_db_config.get("table"):
-        payload = {"table": resolved_db_config.get("table")}
+    if isinstance(row.db_config, dict) and row.db_config.get("table"):
+        payload = {"table": row.db_config.get("table")}
     return {
         "id": row.id,
         "job_name": row.job_name,
         "factory_id": _normalize_factory_id(row.factory_id),
         "owner_id": row.owner_id,
-        "db_config": resolved_db_config,
-        "connection_profile_id": getattr(row, "connection_profile_id", None),
+        "db_config": row.db_config,
         "file_format": row.file_format,
         "destination": row.destination,
         "payload": payload,
     }
-
-
-def _profile_to_db_config(profile: db_models.ConnectionProfileModel, override: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    cfg: Dict[str, Any] = {}
-    if isinstance(profile.extra, dict):
-        cfg.update(profile.extra)
-
-    cfg.update({
-        "db_type": profile.db_type,
-        "driver": profile.driver,
-        "host": profile.host,
-        "port": profile.port,
-        "database": profile.database,
-        "user": profile.username,
-        "dsn": profile.dsn,
-    })
-
-    # MVP secret resolver: secret_ref can be raw password or JSON string.
-    secret_ref = (profile.secret_ref or "").strip()
-    if secret_ref:
-        try:
-            secret_payload = json.loads(secret_ref)
-            if isinstance(secret_payload, dict):
-                if secret_payload.get("password"):
-                    cfg["password"] = secret_payload.get("password")
-                if secret_payload.get("dsn") and not cfg.get("dsn"):
-                    cfg["dsn"] = secret_payload.get("dsn")
-        except Exception:
-            cfg["password"] = secret_ref
-
-    if isinstance(override, dict):
-        cfg.update({k: v for k, v in override.items() if v not in (None, "")})
-
-    return cfg
 
 
 def _persist_to_in_data(factory_id: str, job_id: int, src_path: str) -> str:
@@ -538,7 +522,12 @@ def _copy_path_to_in_data(src: Path, factory_id: str, base_name: Optional[str] =
             rel = file_path.relative_to(src)
         except Exception:
             rel = Path(file_path.name)
-        target = target_base / (base_name or src.name) / rel
+        # When syncing the whole NIFI_BASE_DIR root, keep its children directly
+        # under the factory archive root instead of nesting an extra nifi-data/.
+        if src.resolve() == NIFI_BASE_DIR.resolve() and not base_name:
+            target = target_base / rel
+        else:
+            target = target_base / (base_name or src.name) / rel
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(file_path, target)
         copied.append(str(target))
@@ -624,7 +613,19 @@ def _startup():
             for r in rows:
                 if not r.enabled or not r.schedule:
                     continue
-                schedule_job(str(r.id), r.schedule, run_export_job, args=[_build_export_runtime_payload(r)])
+                payload = {}
+                if isinstance(r.db_config, dict) and r.db_config.get("table"):
+                    payload = {"table": r.db_config.get("table")}
+                schedule_job(str(r.id), r.schedule, run_export_job, args=[{
+                    "id": r.id,
+                    "job_name": r.job_name,
+                    "factory_id": _normalize_factory_id(r.factory_id),
+                    "owner_id": r.owner_id,
+                    "db_config": r.db_config,
+                    "file_format": r.file_format,
+                    "destination": r.destination,
+                    "payload": payload,
+                }])
         finally:
             session.close()
     except Exception:
@@ -664,17 +665,22 @@ def api_create_export(job: Dict[str, Any], request: Request):
             mode=job.get("mode", "visible"),
             enabled=1 if job.get("enabled") else 0,
             db_config=job.get("db_config", {}),
-            connection_profile_id=job.get("connection_profile_id"),
         )
         session.add(ej)
         session.commit()
         session.refresh(ej)
         # schedule if enabled
         if ej.enabled and ej.schedule:
-            runtime_payload = _build_export_runtime_payload(ej)
-            if job.get("payload"):
-                runtime_payload["payload"] = job.get("payload")
-            schedule_job(str(ej.id), ej.schedule, run_export_job, args=[runtime_payload])
+            schedule_job(str(ej.id), ej.schedule, run_export_job, args=[{
+                "id": ej.id,
+                "job_name": ej.job_name,
+                "factory_id": _normalize_factory_id(ej.factory_id),
+                "owner_id": ej.owner_id,
+                "db_config": ej.db_config,
+                "file_format": ej.file_format,
+                "destination": ej.destination,
+                "payload": job.get("payload", {}),
+            }])
         return ok({"id": ej.id}, trace_id)
     finally:
         session.close()
@@ -704,7 +710,6 @@ def api_list_exports(request: Request, factory_id: Optional[str] = Query(default
                 "file_format": r.file_format,
                 "mode": r.mode,
                 "enabled": bool(r.enabled),
-                "connection_profile_id": getattr(r, "connection_profile_id", None),
                 "created_at": r.created_at.isoformat() if r.created_at else None,
             })
         return ok(out, trace_id)
@@ -731,7 +736,6 @@ def api_get_export(job_id: int, request: Request):
             "mode": r.mode,
             "enabled": bool(r.enabled),
             "db_config": r.db_config,
-            "connection_profile_id": getattr(r, "connection_profile_id", None),
             "last_run": r.last_run.isoformat() if r.last_run else None,
         }, trace_id)
     finally:
@@ -747,7 +751,7 @@ def api_patch_export(job_id: int, patch: Dict[str, Any], request: Request):
         if not r:
             raise HTTPException(status_code=404, detail="not found")
         # simple fields
-        for k in ("job_name", "schedule", "file_format", "mode", "destination", "db_config", "factory_id", "connection_profile_id"):
+        for k in ("job_name", "schedule", "file_format", "mode", "destination", "db_config", "factory_id"):
             if k in patch:
                 if k == "factory_id":
                     setattr(r, k, _normalize_factory_id(patch[k]))
@@ -758,10 +762,19 @@ def api_patch_export(job_id: int, patch: Dict[str, Any], request: Request):
         session.commit()
         # manage scheduling
         if r.enabled and r.schedule:
-            runtime_payload = _build_export_runtime_payload(r)
-            if patch.get("payload"):
-                runtime_payload["payload"] = patch.get("payload")
-            schedule_job(str(r.id), r.schedule, run_export_job, args=[runtime_payload])
+            payload = patch.get("payload", {})
+            if (not payload) and isinstance(r.db_config, dict) and r.db_config.get("table"):
+                payload = {"table": r.db_config.get("table")}
+            schedule_job(str(r.id), r.schedule, run_export_job, args=[{
+                "id": r.id,
+                "job_name": r.job_name,
+                "factory_id": _normalize_factory_id(r.factory_id),
+                "owner_id": r.owner_id,
+                "db_config": r.db_config,
+                "file_format": r.file_format,
+                "destination": r.destination,
+                "payload": payload,
+            }])
         else:
             remove_scheduled(str(r.id))
         return ok({"id": r.id}, trace_id)
@@ -781,185 +794,6 @@ def api_delete_export(job_id: int, request: Request):
         session.delete(r)
         session.commit()
         return ok({"deleted": True}, trace_id)
-    finally:
-        session.close()
-
-
-def _serialize_connection_profile(row: db_models.ConnectionProfileModel, include_sensitive: bool = False) -> Dict[str, Any]:
-    payload = {
-        "id": row.id,
-        "name": row.name,
-        "db_type": row.db_type,
-        "driver": row.driver,
-        "host": row.host,
-        "port": row.port,
-        "database": row.database,
-        "username": row.username,
-        "dsn": row.dsn,
-        "enabled": bool(row.enabled),
-        "owner_id": row.owner_id,
-        "extra": row.extra or {},
-        "display": f"{row.name} ({row.db_type})",
-        "created_at": row.created_at.isoformat() if row.created_at else None,
-        "updated_at": row.updated_at.isoformat() if row.updated_at else None,
-    }
-    if include_sensitive:
-        payload["secret_ref"] = row.secret_ref
-    return payload
-
-
-@app.get("/api/connection-profiles")
-@app.get("/api/v1/connection-profiles")
-def api_list_connection_profiles(
-    request: Request,
-    enabled: Optional[bool] = Query(default=None),
-):
-    trace_id = make_trace_id(request.headers.get("x-trace-id"))
-    session = SessionLocal()
-    try:
-        q = session.query(db_models.ConnectionProfileModel)
-        if enabled is not None:
-            q = q.filter(db_models.ConnectionProfileModel.enabled == (1 if enabled else 0))
-        rows = q.order_by(db_models.ConnectionProfileModel.id.asc()).all()
-        return ok([_serialize_connection_profile(r, include_sensitive=False) for r in rows], trace_id)
-    finally:
-        session.close()
-
-
-@app.get("/api/connection-profiles/{profile_id}")
-@app.get("/api/v1/connection-profiles/{profile_id}")
-def api_get_connection_profile(profile_id: int, request: Request):
-    trace_id = make_trace_id(request.headers.get("x-trace-id"))
-    session = SessionLocal()
-    try:
-        row = (
-            session.query(db_models.ConnectionProfileModel)
-            .filter(db_models.ConnectionProfileModel.id == profile_id)
-            .first()
-        )
-        if not row:
-            raise HTTPException(status_code=404, detail="connection profile not found")
-        return ok(_serialize_connection_profile(row, include_sensitive=False), trace_id)
-    finally:
-        session.close()
-
-
-@app.post("/api/connection-profiles")
-@app.post("/api/v1/connection-profiles")
-def api_create_connection_profile(payload: Dict[str, Any], request: Request):
-    trace_id = make_trace_id(request.headers.get("x-trace-id"))
-    session = SessionLocal()
-    try:
-        row = db_models.ConnectionProfileModel(
-            name=str(payload.get("name") or "").strip() or f"profile-{uuid.uuid4().hex[:6]}",
-            db_type=str(payload.get("db_type") or "mysql").strip().lower(),
-            driver=payload.get("driver"),
-            host=payload.get("host"),
-            port=payload.get("port"),
-            database=payload.get("database"),
-            username=payload.get("username"),
-            secret_ref=payload.get("secret_ref") or payload.get("password"),
-            dsn=payload.get("dsn"),
-            extra=payload.get("extra") if isinstance(payload.get("extra"), dict) else {},
-            owner_id=payload.get("owner_id"),
-            enabled=1 if payload.get("enabled", True) else 0,
-            updated_at=datetime.utcnow(),
-        )
-        session.add(row)
-        session.commit()
-        session.refresh(row)
-        return ok(_serialize_connection_profile(row, include_sensitive=False), trace_id)
-    finally:
-        session.close()
-
-
-@app.put("/api/connection-profiles/{profile_id}")
-@app.put("/api/v1/connection-profiles/{profile_id}")
-def api_update_connection_profile(profile_id: int, payload: Dict[str, Any], request: Request):
-    trace_id = make_trace_id(request.headers.get("x-trace-id"))
-    session = SessionLocal()
-    try:
-        row = (
-            session.query(db_models.ConnectionProfileModel)
-            .filter(db_models.ConnectionProfileModel.id == profile_id)
-            .first()
-        )
-        if not row:
-            raise HTTPException(status_code=404, detail="connection profile not found")
-
-        for key in ("name", "db_type", "driver", "host", "port", "database", "username", "dsn", "owner_id"):
-            if key in payload:
-                setattr(row, key, payload.get(key))
-        if "enabled" in payload:
-            row.enabled = 1 if payload.get("enabled") else 0
-        if "secret_ref" in payload:
-            row.secret_ref = payload.get("secret_ref")
-        elif "password" in payload:
-            row.secret_ref = payload.get("password")
-        if "extra" in payload and isinstance(payload.get("extra"), dict):
-            row.extra = payload.get("extra")
-        row.updated_at = datetime.utcnow()
-
-        session.commit()
-        session.refresh(row)
-        return ok(_serialize_connection_profile(row, include_sensitive=False), trace_id)
-    finally:
-        session.close()
-
-
-@app.delete("/api/connection-profiles/{profile_id}")
-@app.delete("/api/v1/connection-profiles/{profile_id}")
-def api_delete_connection_profile(profile_id: int, request: Request):
-    trace_id = make_trace_id(request.headers.get("x-trace-id"))
-    session = SessionLocal()
-    try:
-        row = (
-            session.query(db_models.ConnectionProfileModel)
-            .filter(db_models.ConnectionProfileModel.id == profile_id)
-            .first()
-        )
-        if not row:
-            raise HTTPException(status_code=404, detail="connection profile not found")
-
-        linked = (
-            session.query(db_models.ExportJobModel)
-            .filter(db_models.ExportJobModel.connection_profile_id == profile_id)
-            .count()
-        )
-        if linked > 0:
-            raise HTTPException(status_code=409, detail="profile is used by export jobs")
-
-        session.delete(row)
-        session.commit()
-        return ok({"deleted": True}, trace_id)
-    finally:
-        session.close()
-
-
-@app.post("/api/connection-profiles/{profile_id}/test")
-@app.post("/api/v1/connection-profiles/{profile_id}/test")
-def api_test_connection_profile(profile_id: int, payload: Dict[str, Any], request: Request):
-    trace_id = make_trace_id(request.headers.get("x-trace-id"))
-    session = SessionLocal()
-    try:
-        row = (
-            session.query(db_models.ConnectionProfileModel)
-            .filter(db_models.ConnectionProfileModel.id == profile_id)
-            .first()
-        )
-        if not row:
-            raise HTTPException(status_code=404, detail="connection profile not found")
-
-        override = payload.get("override") if isinstance(payload.get("override"), dict) else {}
-        cfg = _profile_to_db_config(row, override)
-
-        try:
-            engine = engine_from_config(cfg)
-            with engine.connect() as conn:
-                conn.exec_driver_sql("SELECT 1")
-            return ok({"ok": True, "message": "connected"}, trace_id)
-        except Exception as exc:
-            return ok({"ok": False, "message": str(exc)}, trace_id)
     finally:
         session.close()
 
@@ -1022,7 +856,6 @@ def api_list_factory_jobs(request: Request, factory_id: Optional[str] = Query(de
                 "table": table_name,
                 "schedule": r.schedule,
                 "file_format": r.file_format,
-                "connection_profile_id": getattr(r, "connection_profile_id", None),
                 "enabled": bool(r.enabled),
                 "last_run": r.last_run.isoformat() if r.last_run else None,
                 "status": r.status,
@@ -1175,12 +1008,12 @@ def api_get_factory_tree(request: Request, factory_id: Optional[str] = Query(def
 
 @app.post("/api/internal/factory-tree/fetch")
 @app.post("/api/v1/internal/factory-tree/fetch")
-def api_fetch_factory_tree(payload: Dict[str, Any], request: Request):
+def api_fetch_factory_tree(request: Request, payload: Optional[Dict[str, Any]] = Body(default=None)):
     trace_id = make_trace_id(request.headers.get("x-trace-id"))
-    resolved_factory = _normalize_factory_id(payload.get("factory_id"))
-    source_path = Path(str(payload.get("path") or "")).expanduser()
-    if not str(source_path):
-        raise HTTPException(status_code=400, detail="path is required")
+    body = payload or {}
+    resolved_factory = _normalize_factory_id(body.get("factory_id"))
+    source_raw = str(body.get("path") or "").strip()
+    source_path = Path(source_raw).expanduser() if source_raw else NIFI_BASE_DIR
     if not source_path.exists():
         raise HTTPException(status_code=404, detail="source path not found")
 
@@ -1193,7 +1026,18 @@ def api_fetch_factory_tree(payload: Dict[str, Any], request: Request):
     if not any(str(resolved_source).startswith(str(root)) for root in allowed_roots):
         raise HTTPException(status_code=403, detail="path not allowed")
 
-    copied = _copy_path_to_in_data(resolved_source, resolved_factory, base_name=payload.get("alias"))
+    target_root = (IN_DATA_BASE_DIR / resolved_factory).resolve()
+    if str(resolved_source).startswith(str(target_root)):
+        # Guard against nesting copies like in_data/factory-001 -> in_data/factory-001/factory-001/...
+        return ok({
+            "factory_id": resolved_factory,
+            "copied": [],
+            "count": 0,
+            "skipped": True,
+            "message": "source path is already target in_data factory root",
+        }, trace_id)
+
+    copied = _copy_path_to_in_data(resolved_source, resolved_factory, base_name=body.get("alias"))
     record = {
         "factory_id": resolved_factory,
         "job_id": str(payload.get("job_id") or ""),
@@ -1207,6 +1051,27 @@ def api_fetch_factory_tree(payload: Dict[str, Any], request: Request):
     }
     _append_factory_report(record)
     return ok({"factory_id": resolved_factory, "copied": copied, "count": len(copied)}, trace_id)
+
+
+@app.post("/api/internal/factory-tree/refresh")
+@app.post("/api/v1/internal/factory-tree/refresh")
+def api_refresh_factory_tree(request: Request, payload: Optional[Dict[str, Any]] = Body(default=None)):
+    trace_id = make_trace_id(request.headers.get("x-trace-id"))
+    body = payload or {}
+    resolved_factory = _normalize_factory_id(body.get("factory_id"))
+
+    # Refresh means rescan the known NiFi archive roots and mirror missing/new files
+    # into the current factory archive root, without creating an extra nifi_data layer.
+    before_known = set(str(meta.get("storagePath", "")) for meta in files.values() if meta.get("storagePath"))
+    _sync_nifi_files()
+    after_known = set(str(meta.get("storagePath", "")) for meta in files.values() if meta.get("storagePath"))
+    created = len(after_known - before_known)
+
+    return ok({
+        "factory_id": resolved_factory,
+        "created": created,
+        "message": "refresh completed",
+    }, trace_id)
 
 
 def _write_ndjson(path: Path, columns: List[str], rows: List[Dict[str, Any]], append: bool = False) -> None:
@@ -1439,14 +1304,30 @@ async def run_job(job_id: str) -> None:
 
 
 def register_existing_file(file_path: Path, file_format: str) -> Dict[str, Any]:
+    resolved_path = file_path.resolve()
+    existing_meta = next((meta for meta in files.values() if str(meta.get("storagePath", "")) == str(resolved_path)), None)
+    if existing_meta is not None:
+        existing_meta.update({
+            "fileName": resolved_path.name,
+            "fileFormat": file_format.upper(),
+            "fileSize": resolved_path.stat().st_size,
+            "storageType": "LOCAL",
+            "storagePath": str(resolved_path),
+        })
+        try:
+            _mirror_to_in_data(resolved_path, DEFAULT_FACTORY_ID)
+        except Exception:
+            pass
+        return existing_meta
+
     file_id = f"file_{uuid.uuid4().hex[:10]}"
     file_meta = {
         "fileId": file_id,
-        "fileName": file_path.name,
+        "fileName": resolved_path.name,
         "fileFormat": file_format.upper(),
-        "fileSize": file_path.stat().st_size,
+        "fileSize": resolved_path.stat().st_size,
         "storageType": "LOCAL",
-        "storagePath": str(file_path),
+        "storagePath": str(resolved_path),
         "createdAt": now_iso(),
         "jobId": "",
     }
@@ -1466,6 +1347,14 @@ def register_existing_file(file_path: Path, file_format: str) -> Dict[str, Any]:
         db.commit()
     except Exception:
         pass
+
+    # If the source file originates from the local NiFi archive area, mirror it
+    # into in_data so the internal page always reflects the latest artifact set.
+    try:
+        _mirror_to_in_data(resolved_path, DEFAULT_FACTORY_ID)
+    except Exception:
+        pass
+
     return file_meta
 
 
@@ -1484,25 +1373,37 @@ def _guess_file_format(file_path: Path) -> Optional[str]:
 
 def _sync_nifi_files() -> None:
     # Merge files from disk into runtime registry so UI can show complete directory/file data.
-    known_paths = set()
-    for meta in files.values():
-        p = str(meta.get("storagePath", ""))
-        if p:
-            known_paths.add(p)
-
+    # Build set of actual files on disk under tracked roots
+    disk_paths = set()
     for root in [NIFI_BASE_DIR, IN_DATA_BASE_DIR]:
         if not root.exists() or not root.is_dir():
             continue
-
         for p in root.rglob("*"):
             if not p.is_file():
                 continue
-            p_str = str(p)
-            if p_str in known_paths:
-                continue
-            fmt = _guess_file_format(p)
-            register_existing_file(p, fmt)
-            known_paths.add(p_str)
+            disk_paths.add(str(p.resolve()))
+
+    # Remove registry entries that point to files no longer present on disk
+    for fid, meta in list(files.items()):
+        sp = str(meta.get("storagePath", ""))
+        if not sp:
+            continue
+        # only consider NiFi / in_data managed paths for removal
+        if sp.startswith(str(NIFI_BASE_DIR)) or sp.startswith(str(IN_DATA_BASE_DIR)):
+            if sp not in disk_paths:
+                try:
+                    del files[fid]
+                except Exception:
+                    pass
+
+    # Register any new files found on disk
+    known_paths = set(str(meta.get("storagePath", "")) for meta in files.values() if meta.get("storagePath"))
+    for p_str in disk_paths:
+        if p_str in known_paths:
+            continue
+        p = Path(p_str)
+        fmt = _guess_file_format(p)
+        register_existing_file(p, fmt)
 
 
 @app.on_event("startup")

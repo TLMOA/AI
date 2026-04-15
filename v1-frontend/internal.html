@@ -1,0 +1,171 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>内部管理页</title>
+  <link rel="stylesheet" href="./styles.css" />
+  <style>
+    .internal-grid {
+      display: grid;
+      grid-template-columns: 280px 1fr;
+      gap: 12px;
+    }
+    .internal-grid > div {
+      min-width: 0;
+    }
+    .tree-box {
+      max-height: 420px;
+      overflow: auto;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 8px;
+      background: #fff;
+    }
+    .file-table-wrap {
+      max-height: 260px;
+      overflow: auto;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+    }
+    .file-table-wrap table,
+    .preview-table-wrap table {
+      width: 100%;
+      table-layout: fixed;
+    }
+    .file-table-wrap th,
+    .file-table-wrap td,
+    .preview-table-wrap th,
+    .preview-table-wrap td {
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      max-width: 220px;
+    }
+    .preview-table-wrap {
+      max-height: 320px;
+      overflow-x: auto;
+      overflow-y: auto;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      margin-top: 8px;
+    }
+    .preview-table-wrap table {
+      width: max-content;
+      min-width: 100%;
+      table-layout: auto;
+    }
+    .preview-table-wrap th,
+    .preview-table-wrap td {
+      white-space: nowrap;
+      overflow: visible;
+      text-overflow: clip;
+      max-width: none;
+    }
+    .preview-table-wrap table thead th {
+      position: sticky;
+      top: 0;
+      background: #fff;
+      z-index: 2;
+    }
+    .muted {
+      color: var(--muted);
+      font-size: 12px;
+    }
+    #previewRaw {
+      white-space: pre-wrap;
+      word-break: break-word;
+      overflow-wrap: anywhere;
+      max-width: 100%;
+    }
+    @media (max-width: 980px) {
+      .internal-grid {
+        grid-template-columns: 1fr;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="app">
+    <header>
+      <h1>内部管理页</h1>
+      <p>工厂归档中心（in_data）</p>
+      <p><a href="./index.html" rel="noopener">返回主控制台</a></p>
+    </header>
+
+    <section class="card">
+      <div class="row">
+        <label>工厂</label>
+        <select id="factorySelect"></select>
+        <button id="refreshBtn">刷新</button>
+        <span id="statusMsg" class="muted"></span>
+      </div>
+    </section>
+
+    <section class="card internal-grid">
+      <div>
+        <h3>目录树</h3>
+        <div id="treeBox" class="small tree-box"></div>
+      </div>
+      <div>
+        <h3>文件列表</h3>
+        <p id="currentPath" class="muted"></p>
+        <div id="fileTableWrapper">
+          <table>
+            <thead>
+              <tr>
+                <th>fileId</th><th>文件名</th><th>格式</th><th>大小</th><th>操作</th>
+              </tr>
+            </thead>
+            <tbody id="fileTable"></tbody>
+          </table>
+        </div>
+        <div class="row" style="margin-top:8px; gap:8px; align-items:center;">
+          <button id="prevPage">上一页</button>
+          <button id="nextPage">下一页</button>
+          <label>每页</label>
+          <select id="pageSizeSelect">
+            <option value="20">20</option>
+            <option value="50">50</option>
+            <option value="100">100</option>
+          </select>
+          <span id="filePageInfo" class="muted"></span>
+        </div>
+
+        <h3 style="margin-top:12px;">文件预览</h3>
+        <div class="row">
+          <label>offset</label>
+          <input id="previewOffset" type="number" min="0" value="0" />
+          <label>limit</label>
+          <input id="previewLimit" type="number" min="1" value="20" />
+          <button id="reloadPreviewBtn" class="secondary">刷新预览</button>
+        </div>
+        <div class="preview-table-wrap">
+          <table class="preview-table">
+            <thead id="previewHead"></thead>
+            <tbody id="previewBody"></tbody>
+          </table>
+        </div>
+        <pre id="previewRaw" style="display:none;">请选择文件并点击预览</pre>
+        <div class="row" style="margin-top:8px; gap:8px; align-items:center;">
+          <label>分隔符</label>
+          <select id="delimiterSelect">
+            <option value="," selected>逗号 (,)</option>
+            <option value="\t">制表符 (\t)</option>
+            <option value=";">分号 (;)</option>
+          </select>
+          <label>编码</label>
+          <select id="encodingSelect">
+            <option value="utf-8" selected>UTF-8</option>
+            <option value="gbk">GBK</option>
+          </select>
+          <button id="downloadFullBtn" class="secondary">下载完整文件</button>
+        </div>
+      </div>
+    </section>
+  </div>
+
+  <script src="./config.js?v=20260415_1"></script>
+  <script src="./internal.js?v=20260415_2"></script>
+</body>
+</html>

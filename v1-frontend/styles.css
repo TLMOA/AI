@@ -246,3 +246,84 @@ body.modal-open {
   background: #ffffff;
   overflow: auto;
 }
+
+.schedule-modal-shell {
+  position: fixed;
+  inset: 0;
+  z-index: 10001;
+}
+
+.schedule-modal-backdrop {
+  position: absolute;
+  inset: 0;
+  background: rgba(15, 23, 42, 0.55);
+}
+
+.schedule-modal-panel {
+  position: absolute;
+  left: 50%;
+  top: 8%;
+  transform: translateX(-50%);
+  width: min(1100px, 92vw);
+  max-height: 84vh;
+  overflow: auto;
+  background: #ffffff;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 12px;
+  box-shadow: 0 18px 48px rgba(0, 0, 0, 0.28);
+}
+
+.schedule-modal-header {
+  position: sticky;
+  top: 0;
+  background: #ffffff;
+  z-index: 1;
+  padding-bottom: 8px;
+  margin-bottom: 8px;
+}
+
+.schedule-table-wrap {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  overflow: auto;
+  max-height: 62vh;
+}
+
+.schedule-actions {
+  display: flex;
+  gap: 6px;
+}
+
+.tiny-btn {
+  height: 28px;
+  font-size: 12px;
+  padding: 0 8px;
+}
+
+.file-table-wrap {
+  max-height: 260px;
+  overflow-x: auto;
+  overflow-y: auto;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  width: 100%;
+  box-sizing: border-box;
+}
+
+/* 彻底移除省略号和固定布局，保证内容完整显示+横向滚动条 */
+.file-table-wrap table {
+  min-width: 100%;
+  table-layout: auto;
+}
+.preview-table-wrap table {
+  min-width: 900px;
+  table-layout: auto;
+}
+
+.file-table-wrap th,
+.file-table-wrap td,
+.preview-table-wrap th,
+.preview-table-wrap td {
+  white-space: nowrap;
+}

@@ -54,28 +54,7 @@ class ExportJobModel(BASE):
     last_run = Column(DateTime, nullable=True)
     status = Column(String(64), nullable=True)
     db_config = Column(JSON, nullable=True)
-    connection_profile_id = Column(Integer, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
-
-
-class ConnectionProfileModel(BASE):
-    __tablename__ = "connection_profiles"
-    id = Column(Integer, primary_key=True, autoincrement=True)
-    name = Column(String(128), nullable=False, unique=True)
-    db_type = Column(String(32), nullable=False, default="mysql")
-    driver = Column(String(64), nullable=True)
-    host = Column(String(255), nullable=True)
-    port = Column(Integer, nullable=True)
-    database = Column(String(255), nullable=True)
-    username = Column(String(128), nullable=True)
-    # For MVP, keep secret_ref as opaque text (vault ref or encrypted blob id).
-    secret_ref = Column(Text, nullable=True)
-    dsn = Column(Text, nullable=True)
-    extra = Column(JSON, default={})
-    owner_id = Column(String(64), nullable=True)
-    enabled = Column(Integer, default=1)
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow)
 
 
 def get_engine(db_path: Path):
@@ -94,7 +73,5 @@ def init_db(db_path: Path):
         col_names = {row[1] for row in cols}
         if "factory_id" not in col_names:
             conn.execute(text("ALTER TABLE export_jobs ADD COLUMN factory_id VARCHAR(64)"))
-        if "connection_profile_id" not in col_names:
-            conn.execute(text("ALTER TABLE export_jobs ADD COLUMN connection_profile_id INTEGER"))
 
     return sessionmaker(bind=engine)

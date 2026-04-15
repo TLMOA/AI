@@ -1,4 +1,5 @@
 const config = window.APP_CONFIG;
+const DEFAULT_FACTORY_ID = config.FACTORY_ID || "factory-001";
 
 const KNOWN_NIFI_DIRS = [
   "/home/yhz/nifi-data/output_csv",
@@ -51,6 +52,82 @@ function api(path, options = {}) {
     return mockApi(path, options);
   }
   return fetch(`${config.API_BASE}${path}`, options).then((r) => r.json());
+}
+
+function _normalizeBase(base) {
+  const b = String(base || "").trim();
+  if (!b) return "";
+  return b.startsWith("/") ? b : `/${b}`;
+}
+
+async function exportJobsApi(path, options = {}) {
+  const apiBaseNormalized = _normalizeBase(config.API_BASE || "");
+  const apiBaseNoV1 = apiBaseNormalized.replace(/\/v1\/?$/, "");
+  const apiBaseRelative = apiBaseNormalized.replace(/^\//, "");
+  const apiBaseNoV1Relative = apiBaseNoV1.replace(/^\//, "");
+  const candidates = [];
+
+  const absoluteOrigins = [
+    // Current backend default in this project.
+    "http://127.0.0.1:8081",
+    "http://localhost:8081",
+  ];
+
+  // Prefer /api/v1 first because frontend proxy only forwards /api/v1 POST.
+  ["/api/v1", "api/v1", apiBaseNormalized, apiBaseRelative, "/api", "api", apiBaseNoV1, apiBaseNoV1Relative].forEach((base) => {
+    if (!base) return;
+    if (!candidates.includes(base)) {
+      candidates.push(base);
+    }
+  });
+
+  // Also try absolute API endpoints to avoid hitting static web server routes (405 HTML).
+  absoluteOrigins.forEach((origin) => {
+    ["/api", "/api/v1", apiBaseNoV1 || "/api", apiBaseNormalized || "/api/v1"].forEach((base) => {
+      const merged = `${origin}${base.startsWith("/") ? base : `/${base}`}`;
+      if (!candidates.includes(merged)) {
+        candidates.push(merged);
+      }
+    });
+  });
+
+  let lastError = null;
+  for (const base of candidates) {
+    try {
+      const prefix = base.endsWith("/") ? base.slice(0, -1) : base;
+      const r = await fetch(`${prefix}${path}`, options);
+      const text = await r.text();
+      let body = {};
+      try {
+        body = text ? JSON.parse(text) : {};
+      } catch (_) {
+        body = { raw: text };
+      }
+
+      if (!r.ok) {
+        const msg = body?.detail || body?.message || body?.raw || `HTTP ${r.status}`;
+        const contentType = (r.headers.get("content-type") || "").toLowerCase();
+        const rawText = String(body?.raw || "");
+        const looksLikeHtmlError = contentType.includes("text/html") || /<html|<!doctype/i.test(rawText);
+
+        // HTML 404/405/501 usually means request hit static server/proxy mismatch; try next candidate.
+        if (r.status === 404 || ((r.status === 405 || r.status === 501) && looksLikeHtmlError)) {
+          lastError = { code: r.status, message: msg };
+          continue;
+        }
+        return { code: r.status, message: msg, data: body?.data ?? null };
+      }
+      return body;
+    } catch (e) {
+      lastError = { code: -1, message: e?.message || String(e) };
+    }
+  }
+
+  return {
+    code: lastError?.code || -1,
+    message: `request failed: ${lastError?.message || "no reachable export-jobs endpoint"}`,
+    data: null,
+  };
 }
 
 function mockApi(path, options = {}) {
@@ -307,6 +384,17 @@ function filterFilesByCurrentDir() {
 }
 
 async function loadFiles() {
+  // Ensure backend rescans NiFi roots so deletions/additions are reflected
+  try {
+    await api("/internal/factory-tree/refresh", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ factory_id: DEFAULT_FACTORY_ID }),
+    });
+  } catch (e) {
+    // ignore refresh errors — we'll still try to load files
+    console.warn("refresh scan failed:", e);
+  }
   const pageSize = 500;
   let pageNo = 1;
   const allRows = [];
@@ -414,124 +502,6 @@ async function previewFile(fileId) {
         };
       }
     } else {
-
-  // --- DB export handlers: immediate export and schedule creation ---
-  async function dbTestConn() {
-    const host = document.getElementById('dbHost').value;
-    const port = Number(document.getElementById('dbPort').value || 3306);
-    const database = document.getElementById('dbName').value;
-    const user = document.getElementById('dbUser').value;
-    const password = document.getElementById('dbPassword').value;
-    const cfg = { db_type: 'mysql', driver: 'pymysql', host, port, user, password, database };
-    try {
-      const res = await fetch(`${config.API_BASE}/api/db/test`, {
-        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(cfg)
-      });
-      const j = await res.json();
-      document.getElementById('dbConnStatus').textContent = j.message || JSON.stringify(j);
-    } catch (e) {
-      document.getElementById('dbConnStatus').textContent = '连接失败: ' + e.message;
-    }
-  }
-
-  async function dbListTables() {
-    const host = document.getElementById('dbHost').value;
-    const port = Number(document.getElementById('dbPort').value || 3306);
-    const database = document.getElementById('dbName').value;
-    const user = document.getElementById('dbUser').value;
-    const password = document.getElementById('dbPassword').value;
-    const cfg = { db_type: 'mysql', driver: 'pymysql', host, port, user, password, database };
-    try {
-      const res = await fetch(`${config.API_BASE}/api/db/list-tables`, {
-        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(cfg)
-      });
-      const j = await res.json();
-      const sel = document.getElementById('dbTableSelect');
-      sel.innerHTML = '<option value="">-- 先选择 --</option>';
-      if (j && j.tables) {
-        j.tables.forEach(t => {
-          const opt = document.createElement('option'); opt.value = t; opt.textContent = t; sel.appendChild(opt);
-        });
-      }
-    } catch (e) {
-      console.error(e);
-    }
-  }
-
-  async function dbExportImmediate() {
-    const table = document.getElementById('dbTableInput').value || document.getElementById('dbTableSelect').value;
-    if (!table) { document.getElementById('dbExportResult').textContent = '请先选择或输入表名'; return; }
-    const host = document.getElementById('dbHost').value;
-    const port = Number(document.getElementById('dbPort').value || 3306);
-    const database = document.getElementById('dbName').value;
-    const user = document.getElementById('dbUser').value;
-    const password = document.getElementById('dbPassword').value;
-    const format = document.getElementById('dbExportFormat').value || 'CSV';
-    const saveLocation = document.getElementById('dbSaveLocation').value || '';
-    const db_conf = { db_type: 'mysql', driver: 'pymysql', host, port, user, password, database };
-    const job = { owner_id: 'web-user', payload: { table }, db_config: db_conf, file_format: format, destination: { outputDir: saveLocation } };
-    try {
-      const res = await fetch(`${config.API_BASE}/api/export-jobs/trigger`, {
-        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(job)
-      });
-      const j = await res.json();
-      if (j.ok || j.code === 0) {
-        document.getElementById('dbExportResult').textContent = '导出成功: ' + JSON.stringify(j.data || j);
-      } else {
-        document.getElementById('dbExportResult').textContent = '导出返回: ' + JSON.stringify(j);
-      }
-    } catch (e) {
-      document.getElementById('dbExportResult').textContent = '导出失败: ' + e.message;
-    }
-  }
-
-  async function dbCreateSchedule() {
-    const table = document.getElementById('dbTableInput').value || document.getElementById('dbTableSelect').value;
-    if (!table) { document.getElementById('dbExportResult').textContent = '请先选择或输入表名'; return; }
-    const host = document.getElementById('dbHost').value;
-    const port = Number(document.getElementById('dbPort').value || 3306);
-    const database = document.getElementById('dbName').value;
-    const user = document.getElementById('dbUser').value;
-    const password = document.getElementById('dbPassword').value;
-    const format = document.getElementById('dbExportFormat').value || 'CSV';
-    const freq = document.getElementById('dbFrequencySelect').value || '';
-    const saveLocation = document.getElementById('dbSaveLocation').value || '';
-    if (!freq) { document.getElementById('dbExportResult').textContent = '请选择频率后创建定时任务'; return; }
-    const db_conf = { db_type: 'mysql', driver: 'pymysql', host, port, user, password, database };
-    const payload = { table };
-    const body = {
-      job_name: `export_${database}_${table}`,
-      owner_id: 'web-user',
-      schedule: freq,
-      file_format: format,
-      destination: { outputDir: saveLocation },
-      mode: 'visible',
-      enabled: true,
-      db_config: db_conf,
-      payload,
-    };
-    try {
-      const res = await fetch(`${config.API_BASE}/api/export-jobs`, {
-        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body)
-      });
-      const j = await res.json();
-      if (j.code === 0 || j.ok) {
-        document.getElementById('dbExportResult').textContent = '创建定时任务成功: ' + JSON.stringify(j.data || j);
-      } else {
-        document.getElementById('dbExportResult').textContent = '创建任务返回: ' + JSON.stringify(j);
-      }
-    } catch (e) {
-      document.getElementById('dbExportResult').textContent = '创建任务失败: ' + e.message;
-    }
-  }
-
-  // attach handlers when DOM ready
-  window.addEventListener('load', () => {
-    const dbTestBtn = document.getElementById('dbTestBtn'); if (dbTestBtn) dbTestBtn.addEventListener('click', dbTestConn);
-    const dbListBtn = document.getElementById('dbListBtn'); if (dbListBtn) dbListBtn.addEventListener('click', dbListTables);
-    const dbExportBtn = document.getElementById('dbExportBtn'); if (dbExportBtn) dbExportBtn.addEventListener('click', dbExportImmediate);
-    const dbScheduleBtn = document.getElementById('dbScheduleBtn'); if (dbScheduleBtn) dbScheduleBtn.addEventListener('click', dbCreateSchedule);
-  });
       editable.style.display = "none";
       state.previewColumns = [];
       state.previewRows = [];
@@ -698,6 +668,217 @@ async function triggerAutoTag() {
   await loadFiles();
 }
 
+function getScheduleSpecFromUi() {
+  const freq = document.getElementById("dbScheduleFreq")?.value || "5m";
+  const cron = document.getElementById("dbScheduleCron")?.value.trim() || "";
+  if (freq === "cron") {
+    return cron;
+  }
+  return freq;
+}
+
+function collectDbConfigForSchedule() {
+  return {
+    db_type: "mysql",
+    host: document.getElementById("dbHost")?.value.trim() || "127.0.0.1",
+    port: Number(document.getElementById("dbPort")?.value || 3306),
+    user: document.getElementById("dbUser")?.value.trim() || "root",
+    password: document.getElementById("dbPassword")?.value || "",
+    database: document.getElementById("dbName")?.value.trim() || "",
+    table: getSelectedTableForSchedule(),
+  };
+}
+
+function getSelectedTableForSchedule() {
+  const select = document.getElementById("dbTableSelect");
+  const input = document.getElementById("dbTableInput");
+  return (select && select.value) || (input && input.value.trim()) || "";
+}
+
+function setScheduleMessage(text, isError = false) {
+  const el = document.getElementById("dbScheduleResult");
+  if (!el) return;
+  el.style.color = isError ? "#b91c1c" : "#0f766e";
+  el.textContent = text;
+}
+
+function formatScheduleTime(ts) {
+  if (!ts) return "-";
+  try {
+    let normalized = String(ts).trim();
+    if (/^\d{4}-\d{2}-\d{2}T/.test(normalized) && !/(Z|[+-]\d{2}:?\d{2})$/.test(normalized)) {
+      normalized = `${normalized}Z`;
+    }
+    const d = new Date(normalized);
+    if (Number.isNaN(d.getTime())) return String(ts);
+    return d.toLocaleString("zh-CN", { hour12: false });
+  } catch (_) {
+    return String(ts);
+  }
+}
+
+function buildSchedulePayload() {
+  const table = getSelectedTableForSchedule();
+  const format = (document.getElementById("dbExportFormat")?.value || "CSV").toLowerCase();
+  const spec = getScheduleSpecFromUi();
+  if (!table) {
+    throw new Error("请先选择或输入表名");
+  }
+  if (!spec) {
+    throw new Error("请选择频率或填写 cron 表达式");
+  }
+  return {
+    job_name: `db_export_${table}_${Date.now()}`,
+    factory_id: DEFAULT_FACTORY_ID,
+    owner_id: "user-001",
+    schedule: spec,
+    file_format: format,
+    enabled: true,
+    mode: "visible",
+    destination: { type: "local", path: "nifi_data/exports" },
+    db_config: collectDbConfigForSchedule(),
+    payload: { table },
+  };
+}
+
+async function createScheduledExportFromDb() {
+  try {
+    const payload = buildSchedulePayload();
+    setScheduleMessage("创建定时任务中...");
+    const res = await exportJobsApi("/export-jobs", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    if (res.code !== 0) {
+      setScheduleMessage(`创建失败: ${res.message || "未知错误"}`, true);
+      return;
+    }
+    setScheduleMessage(`创建成功，任务ID: ${res.data?.id}`);
+    await loadExportJobsForModal();
+  } catch (e) {
+    setScheduleMessage(`创建失败: ${e.message || e}`, true);
+  }
+}
+
+function openScheduleModal() {
+  const modal = document.getElementById("scheduleModal");
+  if (!modal) return;
+  modal.style.display = "block";
+  document.body.classList.add("modal-open");
+  loadExportJobsForModal().catch(() => {});
+}
+
+function closeScheduleModal() {
+  const modal = document.getElementById("scheduleModal");
+  if (!modal) return;
+  modal.style.display = "none";
+  document.body.classList.remove("modal-open");
+}
+
+function renderExportJobsRows(list) {
+  const tbody = document.getElementById("scheduleTableBody");
+  if (!tbody) return;
+  tbody.innerHTML = "";
+  list.forEach((job) => {
+    const tr = document.createElement("tr");
+    tr.innerHTML = `
+      <td>${job.id ?? "-"}</td>
+      <td>${job.job_name || "-"}</td>
+      <td>${job.factory_id || DEFAULT_FACTORY_ID}</td>
+      <td>${job.schedule || "-"}</td>
+      <td>${(job.file_format || "-").toUpperCase()}</td>
+      <td>${job.enabled ? "是" : "否"}</td>
+      <td>${formatScheduleTime(job.created_at)}</td>
+      <td>
+        <div class="schedule-actions">
+          <button class="tiny-btn" data-action="toggle" data-id="${job.id}" data-enabled="${job.enabled ? "1" : "0"}">${job.enabled ? "禁用" : "启用"}</button>
+          <button class="tiny-btn" data-action="trigger" data-id="${job.id}">触发</button>
+          <button class="tiny-btn secondary" data-action="delete" data-id="${job.id}">删除</button>
+        </div>
+      </td>
+    `;
+    tbody.appendChild(tr);
+  });
+
+  tbody.querySelectorAll("button[data-action]").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const id = btn.dataset.id;
+      const action = btn.dataset.action;
+      if (!id || !action) return;
+      if (action === "toggle") {
+        const enabled = btn.dataset.enabled !== "1";
+        await patchExportJob(id, { enabled });
+      } else if (action === "trigger") {
+        await triggerExportJob(id);
+      } else if (action === "delete") {
+        await deleteExportJob(id);
+      }
+      await loadExportJobsForModal();
+    });
+  });
+}
+
+async function loadExportJobsForModal() {
+  const q = new URLSearchParams({ factory_id: DEFAULT_FACTORY_ID });
+  const res = await exportJobsApi(`/export-jobs?${q.toString()}`, { method: "GET" });
+  if (res.code !== 0) {
+    setScheduleMessage(`加载任务失败: ${res.message || "未知错误"}`, true);
+    return;
+  }
+  renderExportJobsRows(res.data || []);
+}
+
+async function patchExportJob(id, patch) {
+  const res = await exportJobsApi(`/export-jobs/${id}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(patch),
+  });
+  if (res.code !== 0) {
+    setScheduleMessage(`更新失败: ${res.message || "未知错误"}`, true);
+    return;
+  }
+  setScheduleMessage(`任务 ${id} 已更新`);
+}
+
+async function deleteExportJob(id) {
+  const res = await exportJobsApi(`/export-jobs/${id}`, { method: "DELETE" });
+  if (res.code !== 0) {
+    setScheduleMessage(`删除失败: ${res.message || "未知错误"}`, true);
+    return;
+  }
+  setScheduleMessage(`任务 ${id} 已删除`);
+}
+
+async function triggerExportJob(id) {
+  const detail = await exportJobsApi(`/export-jobs/${id}`, { method: "GET" });
+  if (detail.code !== 0 || !detail.data) {
+    setScheduleMessage(`获取任务详情失败: ${detail.message || "未知错误"}`, true);
+    return;
+  }
+  const body = {
+    id: detail.data.id,
+    job_name: detail.data.job_name,
+    factory_id: detail.data.factory_id || DEFAULT_FACTORY_ID,
+    owner_id: detail.data.owner_id,
+    db_config: detail.data.db_config,
+    file_format: detail.data.file_format,
+    destination: detail.data.destination,
+    payload: detail.data.payload || { table: getSelectedTableForSchedule() },
+  };
+  const res = await exportJobsApi("/export-jobs/trigger", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (res.code !== 0) {
+    setScheduleMessage(`触发失败: ${res.message || "未知错误"}`, true);
+    return;
+  }
+  setScheduleMessage(`任务 ${id} 触发成功`);
+}
+
 function bindEvents() {
   document.getElementById("createBtn").addEventListener("click", createJob);
   document.getElementById("refreshBtn").addEventListener("click", loadJobs);
@@ -709,9 +890,21 @@ function bindEvents() {
   const dbTestBtn = document.getElementById("dbTestBtn");
   const dbListBtn = document.getElementById("dbListBtn");
   const dbExportBtn = document.getElementById("dbExportBtn");
+  const dbCreateScheduleBtn = document.getElementById("dbCreateScheduleBtn");
+  const dbManageSchedulesBtn = document.getElementById("dbManageSchedulesBtn");
+  const scheduleCloseBtn = document.getElementById("scheduleModalCloseBtn");
+  const scheduleBackdrop = document.getElementById("scheduleModalBackdrop");
+  const scheduleRefreshBtn = document.getElementById("scheduleRefreshBtn");
   if (dbTestBtn) dbTestBtn.addEventListener("click", testDbConnection);
   if (dbListBtn) dbListBtn.addEventListener("click", listTables);
   if (dbExportBtn) dbExportBtn.addEventListener("click", exportFromDb);
+  if (dbCreateScheduleBtn) dbCreateScheduleBtn.addEventListener("click", createScheduledExportFromDb);
+  if (dbManageSchedulesBtn) dbManageSchedulesBtn.addEventListener("click", openScheduleModal);
+  if (scheduleCloseBtn) scheduleCloseBtn.addEventListener("click", closeScheduleModal);
+  if (scheduleBackdrop) scheduleBackdrop.addEventListener("click", closeScheduleModal);
+  if (scheduleRefreshBtn) scheduleRefreshBtn.addEventListener("click", () => {
+    loadExportJobsForModal().catch(() => {});
+  });
 }
 
 function init() {

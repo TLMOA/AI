@@ -40,6 +40,30 @@ class FrontendHandler(SimpleHTTPRequestHandler):
             return
         self.send_error(405, "Method Not Allowed")
 
+    def do_PUT(self):
+        if self.path.startswith("/api/v1/") or self.path == "/api/v1":
+            self._proxy()
+            return
+        self.send_error(405, "Method Not Allowed")
+
+    def do_PATCH(self):
+        if self.path.startswith("/api/v1/") or self.path == "/api/v1":
+            self._proxy()
+            return
+        self.send_error(405, "Method Not Allowed")
+
+    def do_DELETE(self):
+        if self.path.startswith("/api/v1/") or self.path == "/api/v1":
+            self._proxy()
+            return
+        self.send_error(405, "Method Not Allowed")
+
+    def do_OPTIONS(self):
+        if self.path.startswith("/api/v1/") or self.path == "/api/v1":
+            self._proxy(head_only=True)
+            return
+        self.send_error(405, "Method Not Allowed")
+
     def _proxy(self, head_only: bool = False):
         parsed = urlsplit(self.path)
         path = parsed.path
