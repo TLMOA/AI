@@ -57,6 +57,15 @@ class ExportJobModel(BASE):
     created_at = Column(DateTime, default=datetime.utcnow)
 
 
+class IotUser(BASE):
+    __tablename__ = "iot_users"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    username = Column(String(128), unique=True, index=True, nullable=False)
+    password_hash = Column(String(256), nullable=False)
+    is_admin = Column(Integer, default=0)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
 def get_engine(db_path: Path):
     url = f"sqlite:///{db_path}"
     engine = create_engine(url, connect_args={"check_same_thread": False})
@@ -73,5 +82,30 @@ def init_db(db_path: Path):
         col_names = {row[1] for row in cols}
         if "factory_id" not in col_names:
             conn.execute(text("ALTER TABLE export_jobs ADD COLUMN factory_id VARCHAR(64)"))
+
+        # Ensure iot_users table exists and a default admin user is present
+        try:
+            users = conn.execute(text("SELECT name FROM sqlite_master WHERE type='table' AND name='iot_users'" )).fetchone()
+            if not users:
+                # create table via metadata (already called create_all), but ensure minimal init
+                conn.execute(text("CREATE TABLE IF NOT EXISTS iot_users (id INTEGER PRIMARY KEY AUTOINCREMENT, username VARCHAR(128) UNIQUE NOT NULL, password_hash VARCHAR(256) NOT NULL, is_admin INTEGER DEFAULT 0, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)"))
+        except Exception:
+            pass
+
+        # Insert default admin if not exists (password from env or '123456')
+        try:
+            row = conn.execute(text("SELECT id FROM iot_users WHERE username='admin' LIMIT 1")).fetchone()
+            if not row:
+                # compute bcrypt hash if bcrypt available
+                import os as _os
+                pwd = _os.getenv('IOT_ADMIN_PASSWORD', '123456')
+                try:
+                    import bcrypt as _bcrypt
+                    ph = _bcrypt.hashpw(pwd.encode('utf-8'), _bcrypt.gensalt()).decode('utf-8')
+                except Exception:
+                    ph = pwd
+                conn.execute(text("INSERT INTO iot_users (username, password_hash, is_admin) VALUES ('admin', :ph, 1)"), {"ph": ph})
+        except Exception:
+            pass
 
     return sessionmaker(bind=engine)

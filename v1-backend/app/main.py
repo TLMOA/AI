@@ -18,6 +18,8 @@ from pydantic import BaseModel, Field, field_validator
 
 from .executors import MockExecutor, NiFiExecutor
 from .db_connect import router as db_router
+from .auth import router as auth_router
+from .auth import _get_current_user_from_token
 from . import db_models
 from .export_worker import run_export_job
 from .scheduler import start_scheduler, stop_scheduler, schedule_job, remove_scheduled
@@ -94,6 +96,14 @@ IN_DATA_BASE_DIR.mkdir(parents=True, exist_ok=True)
 
 app = FastAPI(title="AI Module V1 Backend", version="0.1.0")
 app.include_router(db_router)
+app.include_router(auth_router)
+
+
+def _require_admin(request: Request):
+    cookie = request.cookies.get("access_token")
+    user = _get_current_user_from_token(cookie)
+    if not user or not user.get("is_admin"):
+        raise HTTPException(status_code=403, detail="管理员权限不足")
 
 
 def _operation_from_path(path: str) -> str:
@@ -801,6 +811,7 @@ def api_delete_export(job_id: int, request: Request):
 @app.post("/api/internal/factory-reports")
 @app.post("/api/v1/internal/factory-reports")
 def api_ingest_factory_report(payload: Dict[str, Any], request: Request):
+    _require_admin(request)
     trace_id = make_trace_id(request.headers.get("x-trace-id"))
     record = {
         "factory_id": _normalize_factory_id(payload.get("factory_id")),
@@ -820,6 +831,7 @@ def api_ingest_factory_report(payload: Dict[str, Any], request: Request):
 @app.get("/api/internal/factory-reports")
 @app.get("/api/v1/internal/factory-reports")
 def api_list_factory_reports(request: Request, factory_id: Optional[str] = Query(default=None), limit: int = Query(default=50, ge=1, le=500)):
+    _require_admin(request)
     trace_id = make_trace_id(request.headers.get("x-trace-id"))
     items = _read_factory_reports()
     if factory_id is not None:
@@ -832,6 +844,7 @@ def api_list_factory_reports(request: Request, factory_id: Optional[str] = Query
 @app.get("/api/internal/factory-jobs")
 @app.get("/api/v1/internal/factory-jobs")
 def api_list_factory_jobs(request: Request, factory_id: Optional[str] = Query(default=None)):
+    _require_admin(request)
     trace_id = make_trace_id(request.headers.get("x-trace-id"))
     resolved_factory = _normalize_factory_id(factory_id)
     session = SessionLocal()
@@ -868,6 +881,7 @@ def api_list_factory_jobs(request: Request, factory_id: Optional[str] = Query(de
 @app.post("/api/internal/factory-jobs/{job_id}/fetch")
 @app.post("/api/v1/internal/factory-jobs/{job_id}/fetch")
 def api_fetch_factory_job(job_id: int, request: Request, factory_id: Optional[str] = Query(default=None)):
+    _require_admin(request)
     trace_id = make_trace_id(request.headers.get("x-trace-id"))
     resolved_factory = _normalize_factory_id(factory_id)
     session = SessionLocal()
@@ -997,6 +1011,7 @@ def api_list_factory_assets(
 @app.get("/api/internal/factory-tree")
 @app.get("/api/v1/internal/factory-tree")
 def api_get_factory_tree(request: Request, factory_id: Optional[str] = Query(default=None)):
+    _require_admin(request)
     trace_id = make_trace_id(request.headers.get("x-trace-id"))
     resolved_factory = _normalize_factory_id(factory_id)
     roots = []
@@ -1009,6 +1024,7 @@ def api_get_factory_tree(request: Request, factory_id: Optional[str] = Query(def
 @app.post("/api/internal/factory-tree/fetch")
 @app.post("/api/v1/internal/factory-tree/fetch")
 def api_fetch_factory_tree(request: Request, payload: Optional[Dict[str, Any]] = Body(default=None)):
+    _require_admin(request)
     trace_id = make_trace_id(request.headers.get("x-trace-id"))
     body = payload or {}
     resolved_factory = _normalize_factory_id(body.get("factory_id"))
@@ -1056,6 +1072,7 @@ def api_fetch_factory_tree(request: Request, payload: Optional[Dict[str, Any]] =
 @app.post("/api/internal/factory-tree/refresh")
 @app.post("/api/v1/internal/factory-tree/refresh")
 def api_refresh_factory_tree(request: Request, payload: Optional[Dict[str, Any]] = Body(default=None)):
+    _require_admin(request)
     trace_id = make_trace_id(request.headers.get("x-trace-id"))
     body = payload or {}
     resolved_factory = _normalize_factory_id(body.get("factory_id"))

@@ -11,7 +11,11 @@
     <header>
       <h1>AI模块V1控制台</h1>
       <p>简化可改造版（JetLinks联调开关默认关闭）</p>
-      <p><a href="./internal.html" target="_blank" rel="noopener">打开内部管理页（单工厂）</a></p>
+      <p>
+        <a id="loginLink" href="/login.html" rel="noopener">登录</a>
+        &nbsp;|&nbsp;
+        <a id="internalLink" href="./internal.html" target="_blank" rel="noopener" style="display:none">打开内部管理页（单工厂）</a>
+      </p>
     </header>
 
     <section class="card">
@@ -71,6 +75,16 @@
 
     <section class="card">
       <h2>数据库导出（MySQL）</h2>
+      <div class="row">
+        <label>数据库类型</label>
+        <select id="dbType">
+          <option value="mysql">MySQL</option>
+          <option value="postgres">PostgreSQL</option>
+          <option value="sqlite">SQLite</option>
+          <option value="mssql">SQLServer</option>
+          <option value="oracle">Oracle</option>
+        </select>
+      </div>
       <div class="row">
         <label>Host</label>
         <input id="dbHost" type="text" value="127.0.0.1" />
