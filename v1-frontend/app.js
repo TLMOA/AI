@@ -51,7 +51,8 @@ function api(path, options = {}) {
   if (config.USE_MOCK_API) {
     return mockApi(path, options);
   }
-  return fetch(`${config.API_BASE}${path}`, options).then((r) => r.json());
+  const fetchOptions = Object.assign({ credentials: 'same-origin' }, options || {});
+  return fetch(`${config.API_BASE}${path}`, fetchOptions).then((r) => r.json());
 }
 
 function _normalizeBase(base) {
@@ -913,6 +914,19 @@ function init() {
   loadFiles();
   loadTagRules();
     bindNiFiButtons(); // Add NiFi trigger button handler implementation
+
+  // Check current user to decide whether to show internal management link
+  (async function checkCurrentUser(){
+    try{
+      const res = await api('/auth/me');
+      if(res && res.success && res.user && res.user.is_admin){
+        const a = document.getElementById('internalLink');
+        if(a) a.style.display = '';
+      }
+    }catch(e){
+      // not logged in or error: keep link hidden
+    }
+  })();
   
     // NiFi quick trigger helpers
     function bindNiFiButtons() {
@@ -951,7 +965,8 @@ async function testDbConnection() {
   const password = document.getElementById("dbPassword").value;
   const status = document.getElementById("dbConnStatus");
   status.textContent = "测试中...";
-  const payload = { db_type: "mysql", host, port, username, password, database };
+  const dbType = document.getElementById("dbType")?.value || "mysql";
+  const payload = { db_type: dbType, host, port, username, password, database };
   const res = await api("/db/test-connection", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -972,7 +987,8 @@ async function listTables() {
   const password = document.getElementById("dbPassword").value;
   const status = document.getElementById("dbConnStatus");
   status.textContent = "列出表中...";
-  const payload = { db_type: "mysql", host, port, username, password, database };
+  const dbType = document.getElementById("dbType")?.value || "mysql";
+  const payload = { db_type: dbType, host, port, username, password, database };
   const res = await api("/db/list-tables", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -1014,8 +1030,9 @@ async function exportFromDb() {
   result.textContent = "导出中...";
   if (exportBtn) exportBtn.disabled = true;
   try {
-    const payload = { host, port, user: username, password, db: database, table, format, append_to_latest, where };
-    const res = await api(`/export/mysql`, {
+    const dbType = document.getElementById("dbType")?.value || "mysql";
+    const payload = { db_type: dbType, host, port, user: username, password, db: database, table, format, append_to_latest, where };
+    const res = await api(`/export/${dbType}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),

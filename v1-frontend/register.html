@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>注册 - AI助手</title>
+  <link rel="stylesheet" href="/styles.css">
+  <style>
+    html,body{height:100%;margin:0;padding:0}
+    body{font-family: Arial, Helvetica, sans-serif;background-color:#f0f2f5;display:flex;align-items:center;justify-content:center}
+    .box{background:#fff;padding:28px;border-radius:8px;box-shadow:0 2px 10px rgba(0,0,0,0.08);width:420px;max-width:92%}
+    .box h2{text-align:center;margin:0 0 16px;color:#1a66e1}
+    .form-group{margin-bottom:12px}
+    .form-group label{display:block;margin-bottom:6px;font-weight:600}
+    .form-group input{width:100%;padding:10px;border:1px solid #d8dce6;border-radius:6px}
+    .btn{width:100%;padding:12px;border-radius:8px;border:none;background:#28a745;color:#fff;font-size:16px;cursor:pointer}
+    .hint{margin-top:10px;text-align:center}
+    .error{color:#c9302c;text-align:center;margin-top:10px;display:none}
+  </style>
+</head>
+<body>
+  <div class="box">
+    <h2>注册新用户</h2>
+    <div class="form-group">
+      <label for="r_username">用户名</label>
+      <input id="r_username" type="text" placeholder="请输入用户名 (不能为 admin)" autocomplete="username">
+    </div>
+    <div class="form-group">
+      <label for="r_password">密码</label>
+      <input id="r_password" type="password" placeholder="请输入密码" autocomplete="new-password">
+    </div>
+    <button class="btn" id="r_submit">注册</button>
+    <div id="r_error" class="error"></div>
+    <div class="hint">已有账号？ <a href="/login.html">去登录</a></div>
+  </div>
+
+  <script>
+    const err = document.getElementById('r_error');
+    document.getElementById('r_submit').addEventListener('click', async ()=>{
+      err.style.display='none';
+      const u = document.getElementById('r_username').value.trim();
+      const p = document.getElementById('r_password').value;
+      if(!u || !p){ err.textContent='请输入用户名和密码'; err.style.display='block'; return; }
+      if(u.toLowerCase() === 'admin'){ err.textContent='管理员账号不可注册'; err.style.display='block'; return; }
+      try{
+        const resp = await fetch('/api/v1/auth/register', {
+          method:'POST',
+          headers:{'Content-Type':'application/json'},
+          body: JSON.stringify({username:u,password:p}),
+          credentials: 'include'
+        });
+        const j = await resp.json().catch(()=>({}));
+        if(resp.ok && j.success){
+          // 自动跳转到登录页并显示提示 (可用 query param)
+          window.location.href = '/login.html?next=/index.html';
+        } else {
+          err.textContent = j.detail || j.message || '注册失败';
+          err.style.display='block';
+        }
+      }catch(e){ err.textContent='网络或服务错误'; err.style.display='block'; }
+    });
+
+    document.addEventListener('keydown', (e)=>{ if(e.key==='Enter') document.getElementById('r_submit').click(); });
+  </script>
+</body>
+</html>
