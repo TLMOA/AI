@@ -22,16 +22,40 @@ class FrontendHandler(SimpleHTTPRequestHandler):
         if self.path.startswith("/api/v1/") or self.path == "/api/v1":
             self._proxy()
             return
-        if self.path == "/":
-            self.path = "/index.html"
+
+        # require auth for main pages (index and internal)
+        req_path = self.path
+        if req_path == "/":
+            req_path = "/index.html"
+
+        if req_path in ("/index.html", "/internal.html"):
+            if not self._check_authenticated():
+                # redirect to login page
+                self.send_response(302)
+                self.send_header("Location", "/login.html")
+                self.end_headers()
+                return
+
+        self.path = req_path
         return super().do_GET()
 
     def do_HEAD(self):
         if self.path.startswith("/api/v1/") or self.path == "/api/v1":
             self._proxy(head_only=True)
             return
-        if self.path == "/":
-            self.path = "/index.html"
+        # normalize
+        req_path = self.path
+        if req_path == "/":
+            req_path = "/index.html"
+
+        if req_path in ("/index.html", "/internal.html"):
+            if not self._check_authenticated():
+                self.send_response(302)
+                self.send_header("Location", "/login.html")
+                self.end_headers()
+                return
+
+        self.path = req_path
         return super().do_HEAD()
 
     def do_POST(self):
@@ -96,6 +120,26 @@ class FrontendHandler(SimpleHTTPRequestHandler):
                 self.wfile.write(payload)
         finally:
             conn.close()
+
+    def _check_authenticated(self) -> bool:
+        """Call backend /api/v1/auth/me with incoming Cookie header to verify login."""
+        try:
+            conn = http.client.HTTPConnection(BACKEND_HOST, BACKEND_PORT, timeout=10)
+            headers = {k: v for k, v in self.headers.items() if k.lower() in {"cookie", "authorization"}}
+            conn.request("GET", "/api/v1/auth/me", headers=headers)
+            resp = conn.getresponse()
+            # consider 200 as authenticated
+            status = resp.status
+            # drain
+            _ = resp.read()
+            conn.close()
+            return status == 200
+        except Exception:
+            try:
+                conn.close()
+            except Exception:
+                pass
+            return False
 
 
 def main():

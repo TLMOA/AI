@@ -51,7 +51,8 @@ function api(path, options = {}) {
   if (config.USE_MOCK_API) {
     return mockApi(path, options);
   }
-  return fetch(`${config.API_BASE}${path}`, options).then((r) => r.json());
+  const fetchOptions = Object.assign({ credentials: 'same-origin' }, options || {});
+  return fetch(`${config.API_BASE}${path}`, fetchOptions).then((r) => r.json());
 }
 
 function _normalizeBase(base) {
