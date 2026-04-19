@@ -3,6 +3,7 @@ import json
 import os
 import re
 import uuid
+import shutil
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -173,11 +174,28 @@ def run_export_job(job_record: dict) -> dict:
     job_id = job_record.get("id") or uuid.uuid4().hex[:8]
     factory_id = job_record.get("factory_id") or os.getenv("DEFAULT_FACTORY_ID", "factory-001")
     customer = job_record.get("owner_id") or "unknown"
+    # mirror/export directory (per-job archive)
     dest_dir = ensure_export_dir(customer, job_id)
     fmt = (job_record.get("file_format") or "csv").lower()
     state = _load_state(dest_dir)
     filename = state.get("output_file") or f"job_{job_id}_{now_ts()}.{fmt}"
-    out_path = dest_dir / filename
+
+    # Determine primary output directory:
+    # 1) if job_record.destination.path provided, use it
+    # 2) otherwise default to NIFI_BASE_DIR/output_<format>
+    destination = job_record.get("destination") or {}
+    primary_dir = None
+    if isinstance(destination, dict):
+        p = destination.get("path")
+        if p:
+            primary_dir = Path(p)
+    if primary_dir is None:
+        # use NIFI base dir as root and create format-specific folder
+        nifi_root = Path(os.getenv("NIFI_BASE_DIR", str(DEFAULT_NIFI_BASE)))
+        primary_dir = nifi_root / f"output_{fmt}"
+    primary_dir.mkdir(parents=True, exist_ok=True)
+
+    out_path = primary_dir / filename
 
     db_conf = job_record.get("db_config") or {}
     table = None
@@ -188,12 +206,18 @@ def run_export_job(job_record: dict) -> dict:
         table = db_conf.get("table")
 
     if not table:
-        # no table provided - create a tiny demo file
+        # no table provided - create a tiny demo file in primary output and mirror to exports
         with out_path.open("w", encoding="utf-8") as f:
             f.write("id,ts\n")
             for i in range(1, 6):
                 f.write(f"{i},{now_ts()}\n")
-        _append_audit(dest_dir, {"status": "demo_written", "factory_id": factory_id, "path": str(out_path)})
+        # mirror to per-job export archive
+        try:
+            mirror_path = dest_dir / filename
+            shutil.copy2(str(out_path), str(mirror_path))
+        except Exception:
+            mirror_path = None
+        _append_audit(dest_dir, {"status": "demo_written", "factory_id": factory_id, "primary_path": str(out_path), "mirror_path": str(mirror_path) if mirror_path else None})
         return {"status": "demo_written", "path": str(out_path)}
 
     # attempt real incremental export
@@ -214,7 +238,15 @@ def run_export_job(job_record: dict) -> dict:
             })
             return {"status": "no_change", "path": str(out_path), "rows": 0, "incremental_key": key_col}
 
+        # append rows to primary output
         _append_rows(out_path, fmt, cols, rows)
+
+        # mirror/copy the primary output to per-job export archive
+        try:
+            mirror_path = dest_dir / filename
+            shutil.copy2(str(out_path), str(mirror_path))
+        except Exception:
+            mirror_path = None
 
         new_last = rows[-1].get(key_col)
         state.update({
@@ -234,7 +266,8 @@ def run_export_job(job_record: dict) -> dict:
             "from_key": last_key,
             "to_key": state.get("last_exported_key"),
             "rows": len(rows),
-            "path": str(out_path),
+            "primary_path": str(out_path),
+            "mirror_path": str(mirror_path) if mirror_path else None,
         })
 
         return {

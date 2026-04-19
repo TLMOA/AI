@@ -1,0 +1,5 @@
+parse --is-inside-work-tree >/dev/null 2>&1 && 
+echo INSIDE || echo NOT_INSIDE
+ bash -lc "git rev-parse --is-inside-work-tree >/dev/null 2>&1 && echo INSIDE || echo NOT_INSIDE"
+ bash -lc 'rm -f /tmp/git_branch /tmp/git_status /tmp/git_remote /tmp/git_user /tmp/git_email /tmp/git_ok; if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then git rev-parse --abbrev-ref HEAD > /tmp/git_branch 2>&1; git status --porcelain > /tmp/git_status 2>&1; git remote -v > /tmp/git_remote 2>&1; git config user.name --get > /tmp/git_user 2>&1; git config user.email --get > /tmp/git_email 2>&1; echo OK > /tmp/git_ok; else echo NOT_GIT > /tmp/git_ok; fi; echo DONE'
+

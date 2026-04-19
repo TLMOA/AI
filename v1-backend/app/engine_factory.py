@@ -43,7 +43,7 @@ def engine_from_config(db_conf: Dict) -> any:
         port = port or 1433
         url = f"mssql+{driver}://{user}:{password}@{host}:{port}/{database}"
     elif db_type == "oracle":
-        driver = db_conf.get("driver", "cx_oracle")
+        driver = db_conf.get("driver", "oracledb")
         port = port or 1521
         url = f"oracle+{driver}://{user}:{password}@{host}:{port}/?service_name={database}"
     else:
