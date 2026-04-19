@@ -78,10 +78,16 @@
         <select id="dbType">
           <option value="mysql">MySQL</option>
           <option value="postgres">PostgreSQL</option>
+          <option value="sqlserver">SQLServer</option>
           <option value="sqlite">SQLite</option>
-          <option value="mssql">SQLServer</option>
           <option value="oracle">Oracle</option>
         </select>
+        <label style="margin-left:16px">DSN（可选）</label>
+        <input id="dbDSN" type="text" placeholder="优先使用 DSN，例如: mysql+pymysql://user:pwd@host:3306/db" style="width:400px" />
+      </div>
+      <div class="row" id="dbPathRow" style="display:none">
+        <label>SQLite 文件路径</label>
+        <input id="dbPath" type="text" placeholder="例如 /data/db/mydb.sqlite" style="width:400px" />
       </div>
       <div class="row">
         <label>Host</label>
@@ -266,7 +272,7 @@
       <p id="uploadResult"></p>
     </section>
   </div>
-  <script src="./config.js?v=20260404_1"></script>
-  <script src="./app.js?v=20260407_2"></script>
+  <script src="./config.js?v=20260419_5"></script>
+  <script src="./app.js?v=20260419_5"></script>
 </body>
 </html>

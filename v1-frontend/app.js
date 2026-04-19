@@ -679,16 +679,114 @@ function getScheduleSpecFromUi() {
 }
 
 function collectDbConfigForSchedule() {
-  return {
-    db_type: "mysql",
+  const dbTypeEl = document.getElementById("dbType");
+  const dsnEl = document.getElementById("dbDSN");
+  const db_type = (dbTypeEl && String(dbTypeEl.value).trim()) || "mysql";
+  const dsn = dsnEl && String(dsnEl.value).trim();
+  const DEFAULT_PORTS = { mysql: 3306, postgresql: 5432, sqlserver: 1433, oracle: 1521 };
+  const conf = {
+    db_type: db_type,
     host: document.getElementById("dbHost")?.value.trim() || "127.0.0.1",
-    port: Number(document.getElementById("dbPort")?.value || 3306),
+    port: Number(document.getElementById("dbPort")?.value || DEFAULT_PORTS[db_type] || 3306),
     user: document.getElementById("dbUser")?.value.trim() || "root",
     password: document.getElementById("dbPassword")?.value || "",
     database: document.getElementById("dbName")?.value.trim() || "",
+    path: document.getElementById("dbPath")?.value.trim() || "",
     table: getSelectedTableForSchedule(),
   };
+  if (dsn) {
+    conf.dsn = dsn;
+  }
+  return conf;
 }
+
+// Render DB-specific fields and DSN-priority behavior
+function renderDbFields() {
+  const dbType = (document.getElementById("dbType")?.value || "mysql").toLowerCase();
+  const dsn = (document.getElementById("dbDSN")?.value || "").trim();
+  const DEFAULT_PORTS = { mysql: 3306, postgresql: 5432, sqlserver: 1433, oracle: 1521, sqlite: '' };
+  const dbPathRow = document.getElementById("dbPathRow");
+  const hostInputs = ["dbHost", "dbPort", "dbUser", "dbPassword", "dbName", "dbTableSelect", "dbTableInput", "dbWhere", "dbExportFormat", "dbAppendLatest", "dbTestBtn", "dbListBtn"];
+
+  // Show sqlite path only when sqlite is selected
+  if (dbType === "sqlite") {
+    if (dbPathRow) dbPathRow.style.display = '';
+    // hide host/port/database rows visually and disable inputs
+    try {
+      ["dbHost", "dbPort"].forEach((id) => { const el = document.getElementById(id); if (el) { el.disabled = true; const row = el.closest('.row'); if (row) row.style.display = 'none'; } });
+      ["dbName", "dbUser", "dbPassword"].forEach((id) => { const el = document.getElementById(id); if (el) { el.disabled = true; const row = el.closest('.row'); if (row) row.style.display = 'none'; } });
+    } catch (e) {
+      // fallback: disable individual inputs if closest fails
+      ["dbHost", "dbPort", "dbName", "dbUser", "dbPassword"].forEach((id) => { const el = document.getElementById(id); if (el) el.disabled = true; });
+    }
+  } else {
+    if (dbPathRow) dbPathRow.style.display = 'none';
+    try {
+      ["dbHost", "dbPort"].forEach((id) => { const el = document.getElementById(id); if (el) { el.disabled = false; const row = el.closest('.row'); if (row) row.style.display = ''; } });
+      ["dbName", "dbUser", "dbPassword"].forEach((id) => { const el = document.getElementById(id); if (el) { el.disabled = false; const row = el.closest('.row'); if (row) row.style.display = ''; } });
+    } catch (e) {
+      ["dbHost", "dbPort", "dbName", "dbUser", "dbPassword"].forEach((id) => { const el = document.getElementById(id); if (el) el.disabled = false; });
+    }
+  }
+
+  // DSN priority: if DSN present, disable other connection fields
+  if (dsn) {
+    ["dbHost", "dbPort", "dbUser", "dbPassword", "dbName", "dbPath"].forEach((id) => { const el = document.getElementById(id); if (el) el.disabled = true; });
+    const hint = document.getElementById("dbConnStatus"); if (hint) hint.textContent = "已检测到 DSN，其他连接字段已禁用（DSN 优先）";
+  } else {
+    ["dbHost", "dbPort", "dbUser", "dbPassword", "dbName", "dbPath"].forEach((id) => { const el = document.getElementById(id); if (el) el.disabled = false; });
+    const hint = document.getElementById("dbConnStatus"); if (hint) hint.textContent = "";
+  }
+
+  // update port placeholder based on dbType when port input exists
+  try {
+    const portEl = document.getElementById('dbPort');
+    if (portEl) {
+      const def = DEFAULT_PORTS[dbType] !== undefined ? DEFAULT_PORTS[dbType] : '';
+      // set placeholder, but do not overwrite explicit user value
+      portEl.placeholder = def ? String(def) : '';
+    }
+  } catch (e) {
+    // ignore
+  }
+}
+
+// When dbType changes, if port is empty or currently equals another known default,
+// update it to the default for the selected dbType so UI reflects expected port.
+function syncPortWithDbType() {
+  try {
+    const DEFAULT_PORTS = { mysql: 3306, postgresql: 5432, sqlserver: 1433, oracle: 1521 };
+    const dbType = (document.getElementById('dbType')?.value || 'mysql').toLowerCase();
+    const portEl = document.getElementById('dbPort');
+    if (!portEl) return;
+    const cur = (String(portEl.value || '').trim());
+    const known = Object.values(DEFAULT_PORTS).map(String);
+    const def = DEFAULT_PORTS[dbType] ? String(DEFAULT_PORTS[dbType]) : '';
+    if (cur === '' || known.includes(cur)) {
+      if (def) portEl.value = def; else portEl.value = '';
+    }
+  } catch (e) {
+    // ignore
+  }
+}
+
+// bind dynamic behavior: bind immediately and perform initial render
+{
+  const dbTypeEl = document.getElementById('dbType');
+  const dsnEl = document.getElementById('dbDSN');
+  if (dbTypeEl) dbTypeEl.addEventListener('change', renderDbFields);
+  if (dsnEl) dsnEl.addEventListener('input', renderDbFields);
+  if (dbTypeEl) dbTypeEl.addEventListener('change', syncPortWithDbType);
+  // initial render
+  try {
+    renderDbFields();
+  } catch (e) {
+    // swallow errors during initial render to avoid blocking page
+    console.warn('renderDbFields initial render failed', e);
+  }
+}
+// sync port when dbType changes (call once during initial bind)
+try { syncPortWithDbType(); } catch (e) { /* ignore */ }
 
 function getSelectedTableForSchedule() {
   const select = document.getElementById("dbTableSelect");
@@ -1010,15 +1108,9 @@ async function listTables() {
 }
 
 async function exportFromDb() {
-  const host = document.getElementById("dbHost").value.trim();
-  const port = Number(document.getElementById("dbPort").value || 3306);
-  const database = document.getElementById("dbName").value.trim();
-  const username = document.getElementById("dbUser").value.trim();
-  const password = document.getElementById("dbPassword").value;
+  const conf = collectDbConfigForSchedule();
   const where = document.getElementById("dbWhere")?.value.trim() || "";
-  const select = document.getElementById("dbTableSelect");
-  const input = document.getElementById("dbTableInput");
-  const table = (select && select.value) || (input && input.value.trim());
+  const table = conf.table || getSelectedTableForSchedule();
   const format = document.getElementById("dbExportFormat").value || "CSV";
   const append_to_latest = !!document.getElementById("dbAppendLatest").checked;
   const result = document.getElementById("dbExportResult");
@@ -1030,15 +1122,36 @@ async function exportFromDb() {
   result.textContent = "导出中...";
   if (exportBtn) exportBtn.disabled = true;
   try {
-    const dbType = document.getElementById("dbType")?.value || "mysql";
-    const payload = { db_type: dbType, host, port, user: username, password, db: database, table, format, append_to_latest, where };
-    const res = await api(`/export/${dbType}`, {
+    const payload = {
+      db_config: {
+        db_type: conf.db_type,
+        user: conf.user,
+        password: conf.password,
+        host: conf.host,
+        port: conf.port,
+        database: conf.database,
+        path: conf.path,
+        dsn: conf.dsn,
+        table: table,
+      },
+      format: format,
+      append_to_latest: append_to_latest,
+      where: where,
+    };
+    const res = await api(`/api/v1/export`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
     });
     if (res && res.code === 0) {
-      result.textContent = `导出成功: ${res.data.file.fileName}，路径: ${res.data.file.storagePath}`;
+      // prefer returned file meta
+      if (res.data && res.data.file) {
+        result.textContent = `导出成功: ${res.data.file.fileName}，路径: ${res.data.file.storagePath}`;
+      } else if (res.data && res.data.path) {
+        result.textContent = `导出成功，路径: ${res.data.path}`;
+      } else {
+        result.textContent = `导出成功`;
+      }
       // 文件列表刷新放到下一轮事件循环，避免页面长时间停留在“导出中...”
       setTimeout(() => {
         loadFiles().catch(() => {});

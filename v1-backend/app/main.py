@@ -2392,6 +2392,62 @@ def export_mysql(req: MySQLExportReq, request: Request, x_trace_id: Optional[str
     return ok(payload, trace_id)
 
 
+@app.post("/api/v1/export")
+def export_generic(body: Dict[str, Any], request: Request):
+    """Generic export endpoint that accepts `db_config` or inline connection params.
+
+    Expected body examples:
+    - { "db_config": {..}, "format": "CSV", "where":"..." }
+    - { "db_type": "mysql", "host":..., "user":..., "password":..., "database":..., "table": "t" }
+    """
+    trace_id = request.state.trace_id
+    try:
+        # normalize db_config
+        db_conf = body.get("db_config") or {}
+        if not db_conf:
+            # accept old-style keys
+            db_type = body.get("db_type") or body.get("type") or "mysql"
+            db_conf = {
+                "db_type": db_type,
+                "user": body.get("user") or body.get("username"),
+                "password": body.get("password"),
+                "host": body.get("host"),
+                "port": body.get("port"),
+                "database": body.get("database") or body.get("db") or None,
+                "dsn": body.get("dsn"),
+                "path": body.get("path"),
+            }
+
+        # table resolution
+        table = body.get("table") or (body.get("payload") or {}).get("table") or db_conf.get("table")
+        fmt = (body.get("format") or body.get("file_format") or "csv").lower()
+
+        job = {
+            "id": body.get("id") or f"manual_{uuid.uuid4().hex[:8]}",
+            "job_name": body.get("job_name") or f"manual_export_{now_ts()}",
+            "factory_id": _normalize_factory_id(body.get("factory_id")),
+            "owner_id": body.get("owner_id") or "user-001",
+            "db_config": db_conf,
+            "file_format": fmt,
+            "payload": {"table": table} if table else {},
+        }
+
+        res = run_export_job(job)
+        # if run_export_job returns a path or status
+        if res.get("status") in ("ok", "demo_written") and res.get("path"):
+            try:
+                meta = _register_and_return_meta(Path(res.get("path")), fmt)
+                return ok({"file": meta}, trace_id)
+            except Exception:
+                return ok({"path": res.get("path"), "status": res.get("status")}, trace_id)
+        if res.get("status") == "no_change":
+            return ok({"status": "no_change", "path": res.get("path"), "rows": res.get("rows", 0)}, trace_id)
+        # error
+        return err(1005002, f"export failed: {res.get('error') or res}" , trace_id)
+    except Exception as e:
+        return err(1005003, f"export error: {e}", trace_id)
+
+
 @app.post("/api/v1/tags/auto")
 async def auto_tag(req: AutoTagReq, x_trace_id: Optional[str] = Header(default=None)):
     trace_id = make_trace_id(x_trace_id)

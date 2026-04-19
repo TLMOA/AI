@@ -1,0 +1,20 @@
+[0;1;34m# /etc/systemd/system/iot-frontend.service[0m
+[Unit]
+Description=IoT V1 Frontend (Static + API proxy)
+After=network-online.target iot-backend.service
+Wants=network-online.target iot-backend.service
+
+[Service]
+Type=simple
+User=yhz
+WorkingDirectory=/home/yhz/iot/v1-frontend
+ExecStart=/usr/bin/python3 /home/yhz/iot/v1-frontend/serve.py
+Restart=always
+RestartSec=3
+Environment=V1_BACKEND_HOST=127.0.0.1
+Environment=V1_BACKEND_PORT=8081
+Environment=V1_FRONTEND_HOST=0.0.0.0
+Environment=V1_FRONTEND_PORT=5174
+
+[Install]
+WantedBy=multi-user.target
