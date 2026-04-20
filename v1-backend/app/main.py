@@ -352,6 +352,24 @@ def _normalize_factory_id(value: Optional[str]) -> str:
     return (value or "").strip() or DEFAULT_FACTORY_ID
 
 
+def _sanitize_filename_component(value: Optional[str]) -> str:
+    """Sanitize a string for use in filenames: allow letters, digits, underscore and hyphen; replace others with underscore."""
+    if not value:
+        return "unknown"
+    s = str(value)
+    out_chars = []
+    for ch in s:
+        if ch.isalnum() or ch in {"_", "-"}:
+            out_chars.append(ch)
+        else:
+            out_chars.append("_")
+    # collapse repeated underscores
+    out = "".join(out_chars)
+    while "__" in out:
+        out = out.replace("__", "_")
+    return out.strip("_") or "unknown"
+
+
 def _safe_relative_to(path: Path, root: Path) -> Optional[Path]:
     try:
         return path.resolve().relative_to(root.resolve())
@@ -635,6 +653,7 @@ def _startup():
                     "file_format": r.file_format,
                     "destination": r.destination,
                     "payload": payload,
+                    "scheduled": True,
                 }])
         finally:
             session.close()
@@ -689,7 +708,8 @@ def api_create_export(job: Dict[str, Any], request: Request):
                 "db_config": ej.db_config,
                 "file_format": ej.file_format,
                 "destination": ej.destination,
-                "payload": job.get("payload", {}),
+                    "payload": job.get("payload", {}),
+                    "scheduled": True,
             }])
         return ok({"id": ej.id}, trace_id)
     finally:
@@ -783,7 +803,8 @@ def api_patch_export(job_id: int, patch: Dict[str, Any], request: Request):
                 "db_config": r.db_config,
                 "file_format": r.file_format,
                 "destination": r.destination,
-                "payload": payload,
+                    "payload": payload,
+                    "scheduled": True,
             }])
         else:
             remove_scheduled(str(r.id))
@@ -2332,25 +2353,34 @@ def export_mysql(req: MySQLExportReq, request: Request, x_trace_id: Optional[str
             pass
 
     ts = now_ts()
-    fmt = req.format.lower()
-    base_name = f"{req.table}_export_{ts}"
+    fmt = (req.format or "csv").lower()
+    # determine username from cookie token when available
+    cookie = request.cookies.get("access_token")
+    user = _get_current_user_from_token(cookie)
+    username = _sanitize_filename_component((user or {}).get("username") or (user or {}).get("user") or (user or {}).get("name") or "manual")
+    table_safe = _sanitize_filename_component(req.table)
+    base_name = f"export_manual_{username}_{table_safe}_{ts}"
+
+    # Use NIFI_BASE_DIR/output_{fmt} as authoritative output location to avoid env misconfig
+    primary_dir = NIFI_BASE_DIR / f"output_{fmt}"
+    primary_dir.mkdir(parents=True, exist_ok=True)
+
     if fmt == "csv":
-        out_path = NIFI_OUTPUT_DIR / f"{base_name}.csv"
+        out_path = primary_dir / f"{base_name}.csv"
         _write_csv(out_path, cols, rows, append=False)
         # update latest
-        latest_path = NIFI_OUTPUT_DIR / f"{req.table}_export_latest.csv"
+        latest_path = primary_dir / f"{req.table}_export_latest.csv"
         if req.append_to_latest and latest_path.exists():
             _write_csv(latest_path, cols, rows, append=True)
         else:
-            # copy/overwrite latest
             out_path.replace(latest_path)
         # out_path may be moved to latest_path by replace(); always register the actual existing file
         reg_path = out_path if out_path.exists() else latest_path
         meta = _register_and_return_meta(reg_path, "csv")
     elif fmt == "tsv":
-        out_path = OUTPUT_TSV_DIR / f"{base_name}.tsv"
+        out_path = primary_dir / f"{base_name}.tsv"
         _write_tsv(out_path, cols, rows, append=False)
-        latest_path = OUTPUT_TSV_DIR / f"{req.table}_export_latest.tsv"
+        latest_path = primary_dir / f"{req.table}_export_latest.tsv"
         if req.append_to_latest and latest_path.exists():
             _write_tsv(latest_path, cols, rows, append=True)
         else:
@@ -2358,10 +2388,9 @@ def export_mysql(req: MySQLExportReq, request: Request, x_trace_id: Optional[str
         reg_path = out_path if out_path.exists() else latest_path
         meta = _register_and_return_meta(reg_path, "tsv")
     else:
-        out_path = Path(os.getenv("NIFI_OUTPUT_JSON_DIR", "/home/yhz/nifi-data/output_json")) / f"{base_name}.json"
-        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path = primary_dir / f"{base_name}.json"
         _write_ndjson(out_path, cols, rows, append=False)
-        latest_path = out_path.parent / f"{req.table}_export_latest.json"
+        latest_path = primary_dir / f"{req.table}_export_latest.json"
         if req.append_to_latest and latest_path.exists():
             _write_ndjson(latest_path, cols, rows, append=True)
         else:
@@ -2422,11 +2451,17 @@ def export_generic(body: Dict[str, Any], request: Request):
         table = body.get("table") or (body.get("payload") or {}).get("table") or db_conf.get("table")
         fmt = (body.get("format") or body.get("file_format") or "csv").lower()
 
+        # determine owner: prefer JWT cookie -> request body -> fallback
+        cookie = request.cookies.get("access_token")
+        cookie_user = _get_current_user_from_token(cookie)
+        owner_from_cookie = (cookie_user or {}).get("username") if cookie_user else None
+        owner_id = owner_from_cookie or body.get("owner_id") or "unknown"
+
         job = {
             "id": body.get("id") or f"manual_{uuid.uuid4().hex[:8]}",
             "job_name": body.get("job_name") or f"manual_export_{now_ts()}",
             "factory_id": _normalize_factory_id(body.get("factory_id")),
-            "owner_id": body.get("owner_id") or "user-001",
+            "owner_id": owner_id,
             "db_config": db_conf,
             "file_format": fmt,
             "payload": {"table": table} if table else {},
@@ -2436,7 +2471,66 @@ def export_generic(body: Dict[str, Any], request: Request):
         # if run_export_job returns a path or status
         if res.get("status") in ("ok", "demo_written") and res.get("path"):
             try:
-                meta = _register_and_return_meta(Path(res.get("path")), fmt)
+                # normalize filename for manual-triggered jobs to export_manual_{username}_{table}_{ts}
+                try:
+                    p = Path(res.get("path"))
+                    if str(job.get("id") or "").startswith("manual_") and p.exists():
+                        owner = _sanitize_filename_component(job.get("owner_id") or "manual")
+                        payload = job.get("payload") or {}
+                        table = payload.get("table") or (job.get("db_config") or {}).get("table") or "data"
+                        table_safe = _sanitize_filename_component(table)
+                        ts = now_ts()
+                        # place manual export into format-specific output dir under NIFI_BASE_DIR
+                        desired_dir = NIFI_BASE_DIR / f"output_{fmt}"
+                        try:
+                            desired_dir.mkdir(parents=True, exist_ok=True)
+                        except Exception:
+                            pass
+                        desired = desired_dir / f"export_manual_{owner}_{table_safe}_{ts}.{fmt}"
+                        try:
+                            # move/rename primary output to desired name
+                            p.replace(desired)
+                            res["path"] = str(desired)
+                        except Exception:
+                            # fallback: leave as-is
+                            pass
+                except Exception:
+                    pass
+
+                # support append_to_latest for generic export when requested by caller
+                append_flag = bool(body.get("append_to_latest") or False)
+                res_path = Path(res.get("path"))
+                reg_path = res_path
+                if append_flag and res_path.exists():
+                    # try to infer table name for latest filename
+                    payload = job.get("payload") or {}
+                    table_name = payload.get("table") or (job.get("db_config") or {}).get("table")
+                    if table_name:
+                        latest_name = f"{table_name}_export_latest.{fmt}"
+                        latest_path = res_path.parent / latest_name
+                        try:
+                            if latest_path.exists():
+                                # read newly produced records and append to latest
+                                cols, rows = _read_file_records(res_path, fmt.upper())
+                                if fmt == "csv":
+                                    _write_csv(latest_path, cols, rows, append=True)
+                                elif fmt == "tsv":
+                                    _write_tsv(latest_path, cols, rows, append=True)
+                                else:
+                                    _write_ndjson(latest_path, cols, rows, append=True)
+                                reg_path = latest_path
+                            else:
+                                # move produced file to latest path
+                                try:
+                                    res_path.replace(latest_path)
+                                    reg_path = latest_path
+                                except Exception:
+                                    reg_path = res_path
+                        except Exception:
+                            # on any failure, fall back to registering original path
+                            reg_path = res_path
+
+                meta = _register_and_return_meta(reg_path, fmt)
                 return ok({"file": meta}, trace_id)
             except Exception:
                 return ok({"path": res.get("path"), "status": res.get("status")}, trace_id)
