@@ -32,6 +32,7 @@ const state = {
   previewRows: [],
   previewOffset: 0,
   tagRules: [],
+  currentUser: null,
 };
 
 const ERROR_HINTS = {
@@ -189,7 +190,7 @@ async function createJob() {
     tagConfig: { mode: "AUTO", ruleId: "NIFI_RULE_ID_V5" },
     copyFormats: [],
     cron: "",
-    runBy: "user-001",
+    runBy: (state.currentUser && state.currentUser.username) || "user-001",
     remark: "created from v1 frontend",
   };
 
@@ -600,7 +601,7 @@ async function previewFile(fileId) {
       return;
     }
     result.textContent = "保存中...";
-    const payload = { fileId: state.selectedFileId, operator: "user-001", changes, renameColumns };
+    const payload = { fileId: state.selectedFileId, operator: (state.currentUser && state.currentUser.username) || "user-001", changes, renameColumns };
     const res = await api("/tags/manual-table", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -646,7 +647,7 @@ async function triggerAutoTag() {
     msg.textContent = "请先输入 fileId";
     return;
   }
-  const payload = { fileId, ruleId, outputFormat: "CSV", operator: "user-001" };
+  const payload = { fileId, ruleId, outputFormat: "CSV", operator: (state.currentUser && state.currentUser.username) || "user-001" };
   const res = await api("/tags/auto", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -829,7 +830,7 @@ function buildSchedulePayload() {
   return {
     job_name: `db_export_${table}_${Date.now()}`,
     factory_id: DEFAULT_FACTORY_ID,
-    owner_id: "user-001",
+    owner_id: (state.currentUser && state.currentUser.username) || "user-001",
     schedule: spec,
     file_format: format,
     enabled: true,
@@ -1017,12 +1018,26 @@ function init() {
   (async function checkCurrentUser(){
     try{
       const res = await api('/auth/me');
-      if(res && res.success && res.user && res.user.is_admin){
-        const a = document.getElementById('internalLink');
-        if(a) a.style.display = '';
+      // normalize responses from different backend shapes
+      const user = (res && res.user) || (res && res.data && res.data.user) || (res && res.data) || null;
+      if (user) {
+        state.currentUser = user;
+        try { localStorage.setItem('currentUser', JSON.stringify(user)); } catch (e) {}
+        if (user.is_admin) {
+          const a = document.getElementById('internalLink');
+          if(a) a.style.display = '';
+        }
+      } else {
+        // fallback: try from localStorage
+        try {
+          const raw = localStorage.getItem('currentUser');
+          if (raw) state.currentUser = JSON.parse(raw);
+        } catch (e) {}
       }
     }catch(e){
-      // not logged in or error: keep link hidden
+      // not logged in or error: clear cached user
+      try { localStorage.removeItem('currentUser'); } catch (e) {}
+      state.currentUser = null;
     }
   })();
   
@@ -1031,12 +1046,12 @@ function init() {
       document.querySelectorAll(".nifi-btn").forEach((btn) => {
         btn.addEventListener("click", async () => {
           const jobType = btn.dataset.type;
-          const payload = {
+            const payload = {
             jobType,
             source: { sourceType: "MYSQL_TABLE" },
             target: { format: "CSV", outputDir: "/data/jobs" },
             tagConfig: { mode: jobType === "TAG_MANUAL" ? "MANUAL" : "AUTO", ruleId: "NIFI_RULE_ID_V5" },
-            runBy: "user-001",
+            runBy: (state.currentUser && state.currentUser.username) || "user-001",
           };
           const res = await api("/jobs", {
             method: "POST",
@@ -1135,10 +1150,11 @@ async function exportFromDb() {
         table: table,
       },
       format: format,
-      append_to_latest: append_to_latest,
+        append_to_latest: append_to_latest,
+        owner_id: (state.currentUser && state.currentUser.username) || "user-001",
       where: where,
     };
-    const res = await api(`/api/v1/export`, {
+    const res = await api(`/export`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
