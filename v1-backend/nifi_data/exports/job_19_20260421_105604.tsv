@@ -1,0 +1,5 @@
+id	device_id	temperature	humidity	status	record_time
+1	device_001	25.5	100.0	正常	2026-03-20 16:03:59
+2	device_002	28.1	55.5	正常	2026-03-20 16:03:59
+3	device_003	32.8	45.0	高温预警	2026-03-20 16:03:59
+4	device_004	29.5	50.0	正常	2026-03-25 15:20:11
