@@ -23,6 +23,7 @@ from .auth import _get_current_user_from_token
 from . import db_models
 from .export_worker import run_export_job
 from .scheduler import start_scheduler, stop_scheduler, schedule_job, remove_scheduled
+import threading
 import pymysql
 try:
     from zoneinfo import ZoneInfo
@@ -711,6 +712,22 @@ def api_create_export(job: Dict[str, Any], request: Request):
                     "payload": job.get("payload", {}),
                     "scheduled": True,
             }])
+            # trigger one immediate run asynchronously after scheduling
+            try:
+                thread_args = {
+                    "id": ej.id,
+                    "job_name": ej.job_name,
+                    "factory_id": _normalize_factory_id(ej.factory_id),
+                    "owner_id": ej.owner_id,
+                    "db_config": ej.db_config,
+                    "file_format": ej.file_format,
+                    "destination": ej.destination,
+                    "payload": job.get("payload", {}),
+                    "scheduled": True,
+                }
+                threading.Thread(target=run_export_job, args=(thread_args,), daemon=True).start()
+            except Exception:
+                pass
         return ok({"id": ej.id}, trace_id)
     finally:
         session.close()
@@ -806,6 +823,22 @@ def api_patch_export(job_id: int, patch: Dict[str, Any], request: Request):
                     "payload": payload,
                     "scheduled": True,
             }])
+            # immediate asynchronous trigger after enabling/scheduling
+            try:
+                thread_args = {
+                    "id": r.id,
+                    "job_name": r.job_name,
+                    "factory_id": _normalize_factory_id(r.factory_id),
+                    "owner_id": r.owner_id,
+                    "db_config": r.db_config,
+                    "file_format": r.file_format,
+                    "destination": r.destination,
+                    "payload": payload,
+                    "scheduled": True,
+                }
+                threading.Thread(target=run_export_job, args=(thread_args,), daemon=True).start()
+            except Exception:
+                pass
         else:
             remove_scheduled(str(r.id))
         return ok({"id": r.id}, trace_id)
