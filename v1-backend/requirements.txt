@@ -5,3 +5,5 @@ pymysql==1.1.0
 psycopg2-binary==2.9.10
 pyodbc==5.3.0
 oracledb==3.4.2
+pyhive==0.6.4
+thrift==0.16.0

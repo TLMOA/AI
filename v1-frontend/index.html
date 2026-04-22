@@ -80,13 +80,16 @@
           <option value="postgres">PostgreSQL</option>
           <option value="sqlserver">SQLServer</option>
           <option value="sqlite">SQLite</option>
+          <option value="hive">Hive (Hadoop)</option>
+          <option value="hdfs">HDFS (Hadoop 文件存储)</option>
+          <option value="hbase">HBase (Hadoop NoSQL)</option>
           <option value="oracle">Oracle</option>
         </select>
         <label style="margin-left:16px">DSN（可选）</label>
         <input id="dbDSN" type="text" placeholder="优先使用 DSN，例如: mysql+pymysql://user:pwd@host:3306/db" style="width:400px" />
       </div>
       <div class="row" id="dbPathRow" style="display:none">
-        <label>SQLite 文件路径</label>
+        <label id="dbPathLabel">SQLite 文件路径</label>
         <input id="dbPath" type="text" placeholder="例如 /data/db/mydb.sqlite" style="width:400px" />
       </div>
       <div class="row">
@@ -98,6 +101,8 @@
       <div class="row">
         <label>Database</label>
         <input id="dbName" type="text" value="nifi" />
+      </div>
+      <div class="row">
         <label>User</label>
         <input id="dbUser" type="text" value="root" />
         <label>Password</label>
@@ -107,6 +112,10 @@
         <label>Table</label>
         <select id="dbTableSelect"><option value="">-- 先列表 --</option></select>
         <input id="dbTableInput" type="text" placeholder="或手动输入表名（例如 sensor_data）" />
+        <span id="hbaseRowKeyWrap" style="display:none;margin-left:8px;">
+          <label style="margin-right:6px">Row Key 前缀</label>
+          <input id="hbaseRowKeyPrefix" type="text" placeholder="HBase 行键前缀（仅 HBase 有效）" />
+        </span>
         <label>Where</label>
         <input id="dbWhere" type="text" placeholder="可选，例如 id > 100" />
       </div>

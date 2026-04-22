@@ -685,6 +685,11 @@ function collectDbConfigForSchedule() {
   const db_type = (dbTypeEl && String(dbTypeEl.value).trim()) || "mysql";
   const dsn = dsnEl && String(dsnEl.value).trim();
   const DEFAULT_PORTS = { mysql: 3306, postgresql: 5432, sqlserver: 1433, oracle: 1521 };
+  // add common Hadoop-related defaults: Hive thrift, HBase thrift, WebHDFS
+  // HIVE: 10000 (Thrift/Beeswax), HBASE: 9090 (Thrift), HDFS(WebHDFS): 9870/50070 (use 9870 modern)
+  DEFAULT_PORTS.hive = 10000;
+  DEFAULT_PORTS.hbase = 9090;
+  DEFAULT_PORTS.hdfs = 9870;
   const conf = {
     db_type: db_type,
     host: document.getElementById("dbHost")?.value.trim() || "127.0.0.1",
@@ -694,6 +699,7 @@ function collectDbConfigForSchedule() {
     database: document.getElementById("dbName")?.value.trim() || "",
     path: document.getElementById("dbPath")?.value.trim() || "",
     table: getSelectedTableForSchedule(),
+    row_key_prefix: document.getElementById("hbaseRowKeyPrefix")?.value.trim() || "",
   };
   if (dsn) {
     conf.dsn = dsn;
@@ -705,26 +711,81 @@ function collectDbConfigForSchedule() {
 function renderDbFields() {
   const dbType = (document.getElementById("dbType")?.value || "mysql").toLowerCase();
   const dsn = (document.getElementById("dbDSN")?.value || "").trim();
-  const DEFAULT_PORTS = { mysql: 3306, postgresql: 5432, sqlserver: 1433, oracle: 1521, sqlite: '' };
+  const DEFAULT_PORTS = { mysql: 3306, postgresql: 5432, sqlserver: 1433, oracle: 1521, sqlite: '', hive: 10000, hbase: 9090, hdfs: 9870 };
   const dbPathRow = document.getElementById("dbPathRow");
   const hostInputs = ["dbHost", "dbPort", "dbUser", "dbPassword", "dbName", "dbTableSelect", "dbTableInput", "dbWhere", "dbExportFormat", "dbAppendLatest", "dbTestBtn", "dbListBtn"];
-
-  // Show sqlite path only when sqlite is selected
+  // Render fields per dbType
   if (dbType === "sqlite") {
     if (dbPathRow) dbPathRow.style.display = '';
-    // hide host/port/database rows visually and disable inputs
     try {
       ["dbHost", "dbPort"].forEach((id) => { const el = document.getElementById(id); if (el) { el.disabled = true; const row = el.closest('.row'); if (row) row.style.display = 'none'; } });
       ["dbName", "dbUser", "dbPassword"].forEach((id) => { const el = document.getElementById(id); if (el) { el.disabled = true; const row = el.closest('.row'); if (row) row.style.display = 'none'; } });
+      // table selector/input also not applicable for raw sqlite path mode
+      ["dbTableSelect", "dbTableInput", "dbWhere"].forEach((id) => { const el = document.getElementById(id); if (el) { el.disabled = true; const row = el.closest('.row'); if (row) row.style.display = 'none'; } });
     } catch (e) {
-      // fallback: disable individual inputs if closest fails
       ["dbHost", "dbPort", "dbName", "dbUser", "dbPassword"].forEach((id) => { const el = document.getElementById(id); if (el) el.disabled = true; });
     }
+    // set dbPath label/placeholder for sqlite
+    try {
+      const dbPathLabel = document.getElementById('dbPathLabel');
+      const dbPathInput = document.getElementById('dbPath');
+      if (dbPathLabel) dbPathLabel.textContent = 'SQLite 文件路径';
+      if (dbPathInput) dbPathInput.placeholder = '例如 /data/db/mydb.sqlite';
+    } catch (e) {}
+  } else if (dbType === 'hdfs') {
+    // HDFS: need host/port, user and a path; table/where are not applicable
+    if (dbPathRow) dbPathRow.style.display = '';
+    try {
+      // show host/port/user rows
+      ["dbHost", "dbPort", "dbUser"].forEach((id) => { const el = document.getElementById(id); if (el) { el.disabled = false; const row = el.closest('.row'); if (row) row.style.display = ''; el.style.display = ''; const lbl = el.previousElementSibling; if (lbl && lbl.tagName && lbl.tagName.toLowerCase() === 'label') lbl.style.display = ''; } });
+      // HDFS 通常不需要密码字段，隐藏 password input 与其 label（仅隐藏，不移除 DOM）
+      const pwdEl = document.getElementById('dbPassword');
+      if (pwdEl) {
+        pwdEl.disabled = true;
+        pwdEl.style.display = 'none';
+        const prev = pwdEl.previousElementSibling;
+        if (prev && prev.tagName && prev.tagName.toLowerCase() === 'label') prev.style.display = 'none';
+      }
+      // hide DB name row (database not applicable)
+      const dbNameEl = document.getElementById('dbName'); if (dbNameEl) { dbNameEl.disabled = true; const row = dbNameEl.closest('.row'); if (row) row.style.display = 'none'; }
+      // hide table/list controls
+      ["dbTableSelect", "dbTableInput", "dbWhere"].forEach((id) => { const el = document.getElementById(id); if (el) { el.disabled = true; const row = el.closest('.row'); if (row) row.style.display = 'none'; } });
+      // update dbPath label/placeholder for HDFS
+      const dbPathLabel = document.getElementById('dbPathLabel');
+      const dbPathInput = document.getElementById('dbPath');
+      if (dbPathLabel) dbPathLabel.textContent = 'HDFS 路径';
+      if (dbPathInput) dbPathInput.placeholder = '例如 /user/data/*.parquet 或 /user/data/csv/';
+    } catch (e) {
+      // best-effort
+    }
+  } else if (dbType === 'hbase') {
+    // HBase: use host/port (thrift), table selection required; dbName not used
+    if (dbPathRow) dbPathRow.style.display = 'none';
+    try {
+      ["dbHost", "dbPort", "dbUser", "dbPassword"].forEach((id) => { const el = document.getElementById(id); if (el) { el.disabled = false; const row = el.closest('.row'); if (row) row.style.display = ''; } });
+      const dbNameEl = document.getElementById('dbName'); if (dbNameEl) { dbNameEl.disabled = true; const row = dbNameEl.closest('.row'); if (row) row.style.display = 'none'; }
+      // show table selector/input
+      ["dbTableSelect", "dbTableInput"].forEach((id) => { const el = document.getElementById(id); if (el) { el.disabled = false; const row = el.closest('.row'); if (row) row.style.display = ''; } });
+      // keep where as scan filter (show)
+      const whereEl = document.getElementById('dbWhere'); if (whereEl) { whereEl.disabled = false; const row = whereEl.closest('.row'); if (row) row.style.display = ''; }
+      // show row key prefix input for HBase (use wrap)
+      const rkWrap = document.getElementById('hbaseRowKeyWrap');
+      const rk = document.getElementById('hbaseRowKeyPrefix');
+      if (rkWrap) rkWrap.style.display = '';
+      if (rk) rk.disabled = false;
+    } catch (e) {}
   } else {
+    // default relational types (mysql, postgres, hive, mssql, oracle)
     if (dbPathRow) dbPathRow.style.display = 'none';
     try {
       ["dbHost", "dbPort"].forEach((id) => { const el = document.getElementById(id); if (el) { el.disabled = false; const row = el.closest('.row'); if (row) row.style.display = ''; } });
-      ["dbName", "dbUser", "dbPassword"].forEach((id) => { const el = document.getElementById(id); if (el) { el.disabled = false; const row = el.closest('.row'); if (row) row.style.display = ''; } });
+      ["dbName", "dbUser", "dbPassword"].forEach((id) => { const el = document.getElementById(id); if (el) { el.disabled = false; const row = el.closest('.row'); if (row) row.style.display = ''; el.style.display = ''; const lbl = el.previousElementSibling; if (lbl && lbl.tagName && lbl.tagName.toLowerCase() === 'label') lbl.style.display = ''; } });
+      ["dbTableSelect", "dbTableInput", "dbWhere"].forEach((id) => { const el = document.getElementById(id); if (el) { el.disabled = false; const row = el.closest('.row'); if (row) row.style.display = ''; } });
+      // hide hbase row key prefix for non-HBase types
+      const rkWrap = document.getElementById('hbaseRowKeyWrap');
+      const rk = document.getElementById('hbaseRowKeyPrefix');
+      if (rkWrap) rkWrap.style.display = 'none';
+      if (rk) rk.disabled = true;
     } catch (e) {
       ["dbHost", "dbPort", "dbName", "dbUser", "dbPassword"].forEach((id) => { const el = document.getElementById(id); if (el) el.disabled = false; });
     }
@@ -756,7 +817,7 @@ function renderDbFields() {
 // update it to the default for the selected dbType so UI reflects expected port.
 function syncPortWithDbType() {
   try {
-    const DEFAULT_PORTS = { mysql: 3306, postgresql: 5432, sqlserver: 1433, oracle: 1521 };
+    const DEFAULT_PORTS = { mysql: 3306, postgresql: 5432, sqlserver: 1433, oracle: 1521, hive: 10000, hbase: 9090, hdfs: 9870 };
     const dbType = (document.getElementById('dbType')?.value || 'mysql').toLowerCase();
     const portEl = document.getElementById('dbPort');
     if (!portEl) return;
@@ -1148,6 +1209,7 @@ async function exportFromDb() {
         path: conf.path,
         dsn: conf.dsn,
         table: table,
+        row_key_prefix: conf.row_key_prefix,
       },
       format: format,
         append_to_latest: append_to_latest,
