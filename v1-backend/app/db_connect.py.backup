@@ -144,7 +144,7 @@ def test_db_connection(req: DBConnectReq, x_trace_id: Optional[str] = Header(def
 
 @router.post("/api/v1/db/list-tables")
 def list_tables(req: DBConnectReq, x_trace_id: Optional[str] = Header(default=None)):
-    """返回指定数据库下的表名列表（简易实现，支持 mysql/postgres/sqlite/hive/hbase）。"""
+    """返回指定数据库下的表名列表（简易实现，支持 mysql/postgres/sqlite）。"""
     try:
         dbt = (req.db_type or "").strip().lower()
         
@@ -167,9 +167,9 @@ def list_tables(req: DBConnectReq, x_trace_id: Optional[str] = Header(default=No
                 tables = [row[0] for row in rows]  # Hive returns tuples
                 cursor.close()
                 conn.close()
-                return TableListResp(code=0, message="OK", data=tables)
+                return {"code": 0, "message": "OK", "data": tables}
             except Exception as e:
-                return TableListResp(code=9999, message="查询表失败", detail=str(e))
+                return {"code": 9999, "message": "查询表失败", "detail": str(e)}
         elif dbt == "hbase":
             db_conf = {
                 "db_type": "hbase",
@@ -181,9 +181,9 @@ def list_tables(req: DBConnectReq, x_trace_id: Optional[str] = Header(default=No
                 conn = engine_from_config(db_conf)
                 tables = conn.tables()  # List HBase tables
                 conn.close()
-                return TableListResp(code=0, message="OK", data=[table.decode('utf-8') for table in tables])
+                return {"code": 0, "message": "OK", "data": [table.decode('utf-8') for table in tables]}
             except Exception as e:
-                return TableListResp(code=9999, message="查询表失败", detail=str(e))
+                return {"code": 9999, "message": "查询表失败", "detail": str(e)}
         elif dbt in ("mysql", "mariadb"):
             url = f"mysql+pymysql://{req.username}:{req.password}@{req.host}:{req.port}/{req.database}"
         elif dbt in ("postgres", "postgresql"):
@@ -210,6 +210,6 @@ def list_tables(req: DBConnectReq, x_trace_id: Optional[str] = Header(default=No
                 rows = conn.execute(sqlalchemy.text("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"))
                 tables = [r[0] for r in rows]
 
-        return TableListResp(code=0, message="OK", data=tables)
+        return {"code": 0, "message": "OK", "data": tables}
     except Exception as e:
-        return TableListResp(code=9999, message="查询表失败", detail=str(e))
+        return {"code": 9999, "message": "查询表失败", "detail": str(e)}
