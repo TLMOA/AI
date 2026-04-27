@@ -3,4 +3,10 @@ Description=IoT Backend Health Check Service
 
 [Service]
 Type=oneshot
+# create runtime dir /run/iot-backend-health for counter file when service runs
+RuntimeDirectory=iot-backend-health
+# Tune threshold via Environment=FAILURE_THRESHOLD (default in script is 3)
+Environment=FAILURE_THRESHOLD=3
+# Place counter file under /run to avoid permission issues; override via COUNTER_FILE if needed
+Environment=COUNTER_FILE=/run/iot-backend-health/failcount
 ExecStart=/usr/local/bin/iot-backend-health.sh

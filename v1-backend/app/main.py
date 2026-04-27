@@ -1523,6 +1523,25 @@ def health() -> Dict[str, str]:
     return {"status": "ok"}
 
 
+@app.get("/api/v1/health/databases")
+def health_databases(x_trace_id: Optional[str] = Header(default=None)) -> Dict[str, Any]:
+    """Return simulated readiness for newly added Hadoop-related database services.
+
+    Reads `HADOOP_DB_NAMES` environment variable as a comma-separated list of
+    service names (default: "hive,hbase,metastore"). When `SIMULATE_DB_READY`
+    is true (default), each service is reported as ready. This endpoint is
+    intended for web UI/service health checks and does not perform real probes.
+    """
+    trace_id = make_trace_id(x_trace_id)
+    names = [n.strip() for n in os.getenv("HADOOP_DB_NAMES", "hive,hbase,metastore").split(",") if n.strip()]
+    simulated = os.getenv("SIMULATE_DB_READY", "true").lower() in ("1", "true", "yes")
+    databases = []
+    for name in names:
+        databases.append({"name": name, "ready": simulated, "detail": "simulated readiness" if simulated else "not ready (simulated)"})
+
+    return ok({"databases": databases, "simulated": simulated}, trace_id)
+
+
 @app.get("/api/v1/system/executor")
 def get_executor_info(x_trace_id: Optional[str] = Header(default=None)):
     trace_id = make_trace_id(x_trace_id)

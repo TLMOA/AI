@@ -1,0 +1,18 @@
+[0;1;32m●[0m iot-backend.service - IoT V1 Backend (FastAPI) - system
+     Loaded: loaded (/etc/systemd/system/iot-backend.service; enabled; vendor preset: enabled)
+    Drop-In: /etc/systemd/system/iot-backend.service.d
+             └─override.conf
+     Active: [0;1;32mactive (running)[0m since Mon 2026-04-27 11:21:59 CST; 8s ago
+    Process: 837334 ExecStartPre=/bin/sleep 2 (code=exited, status=0/SUCCESS)
+   Main PID: 837436 (python)
+      Tasks: 7 (limit: 37925)
+     Memory: 1.9G
+     CGroup: /system.slice/iot-backend.service
+             └─837436 /home/yhz/iot/.venv/bin/python -m uvicorn app.main:app --host 127.0.0.1 --port 8081
+
+4月 27 11:21:57 ubunto systemd[1]: Starting IoT V1 Backend (FastAPI) - system...
+4月 27 11:21:59 ubunto systemd[1]: Started IoT V1 Backend (FastAPI) - system.
+4月 27 11:21:59 ubunto python[837436]: INFO:     Started server process [837436]
+4月 27 11:21:59 ubunto python[837436]: INFO:     Waiting for application startup.
+4月 27 11:22:06 ubunto python[837436]: INFO:     Application startup complete.
+4月 27 11:22:06 ubunto python[837436]: INFO:     Uvicorn running on http://127.0.0.1:8081 (Press CTRL+C to quit)
