@@ -19,6 +19,7 @@ from pydantic import BaseModel, Field, field_validator
 from .executors import MockExecutor, NiFiExecutor
 from .db_connect import router as db_router
 from .auth import router as auth_router
+from .admin_routes import router as admin_router
 from .auth import _get_current_user_from_token
 from . import db_models
 from .export_worker import run_export_job
@@ -98,6 +99,7 @@ IN_DATA_BASE_DIR.mkdir(parents=True, exist_ok=True)
 app = FastAPI(title="AI Module V1 Backend", version="0.1.0")
 app.include_router(db_router)
 app.include_router(auth_router)
+app.include_router(admin_router)
 
 
 def _require_admin(request: Request):

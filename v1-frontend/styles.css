@@ -87,6 +87,17 @@ select, input {
   flex: 0 1 180px;
 }
 
+/* silent export inline label shouldn't use fixed label width */
+.silent-label {
+  flex: 0 0 auto;
+  width: auto;
+}
+
+/* make status message align to the right of the row */
+#statusMsg {
+  margin-left: 8px;
+}
+
 button {
   cursor: pointer;
   background: var(--primary);

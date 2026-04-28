@@ -375,6 +375,57 @@
     }
   }
 
+  async function loadSilentExportStatus() {
+    const tenant = inferFactoryId();
+    const res = await callApi(`/internal/tenants/${encodeURIComponent(tenant)}/silent-export`);
+    const toggle = document.getElementById('silentExportToggle');
+    const triggerBtn = document.getElementById('silentExportTrigger');
+    if (!toggle || !triggerBtn) return;
+    if (!res || res.code !== 0) {
+      toggle.checked = false;
+      toggle.disabled = true;
+      triggerBtn.disabled = true;
+      return;
+    }
+    const cfg = res.data || {};
+    toggle.checked = !!cfg.enabled;
+    toggle.disabled = false;
+    triggerBtn.disabled = !cfg.enabled;
+  }
+
+  async function setSilentExport(enabled) {
+    const tenant = inferFactoryId();
+    const payload = { enabled };
+    const res = await callApi(`/internal/tenants/${encodeURIComponent(tenant)}/silent-export`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    if (!res || res.code !== 0) {
+      setStatus(`操作失败: ${res && res.message ? res.message : 'unknown'}`, true);
+      return false;
+    }
+    setStatus(`Silent Export 已 ${enabled ? '启用' : '禁用'}`, false);
+    return true;
+  }
+
+  async function triggerSilentExport() {
+    const confirmOk = window.confirm('确认要对当前工厂立即触发一次静默导出吗？此操作仅限管理员用途。');
+    if (!confirmOk) return;
+    const tenant = inferFactoryId();
+    setStatus('正在触发静默导出...', false);
+    const res = await callApi(`/internal/tenants/${encodeURIComponent(tenant)}/silent-export/trigger`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ operator: 'web-admin' }),
+    });
+    if (!res || res.code !== 0) {
+      setStatus(`触发失败: ${res && res.message ? res.message : 'unknown'}`, true);
+      return;
+    }
+    setStatus('静默导出已触发（后台执行）', false);
+  }
+
   async function loadTree() {
     setStatus("加载目录树中...");
     const res = await callApi("/internal/factory-tree?depth=6");
@@ -471,6 +522,28 @@
       });
     }
 
+    const silentToggle = document.getElementById('silentExportToggle');
+    const silentTrigger = document.getElementById('silentExportTrigger');
+    if (silentToggle) {
+      silentToggle.addEventListener('change', async (e) => {
+        const checked = !!e.target.checked;
+        silentToggle.disabled = true;
+        const ok = await setSilentExport(checked);
+        if (!ok) {
+          // revert
+          silentToggle.checked = !checked;
+        } else {
+          if (silentTrigger) silentTrigger.disabled = !checked;
+        }
+        silentToggle.disabled = false;
+      });
+    }
+    if (silentTrigger) {
+      silentTrigger.addEventListener('click', async () => {
+        await triggerSilentExport();
+      });
+    }
+
     reloadPreviewBtn.addEventListener("click", () => {
       if (state.selectedFileId) previewFile(state.selectedFileId);
     });
@@ -518,6 +591,8 @@
     bindEvents();
     const ok = await loadTree();
     if (ok) await loadAssets();
+    // load silent export status for selected tenant
+    try { await loadSilentExportStatus(); } catch (e) { /* ignore */ }
   }
 
   init();
