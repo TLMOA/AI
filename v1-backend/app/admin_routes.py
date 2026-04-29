@@ -15,6 +15,10 @@ def _get_generated_dir() -> Path:
     return Path(__file__).resolve().parent.parent / "data" / "generated"
 
 
+def _get_silent_export_dir() -> Path:
+    return Path("/home/yhz/iot/nifi_data") / "silent_exports"
+
+
 def _config_path() -> Path:
     d = _get_generated_dir()
     d.mkdir(parents=True, exist_ok=True)
@@ -28,20 +32,22 @@ def _requests_path() -> Path:
 
 
 def _require_admin(request: Request):
-    # simple cookie-based admin check compatible with auth._get_current_user_from_token
     from .auth import _get_current_user_from_token
 
     cookie = request.cookies.get("access_token")
     user = _get_current_user_from_token(cookie)
     if not user or not user.get("is_admin"):
         raise HTTPException(status_code=403, detail="管理员权限不足")
+    return user
 
 
 class SilentExportConfig(BaseModel):
     enabled: Optional[bool] = False
-    cron: Optional[str] = "0 2 * * *"
+    cron: Optional[str] = "daily"
     retention_days: Optional[int] = 7
     incremental_marker_column: Optional[str] = "updated_at"
+    max_concurrent: Optional[int] = 1
+    db: Optional[Dict[str, Any]] = None
 
 
 @router.get("/api/internal/tenants/{tenant}/silent-export")
@@ -62,8 +68,7 @@ def get_silent_export(tenant: str):
 
 @router.post("/api/internal/tenants/{tenant}/silent-export")
 def set_silent_export(tenant: str, req: SilentExportConfig, request: Request = None):
-    # require admin
-    _require_admin(request)
+    user = _require_admin(request)
     cfgp = _config_path()
     data = {"tenants": {}}
     if cfgp.exists():
@@ -73,12 +78,16 @@ def set_silent_export(tenant: str, req: SilentExportConfig, request: Request = N
             data = {"tenants": {}}
 
     tenants = data.setdefault("tenants", {})
+    old = tenants.get(tenant, {})
     tenants[tenant] = {
         "enabled": bool(req.enabled),
-        "cron": req.cron or "",
+        "cron": req.cron or "daily",
         "retention_days": int(req.retention_days or 7),
         "incremental_marker_column": req.incremental_marker_column or "updated_at",
+        "max_concurrent": int(req.max_concurrent or 1),
+        "db": req.db or old.get("db") or {},
         "updated_at": datetime.utcnow().isoformat(),
+        "updated_by": user.get("username") if isinstance(user, dict) else None,
     }
     cfgp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
     return {"code": 0, "message": "OK", "data": tenants[tenant], "traceId": ""}
@@ -86,9 +95,9 @@ def set_silent_export(tenant: str, req: SilentExportConfig, request: Request = N
 
 @router.post("/api/internal/tenants/{tenant}/silent-export/trigger")
 def trigger_silent_export(tenant: str, payload: Optional[Dict[str, Any]] = None, request: Request = None):
-    _require_admin(request)
+    user = _require_admin(request)
     req = payload or {}
-    operator = req.get("operator") or "web-admin"
+    operator = req.get("operator") or (user.get("username") if isinstance(user, dict) else "web-admin")
     job = {
         "tenant": tenant,
         "operator": operator,
@@ -96,12 +105,11 @@ def trigger_silent_export(tenant: str, payload: Optional[Dict[str, Any]] = None,
         "status": "queued",
     }
     p = _requests_path()
-    # append ndjson
     with p.open("a", encoding="utf-8") as fh:
         fh.write(json.dumps(job, ensure_ascii=False) + "\n")
-    # spawn background worker to process immediately
+    _get_silent_export_dir().mkdir(parents=True, exist_ok=True)
     try:
-        t = threading.Thread(target=process_once, daemon=True)
+        t = threading.Thread(target=process_once, kwargs={"tenant_filter": tenant}, daemon=True)
         t.start()
     except Exception:
         pass

@@ -23,6 +23,7 @@ from .admin_routes import router as admin_router
 from .auth import _get_current_user_from_token
 from . import db_models
 from .export_worker import run_export_job
+from .silent_export_worker import process_loop_once
 from .scheduler import start_scheduler, stop_scheduler, schedule_job, remove_scheduled
 import threading
 import pymysql
@@ -660,6 +661,11 @@ def _startup():
                 }])
         finally:
             session.close()
+
+        silent_cfg = session.query(db_models.ExportJobModel).first()
+        silent_spec = os.getenv("SILENT_EXPORT_SCHEDULE", "daily")
+        if silent_spec:
+            schedule_job("silent-export-worker", silent_spec, process_loop_once)
     except Exception:
         pass
 

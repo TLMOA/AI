@@ -33,7 +33,10 @@ const state = {
   previewOffset: 0,
   tagRules: [],
   currentUser: null,
+  backendMode: "local",
 };
+
+const BACKEND_MODE_STORAGE_KEY = "iot.backend.mode";
 
 const ERROR_HINTS = {
   NIFI_AUTH_ERROR: "NiFi 鉴权失败，请检查用户名/密码或权限配置。",
@@ -48,12 +51,51 @@ function toErrorHint(errorCode) {
   return ERROR_HINTS[errorCode] || `未知错误码: ${errorCode}`;
 }
 
+function getBackendModeConfig(mode) {
+  const backendModes = config.BACKEND_MODES || {};
+  return backendModes[mode] || backendModes[config.DEFAULT_BACKEND_MODE] || { label: mode, apiBase: config.API_BASE };
+}
+
+function getBackendApiBase(mode = state.backendMode || config.DEFAULT_BACKEND_MODE || "local") {
+  const cfg = getBackendModeConfig(mode);
+  const apiBase = String(cfg.apiBase || config.API_BASE || "/api/v1").trim();
+  if (!apiBase) return "/api/v1";
+  return apiBase.startsWith("/") ? apiBase : `/${apiBase}`;
+}
+
+function setBackendMode(mode) {
+  state.backendMode = mode === "nifi" ? "nifi" : "local";
+  try {
+    localStorage.setItem(BACKEND_MODE_STORAGE_KEY, state.backendMode);
+  } catch (_) {}
+  updateBackendToggleUI();
+}
+
+function updateBackendToggleUI() {
+  const label = document.getElementById("backendModeLabel");
+  const localBtn = document.getElementById("backendLocalBtn");
+  const nifiBtn = document.getElementById("backendNifiBtn");
+  const current = state.backendMode || config.DEFAULT_BACKEND_MODE || "local";
+  if (label) {
+    const cfg = getBackendModeConfig(current);
+    label.textContent = `当前后端：${cfg.label || current}`;
+  }
+  if (localBtn) {
+    localBtn.classList.toggle("primary", current === "local");
+    localBtn.classList.toggle("secondary", current !== "local");
+  }
+  if (nifiBtn) {
+    nifiBtn.classList.toggle("primary", current === "nifi");
+    nifiBtn.classList.toggle("secondary", current !== "nifi");
+  }
+}
+
 function api(path, options = {}) {
   if (config.USE_MOCK_API) {
     return mockApi(path, options);
   }
   const fetchOptions = Object.assign({ credentials: 'same-origin' }, options || {});
-  return fetch(`${config.API_BASE}${path}`, fetchOptions).then((r) => r.json());
+  return fetch(`${getBackendApiBase()}${path}`, fetchOptions).then((r) => r.json());
 }
 
 function _normalizeBase(base) {
@@ -1046,6 +1088,10 @@ function bindEvents() {
   document.getElementById("loadFilesBtn").addEventListener("click", loadFiles);
   document.getElementById("loadRulesBtn").addEventListener("click", loadTagRules);
   document.getElementById("autoTagBtn").addEventListener("click", triggerAutoTag);
+  const backendLocalBtn = document.getElementById("backendLocalBtn");
+  const backendNifiBtn = document.getElementById("backendNifiBtn");
+  if (backendLocalBtn) backendLocalBtn.addEventListener("click", () => setBackendMode("local"));
+  if (backendNifiBtn) backendNifiBtn.addEventListener("click", () => setBackendMode("nifi"));
 
   // DB export UI
   const dbTestBtn = document.getElementById("dbTestBtn");
@@ -1069,6 +1115,13 @@ function bindEvents() {
 }
 
 function init() {
+  try {
+    const savedMode = localStorage.getItem(BACKEND_MODE_STORAGE_KEY);
+    if (savedMode) {
+      state.backendMode = savedMode === "nifi" ? "nifi" : "local";
+    }
+  } catch (_) {}
+  updateBackendToggleUI();
   bindEvents();
   loadJobs();
   loadFiles();

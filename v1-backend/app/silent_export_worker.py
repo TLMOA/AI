@@ -1,18 +1,20 @@
-"""Worker to process silent export requests.
+"""Silent export executor.
 
-Features:
-- Reads `data/generated/silent_export_requests.ndjson` for queued triggers.
-- Loads per-tenant configuration from `data/generated/silent_export_config.json`.
-- Connects to target DB using `engine_from_config` and exports each table to
-  `nifi_data/silent_exports/<tenant>/<table>_silent_export.csv`.
-- Supports incremental export using `incremental_marker_column` (timestamp or numeric).
+Implements the方案 requirements at a pragmatic level:
+- per-tenant config stored in `data/generated/silent_export_config.json`
+- first run emits a full table snapshot
+- later runs append incrementally by marker column
+- schema changes roll a new dated file and keep old files intact
+- each table keeps a `.meta.json` file with execution metadata
 """
 from pathlib import Path
+import csv
+import hashlib
 import json
 from datetime import datetime
 import time
 import fcntl
-from typing import Optional
+from typing import Optional, Dict, Any, List, Tuple
 import shutil
 import os
 
@@ -25,6 +27,8 @@ GENERATED = BASE_DIR / "data" / "generated"
 REQUESTS = GENERATED / "silent_export_requests.ndjson"
 CONFIG = GENERATED / "silent_export_config.json"
 NIFI_SILENT_DIR = Path("/home/yhz/iot/nifi_data") / "silent_exports"
+SILENT_EXPORT_TMP_DIRNAME = "tmp"
+DEFAULT_SCHEDULE = os.getenv("SILENT_EXPORT_SCHEDULE", "daily")
 
 
 def _load_config() -> dict:
@@ -38,6 +42,14 @@ def _load_config() -> dict:
 
 def _save_config(data: dict):
     CONFIG.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _schema_hash(columns: List[str]) -> str:
+    return hashlib.sha256("|".join(columns).encode("utf-8")).hexdigest()[:16]
+
+
+def _file_name_for_table(table: str, suffix: str = "") -> str:
+    return f"{table}_silent_export{suffix}.csv"
 
 
 def _acquire_lock(fp):
@@ -56,7 +68,6 @@ def _release_lock(fp):
 
 
 def _append_atomic(final_path: Path, tmp_path: Path):
-    # Append tmp_path contents to final_path atomically by using file-level lock
     final_path.parent.mkdir(parents=True, exist_ok=True)
     with open(final_path, "a+b") as f_final:
         if not _acquire_lock(f_final):
@@ -70,155 +81,134 @@ def _append_atomic(final_path: Path, tmp_path: Path):
             _release_lock(f_final)
 
 
+def _read_table_rows(conn, table: str, marker_col: Optional[str], marker_value: Any = None) -> Tuple[List[str], List[Dict[str, Any]]]:
+    q = f'SELECT * FROM "{table}"' if marker_col is None or marker_value is None else f'SELECT * FROM "{table}" WHERE "{marker_col}" > :m'
+    res = conn.execute(sqlalchemy.text(q), {"m": marker_value} if marker_col is not None and marker_value is not None else {})
+    cols = list(res.keys())
+    rows = [dict(r._mapping) for r in res.fetchall()]
+    return cols, rows
+
+
+def _write_csv(path: Path, columns: List[str], rows: List[Dict[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8", newline="") as fh:
+        writer = csv.writer(fh)
+        writer.writerow(columns)
+        for row in rows:
+            writer.writerow(["" if row.get(c) is None else str(row.get(c)) for c in columns])
+        fh.flush()
+        os.fsync(fh.fileno())
+
+
 def _export_table(engine, tenant: str, table: str, marker_col: Optional[str], last_marker) -> Optional[dict]:
-    """Export either full table (if last_marker is None) or incremental rows.
-
-    Returns dict with rows_exported and new_last_marker.
-    """
     out_dir = NIFI_SILENT_DIR / tenant
+    tmp_dir = out_dir / SILENT_EXPORT_TMP_DIRNAME
     out_dir.mkdir(parents=True, exist_ok=True)
-    final_file = out_dir / f"{table}_silent_export.csv"
-    tmp_file = out_dir / f".{table}.append.tmp"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+
+    meta_file = out_dir / f"{table}_silent_export.csv.meta.json"
+    meta: Dict[str, Any] = {}
+    if meta_file.exists():
+        try:
+            meta = json.loads(meta_file.read_text(encoding="utf-8"))
+        except Exception:
+            meta = {}
+
     with engine.connect() as conn:
-        # determine dialect-aware quoting
-        try:
-            dialect = getattr(engine, 'dialect', None)
-            dialect_name = dialect.name if dialect is not None else ''
-        except Exception:
-            dialect_name = ''
+        columns_all, full_rows = _read_table_rows(conn, table, None)
+        current_schema = _schema_hash(columns_all)
+        previous_schema = meta.get("schema_hash")
+        schema_changed = bool(previous_schema and previous_schema != current_schema)
 
-        quote = '"' if dialect_name == 'sqlite' else '`'
-
-        # build query
-        if last_marker is None:
-            q = f"SELECT * FROM {quote}{table}{quote}"
-            params = {}
+        if schema_changed:
+            suffix = f"_{datetime.utcnow().strftime('%Y%m%d')}"
+            final_file = out_dir / _file_name_for_table(table, suffix)
         else:
-            if marker_col:
-                q = f"SELECT * FROM {quote}{table}{quote} WHERE {quote}{marker_col}{quote} > :m"
-                params = {"m": last_marker}
-            else:
-                # no marker col, do full export (conservative)
-                q = f"SELECT * FROM {quote}{table}{quote}"
-                params = {}
+            final_file = out_dir / _file_name_for_table(table)
 
-        # fetch rows iterator; also obtain headers separately so we can write header even when zero rows
-        # get headers via LIMIT 1
-        headers = []
-        try:
-            probe_q = f"SELECT * FROM {quote}{table}{quote} LIMIT 1"
-            probe_res = conn.execute(sqlalchemy.text(probe_q))
-            try:
-                headers = list(probe_res.keys()) if hasattr(probe_res, 'keys') else []
-            except Exception:
-                cursor = getattr(probe_res, 'cursor', None)
-                if cursor is not None and getattr(cursor, 'description', None):
-                    headers = [d[0] for d in cursor.description]
-        except Exception:
-            headers = []
+        effective_marker = last_marker if last_marker is not None else meta.get("last_export_marker")
+        if effective_marker is None:
+            effective_marker_by_table = meta.get("last_export_marker_by_table") or {}
+            effective_marker = effective_marker_by_table.get(table)
 
-        res = conn.execute(sqlalchemy.text(q), params)
-        # fetchall may be large; use fetchall here for simplicity
-        rows = res.fetchall()
-        # write tmp CSV
-        import csv
-        tmp_file.unlink(missing_ok=True)
-        with tmp_file.open("w", encoding="utf-8", newline="") as fh:
-            writer = csv.writer(fh)
-            # write header only if final_file not exists
-            if not final_file.exists():
-                # try SQLAlchemy Result.keys() first, fallback to cursor description
-                try:
-                    headers = list(res.keys()) if hasattr(res, 'keys') else []
-                except Exception:
-                    headers = []
-                if not headers:
-                    cursor = getattr(res, 'cursor', None)
-                    if cursor is not None and getattr(cursor, 'description', None):
-                        headers = [d[0] for d in cursor.description]
-                    else:
-                        headers = []
-                writer.writerow(headers)
-            for r in rows:
-                writer.writerow(list(r))
-        # if no rows and header was discovered, ensure an empty file with header exists
-        if not rows and headers and not final_file.exists():
-            # header was already written above when final_file didn't exist
-            pass
-        # fsync tmp
-        with tmp_file.open("rb") as ftmp:
-            ftmp.flush()
-        # append to final atomically
-        # If final doesn't exist, rename tmp to final
-        if not final_file.exists():
-            tmp_file.rename(final_file)
+        if effective_marker is None or not marker_col:
+            columns, rows = columns_all, full_rows
+            trigger_reason = "initial_full_export" if not final_file.exists() else "full_refresh"
         else:
-            # append
-            with open(final_file, "ab") as f_final, open(tmp_file, "rb") as f_tmp:
-                if _acquire_lock(f_final):
-                    try:
-                        shutil.copyfileobj(f_tmp, f_final)
-                        f_final.flush()
-                        try:
-                            import os
+            columns, rows = _read_table_rows(conn, table, marker_col, effective_marker)
+            trigger_reason = "incremental_append"
 
-                            os.fsync(f_final.fileno())
-                        except Exception:
-                            pass
-                    finally:
-                        _release_lock(f_final)
+        tmp_file = tmp_dir / f"{table}.{int(time.time())}.csv"
+        _write_csv(tmp_file, columns, rows)
+
+        if not final_file.exists() or schema_changed:
+            tmp_file.replace(final_file)
+            rows_exported = len(rows)
+        else:
+            _append_atomic(final_file, tmp_file)
+            rows_exported = len(rows)
             tmp_file.unlink(missing_ok=True)
 
-        # compute new marker
-        new_marker = last_marker
-        # prefer using result keys to find marker column index
+        new_marker = effective_marker
+        if marker_col and rows:
+            last_row = rows[-1]
+            new_marker = last_row.get(marker_col, effective_marker)
+
+        current_meta = {
+            "tenant": tenant,
+            "table": table,
+            "traceId": f"silent-{int(time.time())}",
+            "jobId": f"silent-{tenant}-{table}",
+            "operator": "scheduler",
+            "triggerReason": trigger_reason,
+            "last_export_marker": new_marker,
+            "rows_exported": rows_exported,
+            "timestamp": datetime.utcnow().isoformat(),
+            "schema_hash": current_schema,
+            "schema_changed": schema_changed,
+            "source_file": str(final_file),
+        }
+        meta.update(current_meta)
+        meta.setdefault("last_export_marker_by_table", {})[table] = new_marker
+        meta_file.write_text(json.dumps(meta, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+
+        return {"rows_exported": rows_exported, "new_marker": new_marker, "schema_changed": schema_changed}
+
+
+def _iter_enabled_tenants(cfg: Dict[str, Any]) -> List[Tuple[str, Dict[str, Any]]]:
+    tenants = cfg.get("tenants", {}) if isinstance(cfg, dict) else {}
+    items = []
+    for tenant, tcfg in tenants.items():
+        if isinstance(tcfg, dict) and tcfg.get("enabled"):
+            items.append((tenant, tcfg))
+    return items
+
+
+def _get_table_list(engine) -> List[str]:
+    with engine.connect() as conn:
         try:
-            cols = list(res.keys()) if hasattr(res, 'keys') else []
+            tbls = [r[0] for r in conn.execute(sqlalchemy.text("SHOW TABLES")).fetchall()]
         except Exception:
-            cols = []
-        if marker_col and cols:
-            try:
-                last_row = rows[-1]
-                idx = cols.index(marker_col)
-                new_marker = last_row[idx]
-            except Exception:
-                pass
-
-        return {"rows_exported": len(rows), "new_marker": new_marker}
+            tbls = [r[0] for r in conn.execute(sqlalchemy.text("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'" )).fetchall()]
+    return tbls
 
 
-def process_once():
-    # read queued requests
-    if not REQUESTS.exists():
-        print("no pending requests")
-        return
-    lines = REQUESTS.read_text(encoding="utf-8").strip().splitlines()
-    if not lines:
-        print("no pending requests")
-        return
-    # load config
+def process_once(tenant_filter: Optional[str] = None):
     cfg = _load_config()
     tenants_cfg = cfg.get("tenants", {})
+    targets = _iter_enabled_tenants(cfg)
+    if tenant_filter:
+        targets = [(t, c) for t, c in targets if t == tenant_filter]
 
-    remaining = []
-    for ln in lines:
-        try:
-            job = json.loads(ln)
-        except Exception:
-            continue
-        if job.get("status") != "queued":
-            continue
-        tenant = job.get("tenant") or "factory-001"
-        tcfg = tenants_cfg.get(tenant, {})
-        if not tcfg or not tcfg.get("enabled"):
-            print(f"silent export disabled for tenant={tenant}")
-            continue
+    if not targets:
+        print("no enabled silent export tenants")
+        return 0
 
+    processed = 0
+    for tenant, tcfg in targets:
         print(f"processing silent export for tenant={tenant}")
-        # build DB engine config: allow per-tenant db conf under tcfg['db'] or fallback to env via engine_from_config
         db_conf = tcfg.get("db") or {}
         if not db_conf:
-            # try env defaults
             db_conf = {
                 "db_type": "mysql",
                 "user": tcfg.get("db_user") or "root",
@@ -230,47 +220,35 @@ def process_once():
 
         try:
             engine = engine_from_config(db_conf)
+            tbls = _get_table_list(engine)
         except Exception as e:
-            print(f"failed to init engine for tenant={tenant}: {e}")
-            continue
-
-        # list tables (try MySQL-ish, fall back to sqlite)
-        try:
-            with engine.connect() as conn:
-                try:
-                    tbls = [r[0] for r in conn.execute(sqlalchemy.text("SHOW TABLES")).fetchall()]
-                except Exception:
-                    # sqlite fallback
-                    try:
-                        tbls = [r[0] for r in conn.execute(sqlalchemy.text("SELECT name FROM sqlite_master WHERE type='table'")).fetchall()]
-                    except Exception as e:
-                        raise
-        except Exception as e:
-            print(f"failed to list tables for tenant={tenant}: {e}")
+            print(f"failed to init/list for tenant={tenant}: {e}")
             continue
 
         marker_col = tcfg.get("incremental_marker_column")
-        last_marker = tcfg.get("last_export_marker")
-
+        last_marker_by_table = tcfg.get("last_export_marker_by_table") or {}
         for table in tbls:
             try:
-                res = _export_table(engine, tenant, table, marker_col, last_marker)
-                print(f"exported table={table} rows={res['rows_exported']}")
+                res = _export_table(engine, tenant, table, marker_col, last_marker_by_table.get(table))
                 if res and res.get("new_marker") is not None:
-                    # update last_marker per table: store under tenants.<tenant>.last_export_marker_by_table
                     per_table = tenants_cfg.setdefault(tenant, {}).setdefault("last_export_marker_by_table", {})
                     per_table[table] = res.get("new_marker")
-                    # persist
                     cfg["tenants"] = tenants_cfg
                     _save_config(cfg)
+                print(f"exported table={table} rows={res['rows_exported'] if res else 0}")
             except Exception as e:
                 print(f"failed exporting table={table} for tenant={tenant}: {e}")
+        processed += 1
 
-    # clear requests after processing
+    return processed
+
+
+def process_loop_once():
     try:
-        REQUESTS.unlink()
-    except Exception:
-        pass
+        return process_once()
+    except Exception as exc:
+        print(f"silent export scheduler run failed: {exc}")
+        return 0
 
 
 if __name__ == "__main__":

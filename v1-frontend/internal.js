@@ -12,7 +12,10 @@
     treeChildren: {},
     treeRootPath: "",
     expandedDirs: {},
+    backendMode: "",
   };
+
+  const BACKEND_MODE_STORAGE_KEY = "iot.backend.mode";
 
   function getRelativeApiBase() {
     try {
@@ -23,8 +26,23 @@
     }
   }
 
+  function getConfiguredBackendMode() {
+    const fromStorage = window.localStorage.getItem(BACKEND_MODE_STORAGE_KEY);
+    const fallback = String(config.DEFAULT_BACKEND_MODE || "local").toLowerCase();
+    const normalized = String(fromStorage || fallback || "local").toLowerCase();
+    return normalized === "nifi" ? "nifi" : "local";
+  }
+
+  function getBackendModeMeta(mode) {
+    const modes = config.BACKEND_MODES || {};
+    const normalized = mode === "nifi" ? "nifi" : "local";
+    return modes[normalized] || { label: normalized === "nifi" ? "NiFi" : "Local", apiBase: config.API_BASE || "api/v1" };
+  }
+
   function getApiBaseCandidates() {
-    const configured = String(config.API_BASE || "").trim();
+    const configuredMode = getConfiguredBackendMode();
+    const backendMeta = getBackendModeMeta(configuredMode);
+    const configured = String(backendMeta.apiBase || config.API_BASE || "").trim();
     const normalizedConfigured = configured
       ? (configured.startsWith("/") ? configured : `/${configured}`)
       : "";
@@ -32,9 +50,9 @@
     const localHosts = new Set(["localhost", "127.0.0.1", "::1"]);
     const isLocalPage = localHosts.has(String(window.location.hostname || "").toLowerCase());
     const candidates = [
-      "/api/v1",
-      pageRelative,
       normalizedConfigured,
+      pageRelative,
+      "/api/v1",
     ];
     if (isLocalPage) {
       candidates.push("http://127.0.0.1:8081/api/v1", "http://localhost:8081/api/v1");
@@ -100,6 +118,24 @@
     if (!el) return;
     el.textContent = msg || "";
     el.style.color = isError ? "#b91c1c" : "#64748b";
+  }
+
+  function updateBackendToggleUI() {
+    const localBtn = document.getElementById("backendLocalBtn");
+    const nifiBtn = document.getElementById("backendNifiBtn");
+    const mode = getConfiguredBackendMode();
+    state.backendMode = mode;
+    if (localBtn) localBtn.classList.toggle("active", mode === "local");
+    if (nifiBtn) nifiBtn.classList.toggle("active", mode === "nifi");
+    const meta = getBackendModeMeta(mode);
+    setStatus(`当前后端模式：${meta.label}`);
+  }
+
+  function setBackendMode(mode) {
+    const normalized = mode === "nifi" ? "nifi" : "local";
+    window.localStorage.setItem(BACKEND_MODE_STORAGE_KEY, normalized);
+    updateBackendToggleUI();
+    setStatus(`已切换到 ${getBackendModeMeta(normalized).label}，其余页面无需修改`, false);
   }
 
   function renderTree(roots) {
