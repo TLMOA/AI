@@ -1,0 +1,4 @@
+id,username,password_hash,is_admin,created_at
+1,admin,$2b$12$05X1LpZxSY0zk9FmkZGt5OzbtKcBU.lzbd/1M2YrB5pgnGPJDcCha,1,
+1,admin,$2b$12$05X1LpZxSY0zk9FmkZGt5OzbtKcBU.lzbd/1M2YrB5pgnGPJDcCha,1,
+1,admin,$2b$12$05X1LpZxSY0zk9FmkZGt5OzbtKcBU.lzbd/1M2YrB5pgnGPJDcCha,1,

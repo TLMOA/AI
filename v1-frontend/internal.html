@@ -72,6 +72,27 @@
       color: var(--muted);
       font-size: 12px;
     }
+    .backend-toggle-group {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 4px;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      background: #fff;
+    }
+    .backend-toggle-btn {
+      border-radius: 999px;
+      border: 0;
+      padding: 8px 14px;
+      background: transparent;
+      color: var(--muted);
+      font-weight: 600;
+    }
+    .backend-toggle-btn.active {
+      background: var(--primary, #2563eb);
+      color: #fff;
+    }
     #previewRaw {
       white-space: pre-wrap;
       word-break: break-word;
@@ -99,6 +120,9 @@
         <select id="factorySelect"></select>
         <button id="refreshBtn">刷新</button>
         <span id="statusMsg" class="muted"></span>
+        <span class="muted silent-label" style="margin-left:12px">Silent Export</span>
+        <input type="checkbox" id="silentExportToggle" />
+        <button id="silentExportTrigger" class="secondary">立即触发一次</button>
       </div>
     </section>
 

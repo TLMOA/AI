@@ -1,0 +1,18 @@
+{
+  "tenants": {
+    "factory-001": {
+      "enabled": true,
+      "cron": "0 2 * * *",
+      "retention_days": 7,
+      "incremental_marker_column": "updated_at",
+      "db": {
+        "db_type": "mysql",
+        "user": "root",
+        "password": "root",
+        "host": "127.0.0.1",
+        "port": 3306,
+        "database": "mydb"
+      }
+    }
+  }
+}

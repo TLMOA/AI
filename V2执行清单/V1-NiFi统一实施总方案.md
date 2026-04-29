@@ -1,5 +1,9 @@
 # V1 NiFi 统一实施总方案（精简可执行版）
 
+> **补充约束（必须优先执行）**：整个网站必须提供一个全局后端切换按钮，且不改动其他前端页面结构与业务逻辑；按钮仅负责切换同一页面/同一接口请求所对应的后端执行路径（`backend-local` / `backend-nifi`），切换状态需按工厂（tenant）级别持久化，支持管理员权限控制与审计记录。若当前实现尚未具备该能力，应将其视为本方案的优先未完成项，并在前端与后端统一补齐。该要求与本文档中“前端透明切换”“全局切换开关（Local ↔ NiFi）”“切换粒度推荐按工厂（tenant）级别持久化”等条款保持一致。
+
+> **实施边界纠正**：内部管理页仅保留工厂归档、目录树、文件预览、静默导出等运维功能，不应再放置全局后端切换按钮；全局切换入口必须统一放在普通用户使用的 `index.html` 主页面顶部区域，避免其他页面出现重复开关。
+
 版本：v2.1
 作者：xy
 日期：2026-04-09
@@ -55,6 +59,47 @@
 - 可观测字段：`operation,sourcePath,targetPath,status,errorCode,errorMessage,durationMs`。  
 - 错误码基线（例）：`1002401`（参数非法）、`1002402`（解析失败）、`1002404`（fileId 不存在）、`1005001`（数据源连接失败）。
 
+## 附：Local / NiFi 切换需求补充
+
+为支持在生产线上按需在 `backend-local` 与 `backend-nifi` 之间切换执行路径，补充以下可执行需求与实现要点：
+
+- 概要：在前端不改动页面结构的前提下，新增一个全局切换开关（Local ↔ NiFi），切换后同一接口请求由服务端路由到 Local 或 NiFi 实现，NiFi 能力优先使用，缺失或不可用时回退 Local。
+
+- 前端行为：
+	- 增加全局切换按钮（放置于页面工具栏或顶部），显示当前模式（Local / NiFi）。
+	- 切换粒度推荐按工厂（tenant）级别持久化，也可支持 session/user 级作为调试或临时切换手段。
+	- 前端请求路径和参数保持不变；可选暴露调试用请求头 `X-Backend-Mode`（仅允许运维/开发使用）。
+
+- 后端路由（Adapter）设计：
+	- 在网关/服务层实现 Adapter/Router：读取工厂级配置（或 session），决定路由。优先尝试 NiFi：若存在对应 Flow 且健康可用，则调用 NiFi；否则回退到 Local 实现。
+	- 能力映射表维护每个逻辑操作到 NiFi flow id（例：`export_mysql -> nifi_flow_export_mysql_v1`）。
+	- 路由决策、执行结果须记录到日志与监控（包含 `traceId`、chosen_backend、flow_id、duration、error）。
+
+- 错误、回退与幂等性：
+	- NiFi 执行失败应返回统一响应壳并触发回退或人工干预流程；对非幂等操作回退需谨慎并写入审计记录。
+	- 建议所有写产物采用原子写（临时文件 + 重命名）并使用 `jobId+targetPath` 作为幂等键。
+
+- 权限与治理：
+	- 切换按钮应受限（系统管理员或工厂运维），切换操作须有审计记录（操作者、时间、旧值/新值、traceId）。
+
+- 契约测试与验收：
+	- 必须保证 Local 与 NiFi 在相同输入下返回相同响应 schema 与关键字段（契约测试覆盖）。
+	- 样本一致率与关键字段哈希一致率须满足总体量化目标（见第 8 节）。
+
+- 监控与告警：
+	- 增加指标：`operation.route.choice`, `nifi.flow.execution.count`, `nifi.flow.failure.count`, `local.execution.count`, `flow.latency.p95`。
+	- 当 NiFi 连续失败或不可用时触发告警并建议自动或人工切回 Local。
+
+- 回滚与演练：
+	- 在阶段 2 中完成回滚 runbook 演练：暂停 NiFi 流 → 切换 adapter 到 Local → 校验样本一致性 → 恢复或回放 DLQ。
+
+- 可交付物（补充）：
+	1. `nifi_adapter` 服务端模块与能力映射表示例（代码样板）。
+	2. 前端切换按钮组件（含权限判断与持久化示例）。
+	3. 契约测试用例（导出/上传/打标 场景）与演练记录。
+
+以上补充为本方案对“切换能力”的具体要求，需纳入 Phase B（适配层）与 Phase C（NiFi 实验室验证）的实施与验收条目中。
+
 ### 5.1 基于需求基线的对等范围（强制）
 
 以下条目以 `V1执行清单/需求规格-NiFi-文件输出.md` 为基线，要求 `backend-local` 与 `backend-nifi` 双路径均实现：
@@ -81,6 +126,16 @@
 	- 逻辑目录：`tagged_output`
 	- 命名要求：`<source>_tagged_YYYYMMDD_HHMMSS.<ext>`
 	- 写入要求：原子写（临时文件 + 重命名）
+
+7. MySQL -> TSV 导出
+	- 逻辑目录：`output_tsv`
+	- 格式要求：UTF-8、制表符分隔、LF、含表头
+	- 命名要求：`<table>_export_YYYYMMDD_HHMMSS.tsv`
+
+8. 定时导出（Scheduled export）
+	- 逻辑目录：`export`
+	- 说明：支持基于调度器的定时导出（例如每日/每小时），包括 CSV/JSON/TSV 格式，需同样遵守命名与原子写入规则
+	- 命名建议：`<table>_scheduled_export_YYYYMMDD_HHMMSS.<ext>`
 
 ### 5.2 接口与响应对等（强制）
 
@@ -119,6 +174,8 @@
 - 逻辑目录集合（必须统一）：`output_csv|output_json|output_tsv|inbox_csv|inbox_json|inbox_tsv|*_to_*|tagged_output`。  
 - 物理映射：Local 与 NiFi 分别映射到不同根目录，前端仅识别逻辑目录。  
 - 写入原则：临时文件 -> 完整性校验 -> 原子重命名；幂等键为 `jobId+targetPath`。
+ - 物理映射：Local 与 NiFi 分别映射到不同根目录，前端仅识别逻辑目录。为避免混淆，建议本地后端使用物理目录 `nifi_data`，NiFi 写入使用同一路径下的 `real_nifi_data`（例如同一挂载点下的并列目录），两者在物理上隔离但逻辑目录一致。
+ - 写入原则：临时文件 -> 完整性校验 -> 原子重命名；幂等键为 `jobId+targetPath`。
 
 ## 7. 三阶段执行路线（简明）
 

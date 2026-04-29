@@ -9,11 +9,20 @@
 <body>
   <div class="app">
     <header>
-      <h1>AI模块V1控制台</h1>
-      <p>简化可改造版（JetLinks联调开关默认关闭）</p>
-      <p>
-        <a id="internalLink" href="./internal.html" target="_blank" rel="noopener" style="display:none">打开内部管理页（单工厂）</a>
-      </p>
+      <div class="row" style="justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;">
+        <div>
+          <h1>AI模块V1控制台</h1>
+          <p>简化可改造版（JetLinks联调开关默认关闭）</p>
+          <p>
+            <a id="internalLink" href="./internal.html" target="_blank" rel="noopener" style="display:none">打开内部管理页（单工厂）</a>
+          </p>
+        </div>
+        <div class="backend-switcher" style="display:flex;align-items:center;gap:8px;">
+          <span class="small" id="backendModeLabel">当前后端：Local</span>
+          <button id="backendLocalBtn" type="button" class="secondary">Local</button>
+          <button id="backendNifiBtn" type="button" class="secondary">NiFi</button>
+        </div>
+      </div>
     </header>
 
     <section class="card">
