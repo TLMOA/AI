@@ -24,7 +24,7 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 GENERATED = BASE_DIR / "data" / "generated"
 REQUESTS = GENERATED / "silent_export_requests.ndjson"
 CONFIG = GENERATED / "silent_export_config.json"
-NIFI_SILENT_DIR = BASE_DIR / "nifi_data" / "silent_exports"
+NIFI_SILENT_DIR = Path("/home/yhz/iot/nifi_data") / "silent_exports"
 
 
 def _load_config() -> dict:
@@ -79,33 +79,47 @@ def _export_table(engine, tenant: str, table: str, marker_col: Optional[str], la
     out_dir.mkdir(parents=True, exist_ok=True)
     final_file = out_dir / f"{table}_silent_export.csv"
     tmp_file = out_dir / f".{table}.append.tmp"
-
     with engine.connect() as conn:
-        # get columns
+        # determine dialect-aware quoting
         try:
-            try:
-                res0 = conn.execute(sqlalchemy.text(f"SELECT * FROM `{table}` LIMIT 1"))
-                cols = [c[0] for c in res0.cursor.description] if getattr(res0, 'cursor', None) else []
-            except Exception:
-                cols = []
+            dialect = getattr(engine, 'dialect', None)
+            dialect_name = dialect.name if dialect is not None else ''
         except Exception:
-            cols = []
+            dialect_name = ''
+
+        quote = '"' if dialect_name == 'sqlite' else '`'
+
         # build query
         if last_marker is None:
-            q = f"SELECT * FROM `{table}`"
+            q = f"SELECT * FROM {quote}{table}{quote}"
             params = {}
         else:
             if marker_col:
-                q = f"SELECT * FROM `{table}` WHERE `{marker_col}` > :m"
+                q = f"SELECT * FROM {quote}{table}{quote} WHERE {quote}{marker_col}{quote} > :m"
                 params = {"m": last_marker}
             else:
                 # no marker col, do full export (conservative)
-                q = f"SELECT * FROM `{table}`"
+                q = f"SELECT * FROM {quote}{table}{quote}"
                 params = {}
+
+        # fetch rows iterator; also obtain headers separately so we can write header even when zero rows
+        # get headers via LIMIT 1
+        headers = []
+        try:
+            probe_q = f"SELECT * FROM {quote}{table}{quote} LIMIT 1"
+            probe_res = conn.execute(sqlalchemy.text(probe_q))
+            try:
+                headers = list(probe_res.keys()) if hasattr(probe_res, 'keys') else []
+            except Exception:
+                cursor = getattr(probe_res, 'cursor', None)
+                if cursor is not None and getattr(cursor, 'description', None):
+                    headers = [d[0] for d in cursor.description]
+        except Exception:
+            headers = []
+
         res = conn.execute(sqlalchemy.text(q), params)
+        # fetchall may be large; use fetchall here for simplicity
         rows = res.fetchall()
-        if not rows:
-            return {"rows_exported": 0, "new_marker": last_marker}
         # write tmp CSV
         import csv
         tmp_file.unlink(missing_ok=True)
@@ -113,15 +127,24 @@ def _export_table(engine, tenant: str, table: str, marker_col: Optional[str], la
             writer = csv.writer(fh)
             # write header only if final_file not exists
             if not final_file.exists():
-                # headers from cursor
-                cursor = getattr(res, 'cursor', None)
-                if cursor is not None and getattr(cursor, 'description', None):
-                    headers = [d[0] for d in cursor.description]
-                else:
+                # try SQLAlchemy Result.keys() first, fallback to cursor description
+                try:
+                    headers = list(res.keys()) if hasattr(res, 'keys') else []
+                except Exception:
                     headers = []
+                if not headers:
+                    cursor = getattr(res, 'cursor', None)
+                    if cursor is not None and getattr(cursor, 'description', None):
+                        headers = [d[0] for d in cursor.description]
+                    else:
+                        headers = []
                 writer.writerow(headers)
             for r in rows:
                 writer.writerow(list(r))
+        # if no rows and header was discovered, ensure an empty file with header exists
+        if not rows and headers and not final_file.exists():
+            # header was already written above when final_file didn't exist
+            pass
         # fsync tmp
         with tmp_file.open("rb") as ftmp:
             ftmp.flush()
@@ -148,13 +171,15 @@ def _export_table(engine, tenant: str, table: str, marker_col: Optional[str], la
 
         # compute new marker
         new_marker = last_marker
-        cursor = getattr(res, 'cursor', None)
-        if marker_col and cursor is not None and getattr(cursor, 'description', None):
-            # try to derive last marker from last row
+        # prefer using result keys to find marker column index
+        try:
+            cols = list(res.keys()) if hasattr(res, 'keys') else []
+        except Exception:
+            cols = []
+        if marker_col and cols:
             try:
                 last_row = rows[-1]
-                # find index
-                idx = [d[0] for d in cursor.description].index(marker_col)
+                idx = cols.index(marker_col)
                 new_marker = last_row[idx]
             except Exception:
                 pass
