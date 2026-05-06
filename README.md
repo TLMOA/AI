@@ -61,6 +61,29 @@ curl http://127.0.0.1:8081/health
 git log --oneline -n 5
 ```
 
+## CursorPool 依赖进程
+
+`api-worker.service` 是 CursorPool 正常使用所需要的后台进程。该服务通过 `start-api-worker.sh` 在 `/home/yhz/iot` 下启动 `api-worker`，日志写入 `api-worker-npx.log`。
+
+常用检查命令：
+
+```bash
+systemctl status api-worker.service
+pgrep -af 'api-worker|cursorpool'
+```
+
+如服务未启动，可执行：
+
+```bash
+sudo systemctl start api-worker.service
+```
+
+如需要设置为开机自启动，可执行：
+
+```bash
+sudo systemctl enable api-worker.service
+```
+
 ## 断电后自动恢复（开机自启）
 
 若希望电脑断电/重启后，前后端服务自动恢复：

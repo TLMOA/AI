@@ -63,8 +63,18 @@ function getBackendApiBase(mode = state.backendMode || config.DEFAULT_BACKEND_MO
   return apiBase.startsWith("/") ? apiBase : `/${apiBase}`;
 }
 
-function setBackendMode(mode) {
-  state.backendMode = mode === "nifi" ? "nifi" : "local";
+async function setBackendMode(mode) {
+  const nextMode = mode === "nifi" ? "nifi" : "local";
+  const res = await setBackendModeRemote(nextMode);
+  if (res && res.code === 0) {
+    state.backendMode = res.data?.mode === "nifi" ? "nifi" : nextMode;
+    try {
+      localStorage.setItem(BACKEND_MODE_STORAGE_KEY, state.backendMode);
+    } catch (_) {}
+    updateBackendToggleUI();
+    return;
+  }
+  state.backendMode = nextMode;
   try {
     localStorage.setItem(BACKEND_MODE_STORAGE_KEY, state.backendMode);
   } catch (_) {}
@@ -90,18 +100,52 @@ function updateBackendToggleUI() {
   }
 }
 
-function api(path, options = {}) {
+async function getBackendModeState() {
   if (config.USE_MOCK_API) {
-    return mockApi(path, options);
+    return { code: 0, data: { factory_id: DEFAULT_FACTORY_ID, mode: state.backendMode || config.DEFAULT_BACKEND_MODE || "local", updatedAt: new Date().toISOString(), updatedBy: "mock" } };
   }
-  const fetchOptions = Object.assign({ credentials: 'same-origin' }, options || {});
-  return fetch(`${getBackendApiBase()}${path}`, fetchOptions).then((r) => r.json());
+  return await requestJson("/internal/backend-mode", {}, "local");
+}
+
+async function setBackendModeRemote(mode) {
+  if (config.USE_MOCK_API) {
+    return { code: 0, data: { factory_id: DEFAULT_FACTORY_ID, mode } };
+  }
+  const payload = { factory_id: DEFAULT_FACTORY_ID, mode, operator: (state.currentUser && state.currentUser.username) || "system" };
+  return await requestJson("/internal/backend-mode", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  }, "local");
+}
+
+function api(path, options = {}) {
+  return requestJson(path, options);
 }
 
 function _normalizeBase(base) {
   const b = String(base || "").trim();
   if (!b) return "";
   return b.startsWith("/") ? b : `/${b}`;
+}
+
+async function requestJson(path, options = {}, mode = state.backendMode || config.DEFAULT_BACKEND_MODE || "local") {
+  if (config.USE_MOCK_API) {
+    return mockApi(path, options);
+  }
+  const fetchOptions = Object.assign({ credentials: 'same-origin' }, options || {});
+  const r = await fetch(`${getBackendApiBase(mode)}${path}`, fetchOptions);
+  const text = await r.text();
+  let body = {};
+  try {
+    body = text ? JSON.parse(text) : {};
+  } catch (_) {
+    body = { raw: text };
+  }
+  if (!r.ok) {
+    return { code: r.status, message: body?.detail || body?.message || body?.raw || `HTTP ${r.status}`, data: body?.data ?? null };
+  }
+  return body;
 }
 
 async function exportJobsApi(path, options = {}) {
@@ -112,12 +156,10 @@ async function exportJobsApi(path, options = {}) {
   const candidates = [];
 
   const absoluteOrigins = [
-    // Current backend default in this project.
     "http://127.0.0.1:8081",
     "http://localhost:8081",
   ];
 
-  // Prefer /api/v1 first because frontend proxy only forwards /api/v1 POST.
   ["/api/v1", "api/v1", apiBaseNormalized, apiBaseRelative, "/api", "api", apiBaseNoV1, apiBaseNoV1Relative].forEach((base) => {
     if (!base) return;
     if (!candidates.includes(base)) {
@@ -125,7 +167,6 @@ async function exportJobsApi(path, options = {}) {
     }
   });
 
-  // Also try absolute API endpoints to avoid hitting static web server routes (405 HTML).
   absoluteOrigins.forEach((origin) => {
     ["/api", "/api/v1", apiBaseNoV1 || "/api", apiBaseNormalized || "/api/v1"].forEach((base) => {
       const merged = `${origin}${base.startsWith("/") ? base : `/${base}`}`;
@@ -139,39 +180,21 @@ async function exportJobsApi(path, options = {}) {
   for (const base of candidates) {
     try {
       const prefix = base.endsWith("/") ? base.slice(0, -1) : base;
-      const r = await fetch(`${prefix}${path}`, options);
-      const text = await r.text();
-      let body = {};
-      try {
-        body = text ? JSON.parse(text) : {};
-      } catch (_) {
-        body = { raw: text };
-      }
-
-      if (!r.ok) {
-        const msg = body?.detail || body?.message || body?.raw || `HTTP ${r.status}`;
-        const contentType = (r.headers.get("content-type") || "").toLowerCase();
-        const rawText = String(body?.raw || "");
-        const looksLikeHtmlError = contentType.includes("text/html") || /<html|<!doctype/i.test(rawText);
-
-        // HTML 404/405/501 usually means request hit static server/proxy mismatch; try next candidate.
-        if (r.status === 404 || ((r.status === 405 || r.status === 501) && looksLikeHtmlError)) {
-          lastError = { code: r.status, message: msg };
+      const res = await requestJson(`${prefix}${path}`, options, "local");
+      if (res.code && res.code !== 0 && res.code !== 200) {
+        if (res.code === 404 || res.code === 405 || res.code === 501) {
+          lastError = { code: res.code, message: res.message };
           continue;
         }
-        return { code: r.status, message: msg, data: body?.data ?? null };
+        return res;
       }
-      return body;
+      return res;
     } catch (e) {
       lastError = { code: -1, message: e?.message || String(e) };
     }
   }
 
-  return {
-    code: lastError?.code || -1,
-    message: `request failed: ${lastError?.message || "no reachable export-jobs endpoint"}`,
-    data: null,
-  };
+  return { code: lastError?.code || -1, message: `request failed: ${lastError?.message || "no reachable export-jobs endpoint"}`, data: null };
 }
 
 function mockApi(path, options = {}) {
@@ -218,7 +241,7 @@ function renderJobs() {
 async function loadJobs() {
   const res = await api("/jobs");
   if (res.code !== 0) return;
-  state.jobs = res.data.rows;
+  state.jobs = res.data.rows || [];
   renderJobs();
 }
 
@@ -292,7 +315,7 @@ async function loadOutputs(jobId) {
   if (res.code !== 0) return;
   res.data.forEach((f) => {
     const li = document.createElement("li");
-    li.innerHTML = `${f.fileName} (${f.fileFormat}) - <a href="${config.API_BASE}/files/${f.fileId}/download" target="_blank">下载</a> <span class="small">路径: ${f.storagePath || ''}</span>`;
+    li.innerHTML = `${f.fileName} (${f.fileFormat}) - <a href="${getBackendApiBase()}/files/${f.fileId}/download" target="_blank">下载</a> <span class="small">路径: ${f.storagePath || ''}</span>`;
     ul.appendChild(li);
   });
 }
@@ -316,7 +339,7 @@ function renderFiles() {
       <td>${file.fileSize}</td>
       <td>
         <button class="secondary" data-preview="${file.fileId}">预览</button>
-        <a href="${config.API_BASE}/files/${file.fileId}/download" target="_blank">下载</a>
+        <a href="${getBackendApiBase()}/files/${file.fileId}/download" target="_blank">下载</a>
         <div class="small">路径: ${file.storagePath || ''}</div>
       </td>
     `;
@@ -1114,11 +1137,18 @@ function bindEvents() {
   });
 }
 
-function init() {
+async function init() {
   try {
     const savedMode = localStorage.getItem(BACKEND_MODE_STORAGE_KEY);
     if (savedMode) {
       state.backendMode = savedMode === "nifi" ? "nifi" : "local";
+    }
+  } catch (_) {}
+  try {
+    const res = await getBackendModeState();
+    if (res && res.code === 0 && res.data && res.data.mode) {
+      state.backendMode = res.data.mode === "nifi" ? "nifi" : "local";
+      try { localStorage.setItem(BACKEND_MODE_STORAGE_KEY, state.backendMode); } catch (_) {}
     }
   } catch (_) {}
   updateBackendToggleUI();
@@ -1350,13 +1380,10 @@ if (fileInput && uploadBtn && uploadResult) {
       if (columns) {
         query.set("columns", columns);
       }
-      const resp = await fetch(
-        `${config.API_BASE}${selected.endpoint}?${query.toString()}`,
-        {
+      const data = await requestJson(`${selected.endpoint}?${query.toString()}`, {
         method: "POST",
         body: formData,
       });
-      const data = await resp.json();
       if (data.code === 0) {
         const sourcePath = data?.data?.sourcePath || data?.data?.storagePath || "";
         const targetPath = data?.data?.targetPath || "";

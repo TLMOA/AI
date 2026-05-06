@@ -21,7 +21,7 @@
 
 ## 2. 总体决策（已锁定）
 
-1. 双生产：并行交付 `backend-local` 与 `backend-nifi`，功能对等。  
+1. 双生产：并行交付 `backend-local` 与 `backend-nifi`，功能对等，任何能力补齐都必须同时考虑两条路径。  
 2. 前端透明切换：同一页面支持两条后端适配层（adapter 模式）。  
 3. 目录隔离：两条路径物理隔离但逻辑目录一致（见第 4 节）。  
 4. 验收口径：同一批次仅使用一种后端口径进行验收。
@@ -67,8 +67,8 @@
 
 - 前端行为：
 	- 增加全局切换按钮（放置于页面工具栏或顶部），显示当前模式（Local / NiFi）。
-	- 切换粒度推荐按工厂（tenant）级别持久化，也可支持 session/user 级作为调试或临时切换手段。
-	- 前端请求路径和参数保持不变；可选暴露调试用请求头 `X-Backend-Mode`（仅允许运维/开发使用）。
+	- 切换粒度必须按工厂（tenant）级别持久化，临时 session/user 级切换只允许调试场景，不作为默认实现。
+	- 前端请求路径和参数保持不变，所有普通用户请求统一走 adapter 层；必要时可选暴露调试用请求头 `X-Backend-Mode`（仅允许运维/开发使用）。
 
 - 后端路由（Adapter）设计：
 	- 在网关/服务层实现 Adapter/Router：读取工厂级配置（或 session），决定路由。优先尝试 NiFi：若存在对应 Flow 且健康可用，则调用 NiFi；否则回退到 Local 实现。
@@ -174,8 +174,8 @@
 - 逻辑目录集合（必须统一）：`output_csv|output_json|output_tsv|inbox_csv|inbox_json|inbox_tsv|*_to_*|tagged_output`。  
 - 物理映射：Local 与 NiFi 分别映射到不同根目录，前端仅识别逻辑目录。  
 - 写入原则：临时文件 -> 完整性校验 -> 原子重命名；幂等键为 `jobId+targetPath`。
- - 物理映射：Local 与 NiFi 分别映射到不同根目录，前端仅识别逻辑目录。为避免混淆，建议本地后端使用物理目录 `nifi_data`，NiFi 写入使用同一路径下的 `real_nifi_data`（例如同一挂载点下的并列目录），两者在物理上隔离但逻辑目录一致。
- - 写入原则：临时文件 -> 完整性校验 -> 原子重命名；幂等键为 `jobId+targetPath`。
+- 物理映射补充：本地后端建议使用 `nifi_data`，NiFi 后端相关文件统一落到 `/home/yhz/iot/real_nifi_data`，两者在物理上并列隔离、逻辑目录一致。
+- 写入原则补充：任何 NiFi 产物写入前应先生成临时文件、完成校验后再落到 `/home/yhz/iot/real_nifi_data` 对应逻辑子目录。
 
 ## 7. 三阶段执行路线（简明）
 
