@@ -1,4 +1,6 @@
 name: NiFi CI
+permissions:
+  packages: write
 
 on:
   push:
@@ -60,6 +62,61 @@ jobs:
         if: always()
         run: |
           echo "Pushed images: ${{ env.REGISTRY_URL }}/${{ env.IMAGE_NAME }}:${{ github.sha }} and latest"
+
+      - name: Package Flow bundle
+        env:
+          NIFI_REGISTRY_URL: ${{ secrets.REGISTRY_URL }}
+        run: |
+          echo "Packaging flow bundle"
+          mkdir -p artifacts/flow-content
+          # Create a minimal flow archive for CI (replace with real export in future)
+          echo "iot flow bundle" > artifacts/flow-content/README.txt
+          echo "<flow/>" > artifacts/flow-content/flow.xml
+          cd artifacts && zip -r flow-bundle.zip flow-content > /dev/null
+          ls -la artifacts
+
+      - name: Import Flow bundle to NiFi Registry
+        env:
+          NIFI_REGISTRY_URL: ${{ secrets.REGISTRY_URL }}
+          NIFI_REGISTRY_USER: ${{ secrets.REGISTRY_USERNAME }}
+          NIFI_REGISTRY_PASS: ${{ secrets.REGISTRY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          echo "Importing flow bundle to ${NIFI_REGISTRY_URL}"
+          # Ensure jq is available
+          sudo apt-get update && sudo apt-get install -y jq zip > /dev/null
+          # Create bucket (idempotent)
+          curl -s -u "${NIFI_REGISTRY_USER}:${NIFI_REGISTRY_PASS}" -X POST "${NIFI_REGISTRY_URL%/}/nifi-registry-api/buckets" -H "Content-Type: application/json" -d '{"name":"ci-iot-flow","description":"CI import"}' || true
+          # Query bucket id
+          BUCKET_ID=$(curl -s -u "${NIFI_REGISTRY_USER}:${NIFI_REGISTRY_PASS}" "${NIFI_REGISTRY_URL%/}/nifi-registry-api/buckets" | jq -r '(.[]? // .buckets[]?) | select(.name=="ci-iot-flow") | .identifier')
+          if [ -z "${BUCKET_ID}" ] || [ "${BUCKET_ID}" = "null" ]; then
+            echo "Failed to obtain bucket id" >&2
+            exit 2
+          fi
+          echo "Using bucket id: ${BUCKET_ID}"
+          # Upload bundle
+          ./v2-nifi/scripts/import_flow_to_registry.sh upload "${NIFI_REGISTRY_URL%/}" "${BUCKET_ID}" "$(pwd)/artifacts/flow-bundle.zip"
+
+      - name: Run contract-tests
+        env:
+          CI: true
+        run: |
+          set -euo pipefail
+          echo "Running contract-tests via newman"
+          # Install Node + newman
+          sudo apt-get update && sudo apt-get install -y nodejs npm > /dev/null
+          npm install -g newman@5 >/dev/null
+          if [ -f contract-tests/postman_collection.json ]; then
+            newman run contract-tests/postman_collection.json -e contract-tests/postman_env.json --reporters cli,json-summary --reporter-json-summary-export artifacts/newman-summary.json
+          else
+            echo "No Postman collection found; skipping contract-tests" >&2
+            exit 0
+          fi
+
+      - name: Promote bundle (placeholder)
+        run: |
+          echo "Promote bundle from staging to prod (placeholder)"
+          # TODO: implement promotion logic (tagging, moving in Registry, update manifests)
 name: nifi-ci
 
 on:
