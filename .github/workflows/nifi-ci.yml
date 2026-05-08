@@ -114,6 +114,30 @@ jobs:
           # Upload bundle
           ./v2-nifi/scripts/import_flow_to_registry.sh upload "${NIFI_REGISTRY_URL%/}" "${BUCKET_ID}" "$(pwd)/artifacts/flow-bundle.zip"
 
+      - name: Pull and run NiFi smoke container
+        run: |
+          set -euo pipefail
+          IMAGE=ghcr.io/${{ github.repository_owner }}/iot-nifi:${{ github.sha }}
+          echo "Pulling $IMAGE"
+          docker pull "$IMAGE" || true
+          docker rm -f nifi-smoke || true
+          docker run -d --name nifi-smoke -p 8081:8080 "$IMAGE"
+          # wait for NiFi API to respond
+          ATTEMPTS=60
+          for i in $(seq 1 $ATTEMPTS); do
+            if curl -fsS http://localhost:8081/nifi >/dev/null 2>&1; then
+              echo "NiFi is ready"
+              break
+            fi
+            echo "Waiting for NiFi... ($i/$ATTEMPTS)"
+            sleep 2
+          done
+          if ! curl -fsS http://localhost:8081/nifi >/dev/null 2>&1; then
+            echo "NiFi did not become ready in time" >&2
+            docker logs nifi-smoke || true
+            exit 2
+          fi
+
       - name: Run contract-tests
         env:
           CI: true
