@@ -1,0 +1,67 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: nifi-headless
+  labels:
+    app: nifi
+spec:
+  clusterIP: None
+  selector:
+    app: nifi
+  ports:
+    - name: http
+      port: 8080
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: nifi
+  labels:
+    app: nifi
+spec:
+  serviceName: nifi-headless
+  replicas: 1
+  selector:
+    matchLabels:
+      app: nifi
+  template:
+    metadata:
+      labels:
+        app: nifi
+    spec:
+      terminationGracePeriodSeconds: 120
+      containers:
+        - name: nifi
+          image: apache/nifi:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8080
+            - containerPort: 8443
+          env:
+            - name: NIFI_WEB_HTTP_PORT
+              value: "8080"
+            - name: NIFI_CLUSTER_IS_NODE
+              value: "false"
+          readinessProbe:
+            httpGet:
+              path: /nifi-api/about
+              port: 8080
+            initialDelaySeconds: 30
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /nifi-api/about
+              port: 8080
+            initialDelaySeconds: 60
+            periodSeconds: 30
+          volumeMounts:
+            - name: nifi-data
+              mountPath: /opt/nifi/nifi-current/data
+  volumeClaimTemplates:
+    - metadata:
+        name: nifi-data
+      spec:
+        accessModes: [ "ReadWriteOnce" ]
+        resources:
+          requests:
+            storage: 20Gi
