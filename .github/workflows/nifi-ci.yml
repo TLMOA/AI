@@ -58,6 +58,23 @@ jobs:
             ${{ env.REGISTRY_URL }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
             ${{ env.REGISTRY_URL }}/${{ env.IMAGE_NAME }}:latest
 
+      - name: Log in to GHCR
+        uses: docker/login-action@v2
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push to GHCR
+        uses: docker/build-push-action@v4
+        with:
+          context: .
+          file: docker/nifi/Dockerfile
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/iot-nifi:${{ github.sha }}
+            ghcr.io/${{ github.repository_owner }}/iot-nifi:latest
+
       - name: Upload image info
         if: always()
         run: |
@@ -157,3 +174,31 @@ jobs:
       - name: Package Flow bundle (placeholder)
         run: |
           echo "flow bundle step - integrate with NiFi Registry in later iteration"
+
+  verify-pull:
+    runs-on: ubuntu-latest
+    needs: test-and-build
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v2
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Pull image from GHCR
+        run: |
+          IMAGE=ghcr.io/${{ github.repository_owner }}/iot-nifi:${{ github.sha }}
+          echo "Pulling $IMAGE"
+          docker pull "$IMAGE"
+
+      - name: Run smoke test container
+        run: |
+          IMAGE=ghcr.io/${{ github.repository_owner }}/iot-nifi:${{ github.sha }}
+          docker run --rm -d --name nifi-smoke -p 8081:8080 "$IMAGE"
+          sleep 10
+          curl -fsS http://localhost:8081/nifi || (docker logs nifi-smoke && exit 2)
+          docker stop nifi-smoke || true
