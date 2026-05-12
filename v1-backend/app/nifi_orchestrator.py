@@ -18,9 +18,10 @@ NIFI_REAL_BASE_DIR = Path(os.getenv("NIFI_REAL_BASE_DIR", "/home/yhz/iot/real_ni
 NIFI_CONTAINER_DATA_DIR = os.getenv("NIFI_CONTAINER_DATA_DIR", "/opt/nifi/nifi-current/data/iot")
 NIFI_READY_TIMEOUT_SECONDS = int(os.getenv("NIFI_READY_TIMEOUT_SECONDS", "120"))
 NIFI_READY_INTERVAL_SECONDS = float(os.getenv("NIFI_READY_INTERVAL_SECONDS", "3"))
-NIFI_AUTO_CREATE_CONTAINER = os.getenv("NIFI_AUTO_CREATE_CONTAINER", "true").lower() == "true"
-NIFI_AUTO_START_CONTAINER = os.getenv("NIFI_AUTO_START_CONTAINER", "true").lower() == "true"
-NIFI_AUTO_DEPLOY_FLOW = os.getenv("NIFI_AUTO_DEPLOY_FLOW", "true").lower() == "true"
+# 生产默认：只做后端对接，不在运行时自动创建容器或部署 Flow。
+NIFI_AUTO_CREATE_CONTAINER = os.getenv("NIFI_AUTO_CREATE_CONTAINER", "false").lower() == "true"
+NIFI_AUTO_START_CONTAINER = os.getenv("NIFI_AUTO_START_CONTAINER", "false").lower() == "true"
+NIFI_AUTO_DEPLOY_FLOW = os.getenv("NIFI_AUTO_DEPLOY_FLOW", "false").lower() == "true"
 NIFI_FLOW_MARKER = NIFI_REAL_BASE_DIR / "export_jobs" / ".iot_mysql_export_flow_v1.ready.json"
 NIFI_WORKER_SOURCE = Path(__file__).resolve().parent.parent / "scripts" / "nifi_mysql_export_worker.py"
 NIFI_WORKER_TARGET = NIFI_REAL_BASE_DIR / "bin" / "nifi_mysql_export_worker.py"

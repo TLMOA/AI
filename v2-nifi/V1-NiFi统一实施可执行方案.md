@@ -158,30 +158,31 @@ Local 和 NiFi 必须共用同一套响应壳、错误码、文件元数据和�
 
 1. 先在 `index.html` 上做全局切换按钮。
 2. 再把前端请求收敛到统一 API adapter。
-3. 然后实现后端 NiFi 自动编排能力：检测容器、自动启动容器、检测 Flow、自动部署或复用 Flow、启动 Flow。
+3. 然后实现后端 NiFi 一键接入能力：前端操作保持不变，后端只对接运维预置好的容器与 Flow，按任务需要启动/关闭既有 Flow，不在运行时自动部署新 Flow。
 4. 再补齐数据库导出、上传转换、定时导出、自动打标四条高并发链路的 Local / NiFi 双路径实现。
 5. 再补目录扫描、任务回调、审计、回滚与演练。
 6. 最后再考虑更复杂的数据接入和扩展场景。
 
-## 七点五、NiFi 后端自动编排方案
+## 七点五、NiFi 后端一键接入方案
 
-本项目目标采用“后端自动编排 NiFi 优先”的方式实现 `backend-nifi`：用户在 `nifi` 模式下点击数据库导出时，不要求人工提前启动 NiFi 或人工提前创建 Flow；后端应自动确保 NiFi 执行环境可用，然后提交任务并由 NiFi 完成导出。
+本项目目标采用“NiFi 容器与 Flow 由后端麻烦地预先配置好，前端保持和 Local 一样一键触发”的方式实现 `backend-nifi`：用户在 `nifi` 模式下点击数据库导出时，前端不感知 NiFi 细节；后端只接入已存在的 NiFi 容器与已建好的 Flow，在一次导出任务中负责启动既有 Flow、投递任务、等待完成、回收结果，任务结束后可按需要关闭该 Flow。
 
-运维预启动 NiFi 仍可作为生产稳定化手段，但不是当前交互闭环的唯一前提。当前 MVP 要求是：后端具备自动启动 NiFi 容器、自动检测/部署/复用导出 Flow、自动提交任务、自动回收结果的能力。
+这种模式适合阶段一和生产初版：前端体验和 Local 一样是一键完成，后端复杂度被限制在预置配置与任务调度上，最容易先把主链路跑通。
 
 ### 7.5.1 基本原则
 
-1. 后端自动编排优先：`backend_mode=nifi` 时，点击数据库导出应自动触发 NiFi 环境就绪检查。
-2. 不建议每次点击都创建新 Flow：后端应“确保 Flow 存在并运行”，若已存在则复用，若不存在才部署。
-3. 单机 NiFi MVP 优先：先跑通 Docker 单机 NiFi，再考虑 Registry、集群、HA。
-4. 后端负责容器编排、Flow 就绪检查、任务提交、状态同步、文件注册；NiFi 负责真正执行 SQL、转换格式、写入文件。
-5. Local 与 NiFi 共享逻辑目录，但物理目录必须隔离。
-6. NiFi 后端统一使用 `/home/yhz/iot/real_nifi_data` 作为宿主机数据根目录。
-7. 自动编排过程必须记录审计日志：容器启动、Flow 部署、Flow 启动、任务提交、失败回退都要留痕。
+1. 预置优先：`backend_mode=nifi` 时，NiFi 容器和目标 Flow 由运维/脚本提前准备好。
+2. 一键优先：前端点击导出后，体验应和 Local 一样，不要求用户手工进入 NiFi 页面。
+3. 后端只做接入：后端负责检查 NiFi 是否可用、启动既有 Flow、提交任务、同步结果、记录审计。
+4. 不自动部署：后端不创建新 Flow，不自动拉起容器，不在运行时做复杂编排。
+5. 单机 NiFi MVP 优先：先跑通 Docker 单机 NiFi 和固定 Flow，再考虑 Registry、集群、HA。
+6. Local 与 NiFi 共享逻辑目录，但物理目录必须隔离。
+7. NiFi 后端统一使用 `/home/yhz/iot/real_nifi_data` 作为宿主机数据根目录。
+8. 若 NiFi 不可用，明确返回错误或按配置回退 Local，不做静默自动修复。
 
-### 7.5.2 NiFi 容器启动前置准备
+### 7.5.2 NiFi 容器与目录前置准备
 
-需要先在宿主机创建以下目录：
+需要先在宿主机创建以下目录，并由运维或脚本提前启动 NiFi 容器及固定 Flow：
 
 ```bash
 mkdir -p /home/yhz/iot/real_nifi_data/export_jobs/inbox
@@ -196,21 +197,22 @@ mkdir -p /home/yhz/iot/real_nifi_data/inbox_tsv
 mkdir -p /home/yhz/iot/real_nifi_data/tagged_output
 ```
 
-### 7.5.3 后端自动启动 NiFi 容器
+### 7.5.3 后端只做 NiFi 就绪检查与 Flow 控制
 
-当前阶段推荐优先使用 Docker 单机 NiFi，并由后端在需要时自动拉起。
+当前阶段推荐优先使用 Docker 单机 NiFi，但容器由运维或脚本预置启动，后端不负责拉起容器。
 
-后端在 `backend_mode=nifi` 且用户点击数据库导出时，应执行以下容器编排逻辑：
+后端在 `backend_mode=nifi` 且用户点击数据库导出时，应执行以下就绪检查逻辑：
 
-1. 检查 Docker 是否可用。
-2. 检查是否存在名为 `iot-nifi` 的容器。
-3. 若容器不存在，则自动创建并启动容器。
-4. 若容器存在但未运行，则自动启动容器。
-5. 若容器已运行，则直接进入健康检查。
-6. 容器启动后轮询 NiFi API，直到 NiFi UI/API 可访问。
-7. 若超过等待时间仍不可用，则返回 NiFi 启动失败，或按降级策略回退 Local，并记录审计。
+1. 检查 NiFi 容器或服务是否已经在运行。
+2. 检查 NiFi API 是否可访问。
+3. 检查目标 Flow 是否已存在且处于可用状态。
+4. 需要时启动既有 Flow（启用/停止 Flow 的生命周期由后端控制，但不创建新 Flow）。
+5. 任务执行完成后按需要关闭既有 Flow。
+6. 若未就绪则返回明确错误，或按配置回退 Local，并记录审计。
 
-后端自动创建容器时的等价命令如下：
+默认策略应是“只做后端对接，不在运行时自动创建容器或自动部署 Flow”；如确需演示或联调，可通过显式环境变量单独开启自动化能力，并保持审计可追踪。
+
+运维或脚本预置容器时的等价命令如下：
 
 ```bash
 docker run -d \
@@ -220,7 +222,7 @@ docker run -d \
   apache/nifi:latest
 ```
 
-后端实现时不应依赖人工执行上述命令，而应通过后端的 NiFi 编排模块完成等价操作。
+后端实现时不应执行上述命令，而是把它作为运维预置参考。
 
 后续正式化时，应改为 `docker-compose.yml` 或 Docker SDK 管理，并补充：
 
@@ -231,19 +233,18 @@ docker run -d \
 - 日志目录挂载
 - NiFi Registry（可选）
 
-### 7.5.3.1 后端 NiFi 编排模块建议
+### 7.5.3.1 后端 NiFi 接入模块建议
 
 建议新增后端模块：`nifi_orchestrator`，职责包括：
 
-- `ensure_nifi_container()`：确保 `iot-nifi` 容器存在并运行。
-- `wait_nifi_ready()`：轮询 NiFi API，等待 NiFi 就绪。
-- `ensure_export_flow()`：确保数据库导出 Flow 已存在。
-- `deploy_export_flow()`：当 Flow 不存在时，通过 NiFi API、模板或 Registry 自动部署。
-- `start_export_flow()`：确保导出 Flow 内 Processor / Process Group 处于运行状态。
+- `check_nifi_ready()`：检查 NiFi API 是否可访问，确认容器/服务已预置。
+- `start_existing_flow()`：启用既有数据库导出 Flow，开始处理任务。
+- `stop_existing_flow()`：在任务完成后关闭既有 Flow。
+- `ensure_export_flow()`：确认数据库导出 Flow 已存在且可用。
 - `submit_export_job()`：写入导出任务 JSON 到 `export_jobs/inbox`。
 - `sync_export_result()`：扫描 `done/error` 并注册文件资源。
 
-后端导出接口不得直接散落 Docker/NiFi API 调用，必须通过该编排模块统一封装。
+后端导出接口不得直接散落 NiFi HTTP 调用，必须通过该接入模块统一封装。
 
 ### 7.5.4 MySQL JDBC 驱动
 
@@ -269,16 +270,17 @@ docker run -d \
 7. 成功后写 `/opt/nifi/nifi-current/data/iot/export_jobs/done/{jobId}.json`。
 8. 失败后写 `/opt/nifi/nifi-current/data/iot/export_jobs/error/{jobId}.json`。
 
-### 7.5.5.1 Flow 自动部署与复用要求
+### 7.5.5.1 Flow 预置与复用要求
 
-后端自动编排不是每次导出都创建一个新 Flow，而是按以下规则处理：
+后端不负责自动部署 Flow，而是按以下规则处理：
 
-1. 后端通过 NiFi API 检查是否已存在数据库导出 Process Group。
-2. 若已存在，则检查该 Process Group 是否运行中。
-3. 若已存在但未运行，则自动启动。
-4. 若不存在，则从预置模板、版本化 Flow 或代码化定义中自动部署一次。
-5. 部署成功后记录 Flow 标识，例如 `processGroupId`、`flowName`、`version`。
-6. 后续数据库导出任务复用同一个 Flow，只通过 `export_jobs/inbox` 投递不同任务 JSON。
+1. NiFi 侧提前准备好数据库导出 Process Group。
+2. 后端通过 NiFi API 检查该 Process Group 是否存在且可用。
+3. 后端在执行任务前启用这个既有 Flow，任务完成后按需关闭。
+4. 若已存在但不可用，则返回明确错误或回退 Local。
+5. 部署和版本管理由运维、脚本或单独发布流程完成。
+6. 建议记录 Flow 标识，例如 `processGroupId`、`flowName`、`version`。
+7. 后续数据库导出任务复用同一个 Flow，只通过 `export_jobs/inbox` 投递不同任务 JSON。
 
 Flow 标识建议：
 
@@ -287,54 +289,51 @@ Flow 标识建议：
 - 监听目录：`/opt/nifi/nifi-current/data/iot/export_jobs/inbox`
 - 输出根目录：`/opt/nifi/nifi-current/data/iot`
 
-### 7.5.6 后端自动编排执行顺序
+### 7.5.6 后端半自动接入执行顺序
 
 用户在 `backend_mode=nifi` 下点击数据库导出时，后端必须按以下顺序执行：
 
 1. 读取当前 tenant 的 `backend_mode`，确认是 `nifi`。
-2. 调用 `ensure_nifi_container()`，确保 `iot-nifi` 容器存在并运行。
-3. 调用 `wait_nifi_ready()`，确认 NiFi API 可访问。
-4. 调用 `ensure_export_flow()`，确认数据库导出 Flow 已存在；不存在则自动部署。
-5. 调用 `start_export_flow()`，确保 Flow 处于运行状态。
-6. 生成数据库导出任务 JSON。
-7. 写入 `/home/yhz/iot/real_nifi_data/export_jobs/inbox/{jobId}.json`。
-8. 返回前端 `PENDING` / `已提交到 NiFi` 状态。
-9. 后端扫描 `done/error`，或由定时任务同步结果。
-10. 若 NiFi 成功输出文件，则注册 fileId，并供前端预览、下载、追踪。
+2. 调用 `check_nifi_ready()`，确认 NiFi API 可访问且目标 Flow 已预置。
+3. 调用 `ensure_export_flow()`，确认数据库导出 Flow 已存在且可用。
+4. 调用 `start_existing_flow()`，启用该 Flow 开始处理。
+5. 生成数据库导出任务 JSON。
+6. 写入 `/home/yhz/iot/real_nifi_data/export_jobs/inbox/{jobId}.json`。
+7. 返回前端 `PENDING` / `已提交到 NiFi` 状态。
+8. 后端扫描 `done/error`，或由定时任务同步结果。
+9. 若 NiFi 成功输出文件，则注册 fileId，并供前端预览、下载、追踪。
+10. 任务结束后调用 `stop_existing_flow()`，关闭该 Flow。
 
-### 7.5.6.1 自动编排失败处理
+### 7.5.6.1 半自动接入失败处理
 
-后端自动编排失败时，必须按统一策略处理：
+后端接入失败时，必须按统一策略处理：
 
-1. Docker 不可用：返回明确错误或按配置回退 Local。
-2. NiFi 容器启动失败：记录审计，并返回 NiFi 启动失败。
-3. NiFi API 超时不可用：记录审计，并返回 NiFi 不可用。
-4. Flow 自动部署失败：记录审计，并返回 Flow 部署失败。
-5. Flow 启动失败：记录审计，并返回 Flow 启动失败。
-6. 任务 JSON 写入失败：返回任务提交失败。
-7. 任何自动回退 Local 的行为都必须写入审计，不允许静默回退。
+1. Docker/服务不可用：返回明确错误或按配置回退 Local。
+2. NiFi API 不可访问：记录审计，并返回 NiFi 不可用。
+3. 目标 Flow 不存在或不可用：记录审计，并返回 Flow 不可用。
+4. Flow 启动失败或关闭失败：记录审计，并返回 Flow 不可用或任务失败。
+5. 任务 JSON 写入失败：返回任务提交失败。
+6. 任何回退 Local 的行为都必须写入审计，不允许静默回退。
 
 ### 7.5.6.2 与后端联调顺序
 
-1. 后端能检测 Docker 是否可用。
-2. 后端能自动创建或启动 `iot-nifi` 容器。
-3. 后端能等待 NiFi API 就绪。
-4. 后端能检查数据库导出 Flow 是否存在。
-5. 后端能在 Flow 不存在时自动部署，存在时复用。
-6. 后端能自动启动 Flow。
-7. 后端能写入导出任务 JSON。
-8. NiFi 能消费任务并生成 CSV/JSON/TSV。
-9. NiFi 能写入 `done/error` 状态文件。
-10. 后端能扫描结果并注册 fileId。
+1. 先由运维或脚本确保 NiFi 容器已启动。
+2. 后端能检测 NiFi API 是否可访问。
+3. 后端能检查数据库导出 Flow 是否存在且可用。
+4. 后端能启用和关闭既有 Flow。
+5. 后端能写入导出任务 JSON。
+6. NiFi 能消费任务并生成 CSV/JSON/TSV。
+7. NiFi 能写入 `done/error` 状态文件。
+8. 后端能扫描结果并注册 fileId。
 
 ### 7.5.7 数据库导出点击行为要求
 
 当用户点击“数据库导出”时：
 
 - `backend_mode=local`：后端本地执行导出。
-- `backend_mode=nifi`：后端必须先自动确保 NiFi 容器运行、NiFi API 可用、数据库导出 Flow 已存在且处于运行状态，然后再提交 NiFi 任务，由 NiFi 完成 SQL 查询、格式转换与文件落盘。
+- `backend_mode=nifi`：后端必须先确认 NiFi 容器/服务和数据库导出 Flow 已预置且可用，然后启用该 Flow、提交 NiFi 任务，由 NiFi 完成 SQL 查询、格式转换与文件落盘。
 - NiFi 可用且任务提交成功时，不允许后端本地直接生成导出文件。
-- NiFi 不可用、Flow 不存在且自动部署失败、任务提交失败时，才允许根据降级策略回退 Local，并必须记录审计。
+- NiFi 不可用、Flow 不存在或不可用、Flow 启动/关闭失败、任务提交失败时，才允许根据降级策略回退 Local，并必须记录审计。
 - 前端不需要知道容器启动、Flow 部署、Flow 启动等细节，只接收统一响应：`PENDING`、`SUCCEEDED`、`FAILED` 或明确错误。
 
 ## 八、验收标准
@@ -345,14 +344,23 @@ Flow 标识建议：
 - 切换行为可审计
 - Local 和 NiFi 返回结构一致
 - 数据库导出、上传转换、定时导出、自动打标能按模式正确路由
-- 当 `backend_mode=nifi` 且 NiFi 容器未运行时，点击数据库导出能由后端自动启动 `iot-nifi` 容器
-- 当数据库导出 Flow 不存在时，后端能自动部署或创建该 Flow
-- 当数据库导出 Flow 已存在时，后端不得重复创建 Flow，必须复用并确保其处于运行状态
+- 当 `backend_mode=nifi` 且 NiFi 容器未运行时，后端应返回明确的不可用错误或按部署配置回退到 `local`，不得默认自动创建新容器
+- 当数据库导出 Flow 不存在时，后端应记录审计并返回 Flow 不可用；Flow 的部署由运维/发布流程负责，后端不应默认自动创建新 Flow
+- 当数据库导出 Flow 已存在时，后端不得重复创建 Flow，必须复用并确保其处于运行或已启用状态（可由后端启停既有 Flow）
 - 点击数据库导出后，任务 JSON 能自动进入 `/home/yhz/iot/real_nifi_data/export_jobs/inbox`
 - NiFi 能自动消费任务并将结果写入 `/home/yhz/iot/real_nifi_data/output_csv|output_json|output_tsv`
 - NiFi 能写入 `/home/yhz/iot/real_nifi_data/export_jobs/done|error` 状态文件
 - 后端能同步 NiFi 状态文件并注册 fileId
-- 自动启动容器、自动部署 Flow、自动启动 Flow、失败回退均有审计记录
+- 启动/停止既有 Flow、任务提交、失败回退等关键操作必须记录审计日志
+ - 数据库导出、上传转换、定时导出、自动打标能按模式正确路由
+ - 当 `backend_mode=nifi` 且 NiFi 容器未运行时，后端应返回明确的不可用错误或按部署配置回退到 `local`，不得在未获运维授权的情况下自动创建新容器
+ - 当数据库导出 Flow 不存在时，后端应记录审计并返回 Flow 不可用；Flow 的部署由运维/发布流程负责，后端不应自动创建新 Flow
+ - 当数据库导出 Flow 已存在时，后端不得重复创建 Flow，必须复用并确保其处于运行或已启用状态（可由后端启停既有 Flow）
+ - 点击数据库导出后，任务 JSON 能自动进入 `/home/yhz/iot/real_nifi_data/export_jobs/inbox`
+ - NiFi 能消费任务并将结果写入 `/home/yhz/iot/real_nifi_data/output_csv|output_json|output_tsv`（消费逻辑由 NiFi 侧预置）
+ - NiFi 能写入 `/home/yhz/iot/real_nifi_data/export_jobs/done|error` 状态文件
+ - 后端能同步 NiFi 状态文件并注册 fileId
+ - 启动/停止既有 Flow、任务提交、失败回退等关键操作必须记录审计日志
 
 ## 九、与现有文档的关系
 

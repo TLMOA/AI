@@ -11,7 +11,7 @@
 当前在线拉取方案已经验证存在两个问题：
 
 1. 镜像虽然能走 Docker 镜像加速，但仍可能跳转到外部依赖链路。
-2. 当前网络环境对部分镜像源、`gcr.io` 等地址访问不稳定，在线拉取成功率低。
+2. 当前网络环境对部分镜像源、`auth.docker.io`、`registry-1.docker.io`、`cloudflare` 等地址访问不稳定，在线拉取成功率低。
 
 因此，本方案改为：
 
@@ -47,7 +47,7 @@
 
 ### 2. 还需要补齐的点
 
-- 离线镜像的获取、导出、导入流程还没执行
+- 离线镜像的获取、导出、导入流程还没执行完毕
 - 需要一套稳定的容器启动与验证流程
 - HDFS 语义需要更清晰的目录展示
 - 错误提示还需要增强
@@ -89,12 +89,7 @@
 
 用于存放离线导出的镜像包，例如：
 
-- `hadoop-namenode.tar`
-- `hadoop-datanode.tar`
-- `hive-metastore.tar`
-- `hive-server2.tar`
-- `hbase.tar`
-- `hbase-thrift.tar`
+- `hadoop-stack.tar`
 
 ### `scripts/` 目录用途
 
@@ -108,29 +103,23 @@
 
 ## 五、需要的镜像清单
 
-离线导入前，先确认要用哪些镜像。
+当前已确认可用并建议导出的镜像：
 
-### 最小镜像集
-
-#### HDFS
-- NameNode
-- DataNode
-
-#### Hive
-- Hive Metastore
-- HiveServer2
-
-#### HBase
-- HBase 主服务镜像
-- HBase Thrift Server
+- `zookeeper:3.9.3`
+- `apache/hive:4.0.0`
+- `apache/hadoop:3.4.1`
+- `harisekhon/hbase:latest`
 
 ### 说明
 
-如果某些镜像在当前选择的仓库里不可得，可以替换为同等功能镜像，但要保证：
+这组镜像对应：
 
-- 端口一致或可映射
-- 启动命令可用
-- 能被后端 `pyhive / happybase / hdfs` 正确连接
+- `zookeeper:3.9.3` → HBase 依赖
+- `apache/hive:4.0.0` → Hive 服务
+- `apache/hadoop:3.4.1` → HDFS 底座
+- `harisekhon/hbase:latest` → HBase 服务
+
+如果后续你发现某个镜像在启动阶段有兼容性问题，可以再替换成别的候选，但第一版先以这四个镜像为准。
 
 ---
 
@@ -138,23 +127,21 @@
 
 ### 第 1 步，在可联网机器上拉取镜像
 
-你需要在一台能正常访问镜像仓库的机器上执行：
+你已经完成了这一步，当前已成功拉取：
 
-```bash
-docker pull <image:tag>
-```
-
-把需要的镜像全部拉下来。
+- `zookeeper:3.9.3`
+- `apache/hive:4.0.0`
+- `apache/hadoop:3.4.1`
+- `harisekhon/hbase:latest`
 
 ### 第 2 步，导出镜像为 tar
 
 在联网机器上执行：
 
-```bash
-docker save -o hadoop-namenode.tar <image:tag>
+```powershell
+mkdir C:\temp\hadoop-images -Force
+docker save -o C:\temp\hadoop-images\hadoop-stack.tar zookeeper:3.9.3 apache/hive:4.0.0 apache/hadoop:3.4.1 harisekhon/hbase:latest
 ```
-
-每个镜像都导出一个 `tar`，或合并导出成一个总包。
 
 ### 第 3 步，把 tar 文件拷贝到当前本机
 
@@ -167,10 +154,8 @@ docker save -o hadoop-namenode.tar <image:tag>
 在当前本机执行：
 
 ```bash
-docker load -i /home/yhz/iot/docker/hadoop/images/hadoop-namenode.tar
+docker load -i /home/yhz/iot/docker/hadoop/images/hadoop-stack.tar
 ```
-
-对所有镜像重复导入。
 
 ### 第 5 步，确认镜像已经存在
 
@@ -270,7 +255,7 @@ pip install thrift_sasl sasl
 
 ### 3. 增强错误分类
 
-建议后续把异常提示分成几类：
+建议把异常提示分成几类：
 
 - 依赖缺失
 - 端口不可达
