@@ -184,6 +184,29 @@ def list_tables(req: DBConnectReq, x_trace_id: Optional[str] = Header(default=No
                 return TableListResp(code=0, message="OK", data=[table.decode('utf-8') for table in tables])
             except Exception as e:
                 return TableListResp(code=9999, message="查询表失败", detail=str(e))
+        elif dbt == "hdfs":
+            db_conf = {
+                "db_type": "hdfs",
+                "host": req.host,
+                "port": req.port,
+                "user": req.username
+            }
+            try:
+                client = engine_from_config(db_conf)
+                path = (req.database or "/").strip() or "/"
+                # 兼容前端旧默认值：HDFS 默认应列根目录，而不是旧数据库名 /nifi。
+                if path in ("nifi", "/nifi"):
+                    path = "/"
+                if not path.startswith("/"):
+                    path = f"/{path}"
+                entries = client.list(path, status=True)
+                data = []
+                for name, status in entries:
+                    entry_type = status.get("type", "").lower()
+                    data.append(f"{path.rstrip('/')}/{name}" if path != "/" else f"/{name}" if entry_type else name)
+                return TableListResp(code=0, message="OK", data=data)
+            except Exception as e:
+                return TableListResp(code=9999, message="查询目录失败", detail=str(e))
         elif dbt in ("mysql", "mariadb"):
             url = f"mysql+pymysql://{req.username}:{req.password}@{req.host}:{req.port}/{req.database}"
         elif dbt in ("postgres", "postgresql"):

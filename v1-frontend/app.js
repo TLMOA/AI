@@ -803,6 +803,12 @@ function renderDbFields() {
     try {
       // show host/port/user rows
       ["dbHost", "dbPort", "dbUser"].forEach((id) => { const el = document.getElementById(id); if (el) { el.disabled = false; const row = el.closest('.row'); if (row) row.style.display = ''; el.style.display = ''; const lbl = el.previousElementSibling; if (lbl && lbl.tagName && lbl.tagName.toLowerCase() === 'label') lbl.style.display = ''; } });
+      const hostEl = document.getElementById('dbHost');
+      const portEl = document.getElementById('dbPort');
+      const userEl = document.getElementById('dbUser');
+      if (hostEl && (!hostEl.value || ['127.0.0.1', 'localhost'].includes(String(hostEl.value).trim()))) hostEl.value = 'localhost';
+      if (portEl && (!portEl.value || ['3306', '5432', '1433', '1521', '10000', '9090', '9870'].includes(String(portEl.value).trim()))) portEl.value = '9870';
+      if (userEl && (!userEl.value || ['root', 'hive', 'admin'].includes(String(userEl.value).trim()))) userEl.value = 'hadoop';
       // HDFS 通常不需要密码字段，隐藏 password input 与其 label（仅隐藏，不移除 DOM）
       const pwdEl = document.getElementById('dbPassword');
       if (pwdEl) {
@@ -815,11 +821,15 @@ function renderDbFields() {
       const dbNameEl = document.getElementById('dbName'); if (dbNameEl) { dbNameEl.disabled = true; const row = dbNameEl.closest('.row'); if (row) row.style.display = 'none'; }
       // hide table/list controls
       ["dbTableSelect", "dbTableInput", "dbWhere"].forEach((id) => { const el = document.getElementById(id); if (el) { el.disabled = true; const row = el.closest('.row'); if (row) row.style.display = 'none'; } });
-      // update dbPath label/placeholder for HDFS
+      // update dbPath label/placeholder/default for HDFS
       const dbPathLabel = document.getElementById('dbPathLabel');
       const dbPathInput = document.getElementById('dbPath');
       if (dbPathLabel) dbPathLabel.textContent = 'HDFS 路径';
-      if (dbPathInput) dbPathInput.placeholder = '例如 /user/data/*.parquet 或 /user/data/csv/';
+      if (dbPathInput) {
+        dbPathInput.placeholder = '例如 / 或 /user/data/csv/';
+        const currentPath = String(dbPathInput.value || '').trim();
+        if (!currentPath || currentPath === '/nifi') dbPathInput.value = '/';
+      }
     } catch (e) {
       // best-effort
     }

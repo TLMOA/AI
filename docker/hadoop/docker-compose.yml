@@ -1,0 +1,137 @@
+services:
+  namenode:
+    image: apache/hadoop:3.4.1
+    container_name: hadoop-namenode
+    hostname: namenode
+    command: ["bash", "-lc", "hdfs namenode -format -force -nonInteractive || true; hdfs namenode"]
+    environment:
+      - CORE-SITE.XML_fs.defaultFS=hdfs://namenode:9000
+      - HDFS-SITE.XML_dfs.replication=1
+      - HDFS-SITE.XML_dfs.namenode.name.dir=file:///tmp/hadoop-root/dfs/name
+      - HDFS-SITE.XML_dfs.namenode.http-address=0.0.0.0:9870
+      - HDFS-SITE.XML_dfs.namenode.rpc-address=0.0.0.0:9000
+      - HDFS-SITE.XML_dfs.permissions.enabled=false
+      - HDFS-SITE.XML_dfs.webhdfs.enabled=true
+    ports:
+      - "9870:9870"
+      - "9000:9000"
+    healthcheck:
+      test: ["CMD", "bash", "-lc", "curl -sf http://localhost:9870/ >/dev/null || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 15
+
+  datanode:
+    image: apache/hadoop:3.4.1
+    container_name: hadoop-datanode
+    hostname: datanode
+    command: ["bash", "-lc", "hdfs datanode"]
+    depends_on:
+      - namenode
+    environment:
+      - CORE-SITE.XML_fs.defaultFS=hdfs://namenode:9000
+      - HDFS-SITE.XML_dfs.replication=1
+      - HDFS-SITE.XML_dfs.datanode.data.dir=file:///tmp/hadoop-root/dfs/data
+      - HDFS-SITE.XML_dfs.permissions.enabled=false
+      - HDFS-SITE.XML_dfs.webhdfs.enabled=true
+    healthcheck:
+      test: ["CMD", "bash", "-lc", "curl -sf http://namenode:9870/ >/dev/null || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 15
+
+  zookeeper:
+    image: zookeeper:3.9.3
+    container_name: hadoop-zookeeper
+    hostname: zookeeper
+    ports:
+      - "2181:2181"
+    healthcheck:
+      test: ["CMD", "bash", "-lc", "echo ruok | nc -w 2 localhost 2181 | grep imok"]
+      interval: 20s
+      timeout: 10s
+      retries: 15
+
+  hive-metastore:
+    image: apache/hive:4.0.0
+    container_name: hive-metastore
+    hostname: hive-metastore
+    depends_on:
+      - namenode
+      - datanode
+    environment:
+      - SERVICE_NAME=metastore
+      - DB_DRIVER=derby
+      - HIVE_CUSTOM_CONF_DIR=/opt/hive/conf
+      - CORE-SITE.XML_fs.defaultFS=hdfs://namenode:9000
+      - HDFS-SITE.XML_dfs.permissions.enabled=false
+      - HDFS-SITE.XML_dfs.webhdfs.enabled=true
+    ports:
+      - "9083:9083"
+    healthcheck:
+      test: ["CMD", "bash", "-lc", "nc -z localhost 9083"]
+      interval: 30s
+      timeout: 10s
+      retries: 15
+
+  hive-server2:
+    image: apache/hive:4.0.0
+    container_name: hive-server2
+    hostname: hive-server2
+    depends_on:
+      - hive-metastore
+      - namenode
+      - datanode
+    environment:
+      - SERVICE_NAME=hiveserver2
+      - SERVICE_OPTS=-Dhive.metastore.uris=thrift://hive-metastore:9083
+      - IS_RESUME=true
+      - HIVE_CUSTOM_CONF_DIR=/opt/hive/conf
+      - CORE-SITE.XML_fs.defaultFS=hdfs://namenode:9000
+      - HDFS-SITE.XML_dfs.permissions.enabled=false
+      - HDFS-SITE.XML_dfs.webhdfs.enabled=true
+    ports:
+      - "10000:10000"
+    healthcheck:
+      test: ["CMD", "bash", "-lc", "nc -z localhost 10000"]
+      interval: 30s
+      timeout: 10s
+      retries: 15
+
+  hbase:
+    image: harisekhon/hbase:latest
+    container_name: hbase
+    hostname: hbase
+    depends_on:
+      - zookeeper
+    environment:
+      - HBASE_MANAGES_ZK=false
+      - HBASE_ZOOKEEPER_QUORUM=zookeeper
+      - HBASE_ZOOKEEPER_CLIENT_PORT=2181
+      - HBASE_HEAPSIZE=512
+    ports:
+      - "16010:16010"
+    healthcheck:
+      test: ["CMD", "bash", "-lc", "curl -sf http://localhost:16010/ >/dev/null || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 15
+
+  hbase-thrift:
+    image: harisekhon/hbase:latest
+    container_name: hbase-thrift
+    hostname: hbase-thrift
+    depends_on:
+      - hbase
+    command: ["thrift"]
+    ports:
+      - "19090:9090"
+    environment:
+      - HBASE_MANAGES_ZK=false
+      - HBASE_ZOOKEEPER_QUORUM=zookeeper
+      - HBASE_ZOOKEEPER_CLIENT_PORT=2181
+    healthcheck:
+      test: ["CMD", "bash", "-lc", "nc -z localhost 9090"]
+      interval: 30s
+      timeout: 10s
+      retries: 15
