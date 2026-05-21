@@ -3,6 +3,8 @@ from pydantic import BaseModel, Field
 from typing import Optional, Dict, Any
 import sqlalchemy
 import concurrent.futures
+import subprocess
+import shutil
 
 # Import our Hadoop connection functions
 from .engine_factory import engine_from_config
@@ -48,7 +50,47 @@ def test_db_connection(req: DBConnectReq, x_trace_id: Optional[str] = Header(def
         
         # Handle Hadoop service types
         if dbt == "hive":
-            # Test Hive connection using our engine factory
+            # Prefer JDBC/Beeline validation because Hive 4.x + PyHive can be unstable.
+            beeline = shutil.which("beeline")
+            docker = shutil.which("docker")
+            jdbc_url = f"jdbc:hive2://{req.host}:{req.port}/{req.database or 'default'}"
+            if beeline:
+                cmd = [beeline, "-u", jdbc_url]
+                if req.username:
+                    cmd.extend(["-n", req.username])
+                # In NOSASL / non-LDAP modes, do not pass password.
+                if req.password and str(req.password).strip() and (req.params or {}).get("hive_auth", "").upper() in {"LDAP", "CUSTOM"}:
+                    cmd.extend(["-p", req.password])
+                try:
+                    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=15)
+                    output = (proc.stdout or "") + "\n" + (proc.stderr or "")
+                    if proc.returncode == 0 and ("Connected to: Apache Hive" in output or "Connected to:" in output):
+                        return DBConnectResp(code=0, message="连接成功")
+                    return DBConnectResp(code=2001, message="Hive连接失败", detail=output.strip() or f"beeline exit code {proc.returncode}")
+                except subprocess.TimeoutExpired:
+                    return DBConnectResp(code=2003, message="Hive连接超时", detail="beeline 连接 HiveServer2 超时")
+                except Exception as e:
+                    return DBConnectResp(code=2001, message="Hive连接失败", detail=str(e))
+
+            # If beeline is not installed locally, try the running Hive container.
+            if docker:
+                cmd = [docker, "exec", "hive-server2", "beeline", "-u", jdbc_url]
+                if req.username:
+                    cmd.extend(["-n", req.username])
+                if req.password and str(req.password).strip() and (req.params or {}).get("hive_auth", "").upper() in {"LDAP", "CUSTOM"}:
+                    cmd.extend(["-p", req.password])
+                try:
+                    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=20)
+                    output = (proc.stdout or "") + "\n" + (proc.stderr or "")
+                    if proc.returncode == 0 and ("Connected to: Apache Hive" in output or "Connected to:" in output):
+                        return DBConnectResp(code=0, message="连接成功")
+                    return DBConnectResp(code=2001, message="Hive连接失败", detail=output.strip() or f"docker exec beeline exit code {proc.returncode}")
+                except subprocess.TimeoutExpired:
+                    return DBConnectResp(code=2003, message="Hive连接超时", detail="docker exec beeline 连接 HiveServer2 超时")
+                except Exception as e:
+                    return DBConnectResp(code=2001, message="Hive连接失败", detail=str(e))
+
+            # Fallback: PyHive connection check
             db_conf = {
                 "db_type": "hive",
                 "host": req.host,
@@ -59,8 +101,6 @@ def test_db_connection(req: DBConnectReq, x_trace_id: Optional[str] = Header(def
             }
             try:
                 conn = engine_from_config(db_conf)
-                # Try a simple operation to verify connection
-                from pyhive import hive
                 cursor = conn.cursor()
                 cursor.execute("SELECT 1")
                 cursor.fetchone()
@@ -150,26 +190,53 @@ def list_tables(req: DBConnectReq, x_trace_id: Optional[str] = Header(default=No
         
         # Handle Hadoop service types for table listing
         if dbt == "hive":
-            db_conf = {
-                "db_type": "hive",
-                "host": req.host,
-                "port": req.port,
-                "user": req.username,
-                "password": req.password,
-                "database": req.database
-            }
-            try:
-                conn = engine_from_config(db_conf)
-                from pyhive import hive
-                cursor = conn.cursor()
-                cursor.execute("SHOW TABLES")
-                rows = cursor.fetchall()
-                tables = [row[0] for row in rows]  # Hive returns tuples
-                cursor.close()
-                conn.close()
-                return TableListResp(code=0, message="OK", data=tables)
-            except Exception as e:
-                return TableListResp(code=9999, message="查询表失败", detail=str(e))
+            # Prefer Beeline/JDBC for Hive 4.x compatibility.
+            beeline = shutil.which("beeline")
+            docker = shutil.which("docker")
+            jdbc_url = f"jdbc:hive2://{req.host}:{req.port}/{req.database or 'default'}"
+            cmd = None
+            if beeline:
+                cmd = [beeline, "-u", jdbc_url, "-e", "SHOW TABLES"]
+                if req.username:
+                    cmd.extend(["-n", req.username])
+                if req.password and str(req.password).strip() and (req.params or {}).get("hive_auth", "").upper() in {"LDAP", "CUSTOM"}:
+                    cmd.extend(["-p", req.password])
+            elif docker:
+                cmd = [docker, "exec", "hive-server2", "beeline", "-u", jdbc_url, "-e", "SHOW TABLES"]
+                if req.username:
+                    cmd.extend(["-n", req.username])
+                if req.password and str(req.password).strip() and (req.params or {}).get("hive_auth", "").upper() in {"LDAP", "CUSTOM"}:
+                    cmd.extend(["-p", req.password])
+            if cmd:
+                try:
+                    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=30)
+                    output = (proc.stdout or "") + "\n" + (proc.stderr or "")
+                    if proc.returncode != 0:
+                        return TableListResp(code=9999, message="查询表失败", detail=output.strip() or f"hive beeline exit code {proc.returncode}")
+                    tables = []
+                    for line in output.splitlines():
+                        s = line.strip()
+                        if not s:
+                            continue
+                        if s.startswith("SLF4J:") or s.startswith("Connecting to:") or s.startswith("Connected to:"):
+                            continue
+                        if s.lower().startswith("show tables") or s.startswith("Beeline version") or s.startswith("Transaction isolation"):
+                            continue
+                        if s.lower() == "ok":
+                            continue
+                        # Beeline output often has table names as plain lines.
+                        if "\t" in s:
+                            s = s.split("\t")[-1].strip()
+                        tables.append(s)
+                    # de-dup while preserving order
+                    seen = set()
+                    tables = [t for t in tables if not (t in seen or seen.add(t))]
+                    return TableListResp(code=0, message="OK", data=tables)
+                except subprocess.TimeoutExpired:
+                    return TableListResp(code=9999, message="查询表失败", detail="beeline 查询 Hive 表超时")
+                except Exception as e:
+                    return TableListResp(code=9999, message="查询表失败", detail=str(e))
+            return TableListResp(code=9999, message="查询表失败", detail="找不到 beeline，且无法通过 docker exec 调用 hive-server2")
         elif dbt == "hbase":
             db_conf = {
                 "db_type": "hbase",

@@ -3,15 +3,29 @@ services:
     image: apache/hadoop:3.4.1
     container_name: hadoop-namenode
     hostname: namenode
-    command: ["bash", "-lc", "hdfs namenode -format -force -nonInteractive || true; hdfs namenode"]
+    user: root
+    command:
+      - bash
+      - -lc
+      - |
+        set -e
+        mkdir -p /hadoop/dfs/name
+        chmod -R 777 /hadoop/dfs/name
+        if [ ! -f /hadoop/dfs/name/current/VERSION ]; then
+          echo 'Formatting NameNode storage...'
+          hdfs namenode -format -force -nonInteractive
+        fi
+        exec hdfs namenode
     environment:
       - CORE-SITE.XML_fs.defaultFS=hdfs://namenode:9000
       - HDFS-SITE.XML_dfs.replication=1
-      - HDFS-SITE.XML_dfs.namenode.name.dir=file:///tmp/hadoop-root/dfs/name
+      - HDFS-SITE.XML_dfs.namenode.name.dir=file:///hadoop/dfs/name
       - HDFS-SITE.XML_dfs.namenode.http-address=0.0.0.0:9870
       - HDFS-SITE.XML_dfs.namenode.rpc-address=0.0.0.0:9000
       - HDFS-SITE.XML_dfs.permissions.enabled=false
       - HDFS-SITE.XML_dfs.webhdfs.enabled=true
+    volumes:
+      - namenode_data:/hadoop/dfs/name
     ports:
       - "9870:9870"
       - "9000:9000"
@@ -25,15 +39,18 @@ services:
     image: apache/hadoop:3.4.1
     container_name: hadoop-datanode
     hostname: datanode
-    command: ["bash", "-lc", "hdfs datanode"]
+    user: root
+    command: ["bash", "-lc", "mkdir -p /hadoop/dfs/data && chmod -R 777 /hadoop/dfs/data && exec hdfs datanode"]
     depends_on:
       - namenode
     environment:
       - CORE-SITE.XML_fs.defaultFS=hdfs://namenode:9000
       - HDFS-SITE.XML_dfs.replication=1
-      - HDFS-SITE.XML_dfs.datanode.data.dir=file:///tmp/hadoop-root/dfs/data
+      - HDFS-SITE.XML_dfs.datanode.data.dir=file:///hadoop/dfs/data
       - HDFS-SITE.XML_dfs.permissions.enabled=false
       - HDFS-SITE.XML_dfs.webhdfs.enabled=true
+    volumes:
+      - datanode_data:/hadoop/dfs/data
     healthcheck:
       test: ["CMD", "bash", "-lc", "curl -sf http://namenode:9870/ >/dev/null || exit 1"]
       interval: 30s
@@ -66,6 +83,8 @@ services:
       - CORE-SITE.XML_fs.defaultFS=hdfs://namenode:9000
       - HDFS-SITE.XML_dfs.permissions.enabled=false
       - HDFS-SITE.XML_dfs.webhdfs.enabled=true
+    volumes:
+      - hive_metastore_data:/opt/hive/metastore
     ports:
       - "9083:9083"
     healthcheck:
@@ -135,3 +154,8 @@ services:
       interval: 30s
       timeout: 10s
       retries: 15
+
+volumes:
+  namenode_data:
+  datanode_data:
+  hive_metastore_data:

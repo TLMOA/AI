@@ -81,6 +81,61 @@ docker cp iot-nifi:/opt/nifi/nifi-current/conf/flow.xml.gz /home/yhz/iot/real_ni
 
 访问说明：当前证书的 SAN 包含 `localhost` 和容器名，不包含 `127.0.0.1`。如果浏览器提示 `invalid SNI`，请优先使用 `https://localhost:8080` 打开 NiFi；若必须通过 IP 访问，需要重新生成包含该 IP 的证书。
 
+局域网访问（推荐 B 方案：Nginx TLS 终止）
+--------------------------------------------------
+如果你希望 NiFi 像前端 `5174` 一样可被局域网其它机器稳定访问，推荐在宿主机加一层 Nginx（TLS 终止），再反向代理到本机 NiFi。
+
+说明：
+- 现有 NiFi 证书通常只包含 `localhost`，直接用宿主 IP 访问可能出现 SNI/证书不匹配。
+- 通过 Nginx 使用包含宿主 IP 的证书，可以避免该问题，并保留 NiFi 后端 HTTPS。
+
+1) 生成自签证书（包含宿主 IP）
+
+```bash
+cd docker/nifi/nginx
+chmod +x generate_nifi_self_signed_cert.sh
+sudo ./generate_nifi_self_signed_cert.sh <HOST_IP>
+```
+
+2) 安装 Nginx 站点配置（仓库已采用长期端口 `9443`）
+
+推荐使用仓库提供的启用脚本（会把模板写入 `/etc/nginx/conf.d/nifi-lan.conf`、重载 nginx 并放行防火墙端口 9443）：
+
+```bash
+cd docker/nifi/nginx
+sudo chmod +x enable_nifi_nginx.sh
+sudo ./enable_nifi_nginx.sh <HOST_IP>
+```
+
+脚本做了三件事：
+- 将 `nifi-lan.conf.template` 写入 `/etc/nginx/conf.d/nifi-lan.conf`（仅监听 `9443`）
+- 删除系统默认可能存在的 `default` site 配置以避免冲突
+- 测试并重启 nginx，同时在存在 `ufw` 时放行 `9443` 端口
+
+说明：我们把 `9443` 作为长期访问端口以避免与系统上已有使用 `80/443` 的服务冲突。访问示例：`https://<HOST_IP>:9443/nifi/`。
+
+注意：如果你更新了 `docker/nifi/docker-compose.yml`，请确保 `NIFI_WEB_PROXY_HOST` 也包含你的局域网入口（例如 `202.113.76.55:9443`），然后重建或重启 NiFi 容器，让 NiFi 认可来自反向代理的 Host。
+
+3) 从局域网访问
+
+```bash
+# 浏览器访问
+https://<HOST_IP>/nifi/
+
+# API 验证
+curl -k -I https://<HOST_IP>/nifi-api
+```
+
+登录说明：
+- 用户名：`admin`
+- 密码：`admin`
+- 若刚修改过密码，请先重启容器再登录。
+
+排查建议：
+- 确认宿主防火墙已放行 `9443`。
+- 若 Nginx 与 NiFi 不在同一宿主，调整 `proxy_pass` 指向对应 NiFi 地址。
+- 若希望客户端无告警，建议把自签 CA 导入局域网终端信任链，或换成受信任证书。
+
 附加说明：
 - `--restart unless-stopped` 会在主机重启后自动重启容器，但若你手动 `docker stop` 过则不会自动重启。
 - 挂载 `conf` 到宿主意味着你要负责 `conf` 的版本与兼容性（升级镜像时注意备份并检查 `conf` 差异）。

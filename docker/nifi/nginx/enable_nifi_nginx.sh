@@ -39,9 +39,15 @@ nginx -t
 echo "Reloading nginx"
 systemctl restart nginx
 
-echo "Opening firewall port 9443 (ufw if present)"
+echo "Opening firewall port 9443 (ufw if present and active)"
 if command -v ufw >/dev/null 2>&1; then
-  ufw allow 9443/tcp || true
+  if ufw status | grep -qi "Status: active"; then
+    ufw allow 9443/tcp || true
+  else
+    echo "ufw is installed but inactive; skipping firewall change."
+  fi
+else
+  echo "ufw not installed; skipping firewall change."
 fi
 
 echo "Done. NiFi should be reachable at: https://${HOST_IP}:9443/nifi/"
