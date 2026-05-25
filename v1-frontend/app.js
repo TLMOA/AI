@@ -56,10 +56,15 @@ function getBackendModeConfig(mode) {
   return backendModes[mode] || backendModes[config.DEFAULT_BACKEND_MODE] || { label: mode, apiBase: config.API_BASE };
 }
 
+function isAbsoluteUrl(value) {
+  return /^https?:\/\//i.test(String(value || "").trim());
+}
+
 function getBackendApiBase(mode = state.backendMode || config.DEFAULT_BACKEND_MODE || "local") {
   const cfg = getBackendModeConfig(mode);
   const apiBase = String(cfg.apiBase || config.API_BASE || "/api/v1").trim();
   if (!apiBase) return "/api/v1";
+  if (isAbsoluteUrl(apiBase)) return apiBase.replace(/\/$/, "");
   return apiBase.startsWith("/") ? apiBase : `/${apiBase}`;
 }
 
@@ -126,6 +131,7 @@ function api(path, options = {}) {
 function _normalizeBase(base) {
   const b = String(base || "").trim();
   if (!b) return "";
+  if (isAbsoluteUrl(b)) return b.replace(/\/$/, "");
   return b.startsWith("/") ? b : `/${b}`;
 }
 
@@ -134,7 +140,11 @@ async function requestJson(path, options = {}, mode = state.backendMode || confi
     return mockApi(path, options);
   }
   const fetchOptions = Object.assign({ credentials: 'same-origin' }, options || {});
-  const r = await fetch(`${getBackendApiBase(mode)}${path}`, fetchOptions);
+  const requestPath = String(path || "").trim();
+  const requestUrl = isAbsoluteUrl(requestPath)
+    ? requestPath
+    : `${getBackendApiBase(mode).replace(/\/$/, "")}${requestPath.startsWith("/") ? requestPath : `/${requestPath}`}`;
+  const r = await fetch(requestUrl, fetchOptions);
   const text = await r.text();
   let body = {};
   try {
@@ -774,10 +784,10 @@ function collectDbConfigForSchedule() {
 
 const DB_TYPE_DEFAULTS = {
   mysql: { host: '127.0.0.1', port: '3306', user: 'root', database: 'nifi', password: 'root' },
-  postgres: { host: '127.0.0.1', port: '5432', user: 'postgres', database: 'postgres', password: '' },
-  postgresql: { host: '127.0.0.1', port: '5432', user: 'postgres', database: 'postgres', password: '' },
-  sqlserver: { host: '127.0.0.1', port: '1433', user: 'sa', database: 'master', password: '' },
-  oracle: { host: '127.0.0.1', port: '1521', user: 'system', database: 'XE', password: '' },
+  postgres: { host: '127.0.0.1', port: '5432', user: 'postgres', database: 'postgres', password: 'difyai123456' },
+  postgresql: { host: '127.0.0.1', port: '5432', user: 'postgres', database: 'postgres', password: 'difyai123456' },
+  sqlserver: { host: '127.0.0.1', port: '1433', user: 'sa', database: 'master', password: 'Your_password123' },
+  oracle: { host: '127.0.0.1', port: '1521', user: 'system', database: 'FREEPDB1', password: 'Oracle123456' },
   sqlite: { host: '', port: '', user: '', database: '', password: '' },
   hive: { host: 'localhost', port: '10000', user: 'hive', database: 'default', password: '' },
   hdfs: { host: 'localhost', port: '9870', user: 'hadoop', database: '/', password: '', path: '/' },
@@ -1265,7 +1275,9 @@ async function testDbConnection() {
   const defaults = DB_TYPE_DEFAULTS[dbType] || DB_TYPE_DEFAULTS.mysql;
   const host = document.getElementById("dbHost").value.trim() || defaults.host;
   const port = Number(document.getElementById("dbPort").value || defaults.port || 3306);
-  const database = dbType === 'hdfs' ? (document.getElementById("dbPath")?.value.trim() || '/') : (document.getElementById("dbName").value.trim() || defaults.database || 'default');
+  const database = (dbType === 'hdfs' || dbType === 'sqlite')
+    ? (document.getElementById("dbPath")?.value.trim() || (dbType === 'hdfs' ? '/' : ''))
+    : (document.getElementById("dbName").value.trim() || defaults.database || 'default');
   const username = document.getElementById("dbUser").value.trim() || defaults.user;
   const password = document.getElementById("dbPassword").value;
   const status = document.getElementById("dbConnStatus");
@@ -1288,7 +1300,9 @@ async function listTables() {
   const defaults = DB_TYPE_DEFAULTS[dbType] || DB_TYPE_DEFAULTS.mysql;
   const host = document.getElementById("dbHost").value.trim() || defaults.host;
   const port = Number(document.getElementById("dbPort").value || defaults.port || 3306);
-  const database = dbType === 'hdfs' ? (document.getElementById("dbPath")?.value.trim() || '/') : (document.getElementById("dbName").value.trim() || defaults.database || 'default');
+  const database = (dbType === 'hdfs' || dbType === 'sqlite')
+    ? (document.getElementById("dbPath")?.value.trim() || (dbType === 'hdfs' ? '/' : ''))
+    : (document.getElementById("dbName").value.trim() || defaults.database || 'default');
   const username = document.getElementById("dbUser").value.trim() || defaults.user;
   const password = document.getElementById("dbPassword").value;
   const status = document.getElementById("dbConnStatus");

@@ -3144,7 +3144,7 @@ def export_mysql(req: MySQLExportReq, request: Request, x_trace_id: Optional[str
             _write_meta_file(meta, extra)
         except Exception:
             pass
-    else:
+    elif fmt == "json":
         out_path = primary_dir / f"{base_name}.json"
         _write_ndjson(out_path, cols, rows, append=False)
         latest_path = primary_dir / f"{req.table}_export_latest.json"

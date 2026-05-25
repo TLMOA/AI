@@ -17,7 +17,7 @@ class DBConnectReq(BaseModel):
     port: int = Field(..., description="端口号")
     username: str = Field(..., description="用户名")
     password: str = Field(..., description="密码")
-    database: str = Field(..., description="数据库名")
+    database: Optional[str] = Field(default="", description="数据库名（HDFS/HBase 可留空）")
     params: Optional[Dict[str, Any]] = Field(default_factory=dict, description="其他连接参数")
 
 class DBConnectResp(BaseModel):
@@ -41,8 +41,11 @@ def test_db_connection(req: DBConnectReq, x_trace_id: Optional[str] = Header(def
     3. 失败时给出详细错误原因
     """
     dbt = (req.db_type or "").strip().lower()
-    # 参数校验：HDFS/HBase 不需要数据库名；其他类型仍要求 database。
-    if not req.host or not req.port or not req.username or (dbt not in {"hdfs", "hbase"} and not req.database):
+    # 参数校验：HDFS/HBase/SQLite 不需要数据库名；SQLite 只需要路径。
+    if dbt == "sqlite":
+        if not req.database:
+            return DBConnectResp(code=1001, message="参数缺失，请检查 SQLite 文件路径是否填写完整")
+    elif not req.host or not req.port or not req.username or (dbt not in {"hdfs", "hbase"} and not req.database):
         return DBConnectResp(code=1001, message="参数缺失，请检查主机、端口、用户名、数据库名是否填写完整")
     
     # 构建连接字符串
@@ -109,9 +112,11 @@ def test_db_connection(req: DBConnectReq, x_trace_id: Optional[str] = Header(def
             except Exception as e:
                 return DBConnectResp(code=2001, message="Hive连接失败", detail=str(e))
         elif dbt == "hbase":
-            # Prefer native HBase shell in the running container; the standalone thrift
-            # container may be reachable while failing to discover /hbase/master in ZooKeeper.
+            # Prefer native HBase shell in the running container; if that fails
+            # (for example the container image lacks the `hbase` binary),
+            # fall back to Thrift/happybase via engine_factory.
             docker = shutil.which("docker")
+            docker_error_detail = None
             if docker:
                 try:
                     proc = subprocess.run(
@@ -124,12 +129,14 @@ def test_db_connection(req: DBConnectReq, x_trace_id: Optional[str] = Header(def
                     output = (proc.stdout or "") + "\n" + (proc.stderr or "")
                     if proc.returncode == 0 and ("TABLE" in output or "row(s)" in output):
                         return DBConnectResp(code=0, message="连接成功")
-                    return DBConnectResp(code=2001, message="HBase连接失败", detail=output.strip() or f"hbase shell exit code {proc.returncode}")
+                    # remember docker error but do not fail immediately — try Thrift fallback
+                    docker_error_detail = output.strip() or f"hbase shell exit code {proc.returncode}"
                 except subprocess.TimeoutExpired:
-                    return DBConnectResp(code=2003, message="HBase连接超时", detail="docker exec hbase shell 超时")
+                    docker_error_detail = "docker exec hbase shell 超时"
                 except Exception as e:
-                    return DBConnectResp(code=2001, message="HBase连接失败", detail=str(e))
+                    docker_error_detail = str(e)
 
+            # Fallback to happybase/thrift (engine_factory) if container shell is not usable
             db_conf = {
                 "db_type": "hbase",
                 "host": req.host,
@@ -142,7 +149,11 @@ def test_db_connection(req: DBConnectReq, x_trace_id: Optional[str] = Header(def
                 conn.close()
                 return DBConnectResp(code=0, message="连接成功")
             except Exception as e:
-                return DBConnectResp(code=2001, message="HBase连接失败", detail=str(e))
+                # If we had a docker error earlier, include it to help debugging.
+                detail = str(e)
+                if docker_error_detail:
+                    detail = f"docker-hbase: {docker_error_detail}; thrift: {detail}"
+                return DBConnectResp(code=2001, message="HBase连接失败", detail=detail)
         elif dbt == "hdfs":
             # Test HDFS connection using our engine factory
             db_conf = {
@@ -257,6 +268,7 @@ def list_tables(req: DBConnectReq, x_trace_id: Optional[str] = Header(default=No
             return TableListResp(code=9999, message="查询表失败", detail="找不到 beeline，且无法通过 docker exec 调用 hive-server2")
         elif dbt == "hbase":
             docker = shutil.which("docker")
+            docker_error_detail = None
             if docker:
                 try:
                     proc = subprocess.run(
@@ -267,25 +279,26 @@ def list_tables(req: DBConnectReq, x_trace_id: Optional[str] = Header(default=No
                         timeout=20,
                     )
                     output = (proc.stdout or "") + "\n" + (proc.stderr or "")
-                    if proc.returncode != 0:
-                        return TableListResp(code=9999, message="查询表失败", detail=output.strip() or f"hbase shell exit code {proc.returncode}")
-                    tables = []
-                    capture = False
-                    for line in output.splitlines():
-                        item = line.strip()
-                        if item == "TABLE":
-                            capture = True
-                            continue
-                        if not capture:
-                            continue
-                        if not item or item.startswith("SLF4J:") or "row(s)" in item or item.startswith("Took "):
-                            continue
-                        tables.append(item)
-                    return TableListResp(code=0, message="OK", data=tables)
+                    if proc.returncode == 0:
+                        tables = []
+                        capture = False
+                        for line in output.splitlines():
+                            item = line.strip()
+                            if item == "TABLE":
+                                capture = True
+                                continue
+                            if not capture:
+                                continue
+                            if not item or item.startswith("SLF4J:") or "row(s)" in item or item.startswith("Took "):
+                                continue
+                            tables.append(item)
+                        return TableListResp(code=0, message="OK", data=tables)
+                    # remember docker error but continue to thrift fallback
+                    docker_error_detail = output.strip() or f"hbase shell exit code {proc.returncode}"
                 except subprocess.TimeoutExpired:
-                    return TableListResp(code=9999, message="查询表失败", detail="hbase shell 查询 HBase 表超时")
+                    docker_error_detail = "hbase shell 查询 HBase 表超时"
                 except Exception as e:
-                    return TableListResp(code=9999, message="查询表失败", detail=str(e))
+                    docker_error_detail = str(e)
 
             db_conf = {
                 "db_type": "hbase",
@@ -299,7 +312,10 @@ def list_tables(req: DBConnectReq, x_trace_id: Optional[str] = Header(default=No
                 conn.close()
                 return TableListResp(code=0, message="OK", data=[table.decode('utf-8') for table in tables])
             except Exception as e:
-                return TableListResp(code=9999, message="查询表失败", detail=str(e))
+                detail = str(e)
+                if docker_error_detail:
+                    detail = f"docker-hbase: {docker_error_detail}; thrift: {detail}"
+                return TableListResp(code=9999, message="查询表失败", detail=detail)
         elif dbt == "hdfs":
             db_conf = {
                 "db_type": "hdfs",

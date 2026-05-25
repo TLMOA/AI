@@ -101,6 +101,12 @@ services:
       - hive-metastore
       - namenode
       - datanode
+    command:
+      - bash
+      - -lc
+      - |
+        rm -f /opt/hive/conf/hiveserver2.pid
+        exec /opt/hive/bin/hive --skiphadoopversion --skiphbasecp --service hiveserver2
     environment:
       - SERVICE_NAME=hiveserver2
       - SERVICE_OPTS=-Dhive.metastore.uris=thrift://hive-metastore:9083

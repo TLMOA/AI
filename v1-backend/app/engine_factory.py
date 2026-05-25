@@ -1,5 +1,12 @@
 from sqlalchemy import create_engine
 from typing import Dict
+import warnings
+
+warnings.filterwarnings(
+    "ignore",
+    message=r"pkg_resources is deprecated as an API.*",
+    category=UserWarning,
+)
 try:
     import pyhive.hive
 except ImportError:

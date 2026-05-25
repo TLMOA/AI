@@ -158,6 +158,24 @@ bash scripts/install_autostart_services.sh
 systemctl status iot-backend.service iot-frontend.service iot-backend-health.timer --no-pager --full
 ```
 
+## 数据库服务一键启动
+
+如果你需要把本机数据库测试相关的服务一次性拉起并完成连通性校验，直接执行：
+
+```bash
+sudo bash /home/yhz/iot/scripts/start_db_services.sh
+```
+
+这个脚本当前会处理以下内容：
+
+- 修正 SQLite 备份库权限，确保后端能打开文件型数据库
+- 启动 Hadoop / Hive / HBase 相关 Docker 编排
+- 启动 PostgreSQL、SQL Server、Oracle 等独立数据库容器
+- 重启 `iot-backend.service` 和 `iot-frontend.service`
+- 调用后端接口做 SQLite、PostgreSQL、SQL Server、Oracle、Hive、HBase、HDFS 的测试连接
+
+说明：NiFi 已经改为单独自启动管理，不再由这个脚本处理。
+
 如果修改了 systemd 单元文件，记得重新加载：
 
 ```bash
