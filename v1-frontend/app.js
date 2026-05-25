@@ -56,15 +56,30 @@ function getBackendModeConfig(mode) {
   return backendModes[mode] || backendModes[config.DEFAULT_BACKEND_MODE] || { label: mode, apiBase: config.API_BASE };
 }
 
+function isAbsoluteUrl(value) {
+  return /^https?:\/\//i.test(String(value || "").trim());
+}
+
 function getBackendApiBase(mode = state.backendMode || config.DEFAULT_BACKEND_MODE || "local") {
   const cfg = getBackendModeConfig(mode);
   const apiBase = String(cfg.apiBase || config.API_BASE || "/api/v1").trim();
   if (!apiBase) return "/api/v1";
+  if (isAbsoluteUrl(apiBase)) return apiBase.replace(/\/$/, "");
   return apiBase.startsWith("/") ? apiBase : `/${apiBase}`;
 }
 
-function setBackendMode(mode) {
-  state.backendMode = mode === "nifi" ? "nifi" : "local";
+async function setBackendMode(mode) {
+  const nextMode = mode === "nifi" ? "nifi" : "local";
+  const res = await setBackendModeRemote(nextMode);
+  if (res && res.code === 0) {
+    state.backendMode = res.data?.mode === "nifi" ? "nifi" : nextMode;
+    try {
+      localStorage.setItem(BACKEND_MODE_STORAGE_KEY, state.backendMode);
+    } catch (_) {}
+    updateBackendToggleUI();
+    return;
+  }
+  state.backendMode = nextMode;
   try {
     localStorage.setItem(BACKEND_MODE_STORAGE_KEY, state.backendMode);
   } catch (_) {}
@@ -90,18 +105,57 @@ function updateBackendToggleUI() {
   }
 }
 
-function api(path, options = {}) {
+async function getBackendModeState() {
   if (config.USE_MOCK_API) {
-    return mockApi(path, options);
+    return { code: 0, data: { factory_id: DEFAULT_FACTORY_ID, mode: state.backendMode || config.DEFAULT_BACKEND_MODE || "local", updatedAt: new Date().toISOString(), updatedBy: "mock" } };
   }
-  const fetchOptions = Object.assign({ credentials: 'same-origin' }, options || {});
-  return fetch(`${getBackendApiBase()}${path}`, fetchOptions).then((r) => r.json());
+  return await requestJson("/internal/backend-mode", {}, "local");
+}
+
+async function setBackendModeRemote(mode) {
+  if (config.USE_MOCK_API) {
+    return { code: 0, data: { factory_id: DEFAULT_FACTORY_ID, mode } };
+  }
+  const payload = { factory_id: DEFAULT_FACTORY_ID, mode, operator: (state.currentUser && state.currentUser.username) || "system" };
+  return await requestJson("/internal/backend-mode", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  }, "local");
+}
+
+function api(path, options = {}) {
+  return requestJson(path, options);
 }
 
 function _normalizeBase(base) {
   const b = String(base || "").trim();
   if (!b) return "";
+  if (isAbsoluteUrl(b)) return b.replace(/\/$/, "");
   return b.startsWith("/") ? b : `/${b}`;
+}
+
+async function requestJson(path, options = {}, mode = state.backendMode || config.DEFAULT_BACKEND_MODE || "local") {
+  if (config.USE_MOCK_API) {
+    return mockApi(path, options);
+  }
+  const fetchOptions = Object.assign({ credentials: 'same-origin' }, options || {});
+  const requestPath = String(path || "").trim();
+  const requestUrl = isAbsoluteUrl(requestPath)
+    ? requestPath
+    : `${getBackendApiBase(mode).replace(/\/$/, "")}${requestPath.startsWith("/") ? requestPath : `/${requestPath}`}`;
+  const r = await fetch(requestUrl, fetchOptions);
+  const text = await r.text();
+  let body = {};
+  try {
+    body = text ? JSON.parse(text) : {};
+  } catch (_) {
+    body = { raw: text };
+  }
+  if (!r.ok) {
+    return { code: r.status, message: body?.detail || body?.message || body?.raw || `HTTP ${r.status}`, data: body?.data ?? null };
+  }
+  return body;
 }
 
 async function exportJobsApi(path, options = {}) {
@@ -112,12 +166,10 @@ async function exportJobsApi(path, options = {}) {
   const candidates = [];
 
   const absoluteOrigins = [
-    // Current backend default in this project.
     "http://127.0.0.1:8081",
     "http://localhost:8081",
   ];
 
-  // Prefer /api/v1 first because frontend proxy only forwards /api/v1 POST.
   ["/api/v1", "api/v1", apiBaseNormalized, apiBaseRelative, "/api", "api", apiBaseNoV1, apiBaseNoV1Relative].forEach((base) => {
     if (!base) return;
     if (!candidates.includes(base)) {
@@ -125,7 +177,6 @@ async function exportJobsApi(path, options = {}) {
     }
   });
 
-  // Also try absolute API endpoints to avoid hitting static web server routes (405 HTML).
   absoluteOrigins.forEach((origin) => {
     ["/api", "/api/v1", apiBaseNoV1 || "/api", apiBaseNormalized || "/api/v1"].forEach((base) => {
       const merged = `${origin}${base.startsWith("/") ? base : `/${base}`}`;
@@ -139,39 +190,21 @@ async function exportJobsApi(path, options = {}) {
   for (const base of candidates) {
     try {
       const prefix = base.endsWith("/") ? base.slice(0, -1) : base;
-      const r = await fetch(`${prefix}${path}`, options);
-      const text = await r.text();
-      let body = {};
-      try {
-        body = text ? JSON.parse(text) : {};
-      } catch (_) {
-        body = { raw: text };
-      }
-
-      if (!r.ok) {
-        const msg = body?.detail || body?.message || body?.raw || `HTTP ${r.status}`;
-        const contentType = (r.headers.get("content-type") || "").toLowerCase();
-        const rawText = String(body?.raw || "");
-        const looksLikeHtmlError = contentType.includes("text/html") || /<html|<!doctype/i.test(rawText);
-
-        // HTML 404/405/501 usually means request hit static server/proxy mismatch; try next candidate.
-        if (r.status === 404 || ((r.status === 405 || r.status === 501) && looksLikeHtmlError)) {
-          lastError = { code: r.status, message: msg };
+      const res = await requestJson(`${prefix}${path}`, options, "local");
+      if (res.code && res.code !== 0 && res.code !== 200) {
+        if (res.code === 404 || res.code === 405 || res.code === 501) {
+          lastError = { code: res.code, message: res.message };
           continue;
         }
-        return { code: r.status, message: msg, data: body?.data ?? null };
+        return res;
       }
-      return body;
+      return res;
     } catch (e) {
       lastError = { code: -1, message: e?.message || String(e) };
     }
   }
 
-  return {
-    code: lastError?.code || -1,
-    message: `request failed: ${lastError?.message || "no reachable export-jobs endpoint"}`,
-    data: null,
-  };
+  return { code: lastError?.code || -1, message: `request failed: ${lastError?.message || "no reachable export-jobs endpoint"}`, data: null };
 }
 
 function mockApi(path, options = {}) {
@@ -218,7 +251,7 @@ function renderJobs() {
 async function loadJobs() {
   const res = await api("/jobs");
   if (res.code !== 0) return;
-  state.jobs = res.data.rows;
+  state.jobs = res.data.rows || [];
   renderJobs();
 }
 
@@ -292,7 +325,7 @@ async function loadOutputs(jobId) {
   if (res.code !== 0) return;
   res.data.forEach((f) => {
     const li = document.createElement("li");
-    li.innerHTML = `${f.fileName} (${f.fileFormat}) - <a href="${config.API_BASE}/files/${f.fileId}/download" target="_blank">下载</a> <span class="small">路径: ${f.storagePath || ''}</span>`;
+    li.innerHTML = `${f.fileName} (${f.fileFormat}) - <a href="${getBackendApiBase()}/files/${f.fileId}/download" target="_blank">下载</a> <span class="small">路径: ${f.storagePath || ''}</span>`;
     ul.appendChild(li);
   });
 }
@@ -316,7 +349,7 @@ function renderFiles() {
       <td>${file.fileSize}</td>
       <td>
         <button class="secondary" data-preview="${file.fileId}">预览</button>
-        <a href="${config.API_BASE}/files/${file.fileId}/download" target="_blank">下载</a>
+        <a href="${getBackendApiBase()}/files/${file.fileId}/download" target="_blank">下载</a>
         <div class="small">路径: ${file.storagePath || ''}</div>
       </td>
     `;
@@ -728,9 +761,9 @@ function collectDbConfigForSchedule() {
   const dsn = dsnEl && String(dsnEl.value).trim();
   const DEFAULT_PORTS = { mysql: 3306, postgresql: 5432, sqlserver: 1433, oracle: 1521 };
   // add common Hadoop-related defaults: Hive thrift, HBase thrift, WebHDFS
-  // HIVE: 10000 (Thrift/Beeswax), HBASE: 9090 (Thrift), HDFS(WebHDFS): 9870/50070 (use 9870 modern)
+  // HIVE: 10000 (Thrift/Beeswax), HBASE: 19090 (host-mapped Thrift), HDFS(WebHDFS): 9870/50070 (use 9870 modern)
   DEFAULT_PORTS.hive = 10000;
-  DEFAULT_PORTS.hbase = 9090;
+  DEFAULT_PORTS.hbase = 19090;
   DEFAULT_PORTS.hdfs = 9870;
   const conf = {
     db_type: db_type,
@@ -749,13 +782,50 @@ function collectDbConfigForSchedule() {
   return conf;
 }
 
+const DB_TYPE_DEFAULTS = {
+  mysql: { host: '127.0.0.1', port: '3306', user: 'root', database: 'nifi', password: 'root' },
+  postgres: { host: '127.0.0.1', port: '5432', user: 'postgres', database: 'postgres', password: 'difyai123456' },
+  postgresql: { host: '127.0.0.1', port: '5432', user: 'postgres', database: 'postgres', password: 'difyai123456' },
+  sqlserver: { host: '127.0.0.1', port: '1433', user: 'sa', database: 'master', password: 'Your_password123' },
+  oracle: { host: '127.0.0.1', port: '1521', user: 'system', database: 'FREEPDB1', password: 'Oracle123456' },
+  sqlite: { host: '', port: '', user: '', database: '', password: '' },
+  hive: { host: 'localhost', port: '10000', user: 'hive', database: 'default', password: '' },
+  hdfs: { host: 'localhost', port: '9870', user: 'hadoop', database: '/', password: '', path: '/' },
+  hbase: { host: 'localhost', port: '19090', user: 'root', database: 'default', password: '' },
+};
+
+function applyDbTypeDefaults() {
+  const dbType = (document.getElementById("dbType")?.value || "mysql").toLowerCase();
+  const defaults = DB_TYPE_DEFAULTS[dbType] || DB_TYPE_DEFAULTS.mysql;
+  const previousType = window.__lastDbType || '';
+  const previousDefaults = DB_TYPE_DEFAULTS[previousType] || {};
+  const allKnownValues = (key) => Array.from(new Set(Object.values(DB_TYPE_DEFAULTS).map((item) => item[key]).filter((v) => v !== undefined && v !== null).map(String)));
+  const maybeSet = (id, key) => {
+    const el = document.getElementById(id);
+    if (!el || defaults[key] === undefined) return;
+    const current = String(el.value || '').trim();
+    const previous = previousDefaults[key] !== undefined ? String(previousDefaults[key]) : '';
+    const known = allKnownValues(key);
+    if (!current || current === previous || known.includes(current)) {
+      el.value = defaults[key];
+    }
+  };
+  maybeSet('dbHost', 'host');
+  maybeSet('dbPort', 'port');
+  maybeSet('dbUser', 'user');
+  maybeSet('dbPassword', 'password');
+  maybeSet('dbName', 'database');
+  if (dbType === 'hdfs') maybeSet('dbPath', 'path');
+  window.__lastDbType = dbType;
+}
+
 // Render DB-specific fields and DSN-priority behavior
 function renderDbFields() {
+  applyDbTypeDefaults();
   const dbType = (document.getElementById("dbType")?.value || "mysql").toLowerCase();
   const dsn = (document.getElementById("dbDSN")?.value || "").trim();
-  const DEFAULT_PORTS = { mysql: 3306, postgresql: 5432, sqlserver: 1433, oracle: 1521, sqlite: '', hive: 10000, hbase: 9090, hdfs: 9870 };
+  const DEFAULT_PORTS = Object.fromEntries(Object.entries(DB_TYPE_DEFAULTS).map(([key, value]) => [key, value.port]));
   const dbPathRow = document.getElementById("dbPathRow");
-  const hostInputs = ["dbHost", "dbPort", "dbUser", "dbPassword", "dbName", "dbTableSelect", "dbTableInput", "dbWhere", "dbExportFormat", "dbAppendLatest", "dbTestBtn", "dbListBtn"];
   // Render fields per dbType
   if (dbType === "sqlite") {
     if (dbPathRow) dbPathRow.style.display = '';
@@ -780,6 +850,12 @@ function renderDbFields() {
     try {
       // show host/port/user rows
       ["dbHost", "dbPort", "dbUser"].forEach((id) => { const el = document.getElementById(id); if (el) { el.disabled = false; const row = el.closest('.row'); if (row) row.style.display = ''; el.style.display = ''; const lbl = el.previousElementSibling; if (lbl && lbl.tagName && lbl.tagName.toLowerCase() === 'label') lbl.style.display = ''; } });
+      const hostEl = document.getElementById('dbHost');
+      const portEl = document.getElementById('dbPort');
+      const userEl = document.getElementById('dbUser');
+      if (hostEl && (!hostEl.value || ['127.0.0.1', 'localhost'].includes(String(hostEl.value).trim()))) hostEl.value = 'localhost';
+      if (portEl && (!portEl.value || ['3306', '5432', '1433', '1521', '10000', '9090', '9870', '19090'].includes(String(portEl.value).trim()))) portEl.value = '9870';
+      if (userEl && (!userEl.value || ['root', 'hive', 'admin'].includes(String(userEl.value).trim()))) userEl.value = 'hadoop';
       // HDFS 通常不需要密码字段，隐藏 password input 与其 label（仅隐藏，不移除 DOM）
       const pwdEl = document.getElementById('dbPassword');
       if (pwdEl) {
@@ -792,11 +868,15 @@ function renderDbFields() {
       const dbNameEl = document.getElementById('dbName'); if (dbNameEl) { dbNameEl.disabled = true; const row = dbNameEl.closest('.row'); if (row) row.style.display = 'none'; }
       // hide table/list controls
       ["dbTableSelect", "dbTableInput", "dbWhere"].forEach((id) => { const el = document.getElementById(id); if (el) { el.disabled = true; const row = el.closest('.row'); if (row) row.style.display = 'none'; } });
-      // update dbPath label/placeholder for HDFS
+      // update dbPath label/placeholder/default for HDFS
       const dbPathLabel = document.getElementById('dbPathLabel');
       const dbPathInput = document.getElementById('dbPath');
       if (dbPathLabel) dbPathLabel.textContent = 'HDFS 路径';
-      if (dbPathInput) dbPathInput.placeholder = '例如 /user/data/*.parquet 或 /user/data/csv/';
+      if (dbPathInput) {
+        dbPathInput.placeholder = '例如 / 或 /user/data/csv/';
+        const currentPath = String(dbPathInput.value || '').trim();
+        if (!currentPath || currentPath === '/nifi') dbPathInput.value = '/';
+      }
     } catch (e) {
       // best-effort
     }
@@ -859,13 +939,12 @@ function renderDbFields() {
 // update it to the default for the selected dbType so UI reflects expected port.
 function syncPortWithDbType() {
   try {
-    const DEFAULT_PORTS = { mysql: 3306, postgresql: 5432, sqlserver: 1433, oracle: 1521, hive: 10000, hbase: 9090, hdfs: 9870 };
     const dbType = (document.getElementById('dbType')?.value || 'mysql').toLowerCase();
     const portEl = document.getElementById('dbPort');
     if (!portEl) return;
     const cur = (String(portEl.value || '').trim());
-    const known = Object.values(DEFAULT_PORTS).map(String);
-    const def = DEFAULT_PORTS[dbType] ? String(DEFAULT_PORTS[dbType]) : '';
+    const known = Object.values(DB_TYPE_DEFAULTS).map((item) => String(item.port || '')).filter(Boolean);
+    const def = DB_TYPE_DEFAULTS[dbType]?.port ? String(DB_TYPE_DEFAULTS[dbType].port) : '';
     if (cur === '' || known.includes(cur)) {
       if (def) portEl.value = def; else portEl.value = '';
     }
@@ -1114,11 +1193,18 @@ function bindEvents() {
   });
 }
 
-function init() {
+async function init() {
   try {
     const savedMode = localStorage.getItem(BACKEND_MODE_STORAGE_KEY);
     if (savedMode) {
       state.backendMode = savedMode === "nifi" ? "nifi" : "local";
+    }
+  } catch (_) {}
+  try {
+    const res = await getBackendModeState();
+    if (res && res.code === 0 && res.data && res.data.mode) {
+      state.backendMode = res.data.mode === "nifi" ? "nifi" : "local";
+      try { localStorage.setItem(BACKEND_MODE_STORAGE_KEY, state.backendMode); } catch (_) {}
     }
   } catch (_) {}
   updateBackendToggleUI();
@@ -1185,14 +1271,17 @@ function init() {
 }
 
 async function testDbConnection() {
-  const host = document.getElementById("dbHost").value.trim();
-  const port = Number(document.getElementById("dbPort").value || 3306);
-  const database = document.getElementById("dbName").value.trim();
-  const username = document.getElementById("dbUser").value.trim();
+  const dbType = (document.getElementById("dbType")?.value || "mysql").toLowerCase();
+  const defaults = DB_TYPE_DEFAULTS[dbType] || DB_TYPE_DEFAULTS.mysql;
+  const host = document.getElementById("dbHost").value.trim() || defaults.host;
+  const port = Number(document.getElementById("dbPort").value || defaults.port || 3306);
+  const database = (dbType === 'hdfs' || dbType === 'sqlite')
+    ? (document.getElementById("dbPath")?.value.trim() || (dbType === 'hdfs' ? '/' : ''))
+    : (document.getElementById("dbName").value.trim() || defaults.database || 'default');
+  const username = document.getElementById("dbUser").value.trim() || defaults.user;
   const password = document.getElementById("dbPassword").value;
   const status = document.getElementById("dbConnStatus");
   status.textContent = "测试中...";
-  const dbType = document.getElementById("dbType")?.value || "mysql";
   const payload = { db_type: dbType, host, port, username, password, database };
   const res = await api("/db/test-connection", {
     method: "POST",
@@ -1207,14 +1296,17 @@ async function testDbConnection() {
 }
 
 async function listTables() {
-  const host = document.getElementById("dbHost").value.trim();
-  const port = Number(document.getElementById("dbPort").value || 3306);
-  const database = document.getElementById("dbName").value.trim();
-  const username = document.getElementById("dbUser").value.trim();
+  const dbType = (document.getElementById("dbType")?.value || "mysql").toLowerCase();
+  const defaults = DB_TYPE_DEFAULTS[dbType] || DB_TYPE_DEFAULTS.mysql;
+  const host = document.getElementById("dbHost").value.trim() || defaults.host;
+  const port = Number(document.getElementById("dbPort").value || defaults.port || 3306);
+  const database = (dbType === 'hdfs' || dbType === 'sqlite')
+    ? (document.getElementById("dbPath")?.value.trim() || (dbType === 'hdfs' ? '/' : ''))
+    : (document.getElementById("dbName").value.trim() || defaults.database || 'default');
+  const username = document.getElementById("dbUser").value.trim() || defaults.user;
   const password = document.getElementById("dbPassword").value;
   const status = document.getElementById("dbConnStatus");
   status.textContent = "列出表中...";
-  const dbType = document.getElementById("dbType")?.value || "mysql";
   const payload = { db_type: dbType, host, port, username, password, database };
   const res = await api("/db/list-tables", {
     method: "POST",
@@ -1350,13 +1442,10 @@ if (fileInput && uploadBtn && uploadResult) {
       if (columns) {
         query.set("columns", columns);
       }
-      const resp = await fetch(
-        `${config.API_BASE}${selected.endpoint}?${query.toString()}`,
-        {
+      const data = await requestJson(`${selected.endpoint}?${query.toString()}`, {
         method: "POST",
         body: formData,
       });
-      const data = await resp.json();
       if (data.code === 0) {
         const sourcePath = data?.data?.sourcePath || data?.data?.storagePath || "";
         const targetPath = data?.data?.targetPath || "";

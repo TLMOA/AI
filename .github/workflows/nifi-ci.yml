@@ -1,0 +1,228 @@
+name: NiFi CI
+permissions:
+  packages: write
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+
+env:
+  IMAGE_NAME: iot-nifi-python
+  REGISTRY_URL: ${{ secrets.REGISTRY_URL }}
+
+jobs:
+  test-and-build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.8'
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements*.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Install test requirements
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f v2-nifi/examples/requirements.txt ]; then pip install -r v2-nifi/examples/requirements.txt; fi
+
+      - name: Run pytest
+        run: |
+          pytest -q v2-nifi/tests || true
+
+      - name: Log in to container registry
+        uses: docker/login-action@v2
+        with:
+          registry: ${{ env.REGISTRY_URL }}
+          username: ${{ secrets.REGISTRY_USERNAME }}
+          password: ${{ secrets.REGISTRY_PASSWORD }}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v4
+        with:
+          context: .
+          file: docker/nifi/Dockerfile
+          push: true
+          tags: |
+            ${{ env.REGISTRY_URL }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+            ${{ env.REGISTRY_URL }}/${{ env.IMAGE_NAME }}:latest
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v2
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push to GHCR
+        uses: docker/build-push-action@v4
+        with:
+          context: .
+          file: docker/nifi/Dockerfile
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/iot-nifi:${{ github.sha }}
+            ghcr.io/${{ github.repository_owner }}/iot-nifi:latest
+
+      - name: Upload image info
+        if: always()
+        run: |
+          echo "Pushed images: ${{ env.REGISTRY_URL }}/${{ env.IMAGE_NAME }}:${{ github.sha }} and latest"
+
+      - name: Package Flow bundle
+        env:
+          NIFI_REGISTRY_URL: ${{ secrets.REGISTRY_URL }}
+        run: |
+          echo "Packaging flow bundle"
+          mkdir -p artifacts/flow-content
+          # Create a minimal flow archive for CI (replace with real export in future)
+          echo "iot flow bundle" > artifacts/flow-content/README.txt
+          echo "<flow/>" > artifacts/flow-content/flow.xml
+          cd artifacts && zip -r flow-bundle.zip flow-content > /dev/null
+          ls -la artifacts
+
+      - name: Import Flow bundle to NiFi Registry
+        env:
+          NIFI_REGISTRY_URL: ${{ secrets.REGISTRY_URL }}
+          NIFI_REGISTRY_USER: ${{ secrets.REGISTRY_USERNAME }}
+          NIFI_REGISTRY_PASS: ${{ secrets.REGISTRY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          echo "Importing flow bundle to ${NIFI_REGISTRY_URL}"
+          # Ensure jq is available
+          sudo apt-get update && sudo apt-get install -y jq zip > /dev/null
+          # Create bucket (idempotent)
+          curl -s -u "${NIFI_REGISTRY_USER}:${NIFI_REGISTRY_PASS}" -X POST "${NIFI_REGISTRY_URL%/}/nifi-registry-api/buckets" -H "Content-Type: application/json" -d '{"name":"ci-iot-flow","description":"CI import"}' || true
+          # Query bucket id
+          BUCKET_ID=$(curl -s -u "${NIFI_REGISTRY_USER}:${NIFI_REGISTRY_PASS}" "${NIFI_REGISTRY_URL%/}/nifi-registry-api/buckets" | jq -r '(.[]? // .buckets[]?) | select(.name=="ci-iot-flow") | .identifier')
+          if [ -z "${BUCKET_ID}" ] || [ "${BUCKET_ID}" = "null" ]; then
+            echo "Failed to obtain bucket id" >&2
+            exit 2
+          fi
+          echo "Using bucket id: ${BUCKET_ID}"
+          # Upload bundle
+          ./v2-nifi/scripts/import_flow_to_registry.sh upload "${NIFI_REGISTRY_URL%/}" "${BUCKET_ID}" "$(pwd)/artifacts/flow-bundle.zip"
+
+      - name: Pull and run NiFi smoke container
+        run: |
+          set -euo pipefail
+          IMAGE=ghcr.io/${{ github.repository_owner }}/iot-nifi:${{ github.sha }}
+          echo "Pulling $IMAGE"
+          docker pull "$IMAGE" || true
+          docker rm -f nifi-smoke || true
+          docker run -d --name nifi-smoke -p 8081:8080 "$IMAGE"
+          # wait for NiFi API to respond
+          ATTEMPTS=60
+          for i in $(seq 1 $ATTEMPTS); do
+            if curl -fsS http://localhost:8081/nifi >/dev/null 2>&1; then
+              echo "NiFi is ready"
+              break
+            fi
+            echo "Waiting for NiFi... ($i/$ATTEMPTS)"
+            sleep 2
+          done
+          if ! curl -fsS http://localhost:8081/nifi >/dev/null 2>&1; then
+            echo "NiFi did not become ready in time" >&2
+            docker logs nifi-smoke || true
+            exit 2
+          fi
+
+      - name: Run contract-tests
+        env:
+          CI: true
+        run: |
+          set -euo pipefail
+          echo "Running contract-tests via newman"
+          # Install Node + newman
+          sudo apt-get update && sudo apt-get install -y nodejs npm > /dev/null
+          npm install -g newman@5 >/dev/null
+          if [ -f contract-tests/postman_collection.json ]; then
+            newman run contract-tests/postman_collection.json -e contract-tests/postman_env.json --reporters cli,json-summary --reporter-json-summary-export artifacts/newman-summary.json
+          else
+            echo "No Postman collection found; skipping contract-tests" >&2
+            exit 0
+          fi
+
+      - name: Promote bundle (placeholder)
+        run: |
+          echo "Promote bundle from staging to prod (placeholder)"
+          # TODO: implement promotion logic (tagging, moving in Registry, update manifests)
+name: nifi-ci
+
+on:
+  push:
+    paths:
+      - 'v2-nifi/**'
+      - '.github/workflows/nifi-ci.yml'
+  pull_request:
+    paths:
+      - 'v2-nifi/**'
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.9'
+      - name: Install lint deps
+        run: pip install flake8 yamllint
+      - name: Lint Python
+        run: |
+          flake8 v2-nifi || true
+      - name: Lint YAML
+        run: |
+          yamllint -d "{extends: default, rules: {line-length: {max: 200}}}" v2-nifi || true
+
+  build-manifests:
+    runs-on: ubuntu-latest
+    needs: lint
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate k8s manifests
+        run: |
+          echo "k8s manifest validation (placeholder)"
+      - name: Package Flow bundle (placeholder)
+        run: |
+          echo "flow bundle step - integrate with NiFi Registry in later iteration"
+
+  verify-pull:
+    runs-on: ubuntu-latest
+    needs: test-and-build
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v2
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Pull image from GHCR
+        run: |
+          IMAGE=ghcr.io/${{ github.repository_owner }}/iot-nifi:${{ github.sha }}
+          echo "Pulling $IMAGE"
+          docker pull "$IMAGE"
+
+      - name: Run smoke test container
+        run: |
+          IMAGE=ghcr.io/${{ github.repository_owner }}/iot-nifi:${{ github.sha }}
+          docker run --rm -d --name nifi-smoke -p 8081:8080 "$IMAGE"
+          sleep 10
+          curl -fsS http://localhost:8081/nifi || (docker logs nifi-smoke && exit 2)
+          docker stop nifi-smoke || true

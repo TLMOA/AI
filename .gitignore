@@ -41,6 +41,11 @@ logs/
 # Local generated data
 v1-backend/data/
 v1-backend/app/__pycache__/
+real_nifi_conf/archive/
+real_nifi_data/backup/*.meta.json*
+
+# Temporary shell scratch from failed command capture
+et -e
 
 # JetBrains / Maven / Java
 *.iml

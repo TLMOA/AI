@@ -11,6 +11,7 @@ window.APP_CONFIG = {
     }
   },
   DEFAULT_BACKEND_MODE: "local",
+  BACKEND_MODE_API: "api/v1/internal/backend-mode",
   USE_MOCK_API: false,
   FEATURE_FLAGS: {
     jetlinksAlarmPush: false,

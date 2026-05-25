@@ -1,5 +1,12 @@
 from sqlalchemy import create_engine
 from typing import Dict
+import warnings
+
+warnings.filterwarnings(
+    "ignore",
+    message=r"pkg_resources is deprecated as an API.*",
+    category=UserWarning,
+)
 try:
     import pyhive.hive
 except ImportError:
@@ -65,16 +72,20 @@ def engine_from_config(db_conf: Dict) -> any:
         port = port or 10000
         auth = db_conf.get("auth", "NOSASL")  # Default to no authentication
         database = database or "default"
-        
+
+        # NOSASL / non-LDAP modes reject password; only pass it when explicitly needed.
+        conn_kwargs = {
+            "host": host,
+            "port": port,
+            "username": user,
+            "database": database,
+            "auth": auth,
+        }
+        if password and str(auth).upper() in {"LDAP", "CUSTOM"}:
+            conn_kwargs["password"] = password
+
         # Create connection using PyHive
-        connection = pyhive.hive.Connection(
-            host=host,
-            port=port,
-            username=user,
-            password=password,
-            database=database,
-            auth=auth
-        )
+        connection = pyhive.hive.Connection(**conn_kwargs)
         return connection
     elif db_type == "hbase":
         if happybase is None:
