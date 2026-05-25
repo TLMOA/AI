@@ -1,0 +1,21 @@
+{
+  "fileId": "file_001",
+  "fileName": "sample.csv",
+  "sourceType": "upload",
+  "storageType": "tagged",
+  "storagePath": "/home/yhz/iot/real_nifi_data/output_csv/sample.csv",
+  "hasTag": true,
+  "tagColumn": "tag",
+  "tagName": "故障级别",
+  "tagRange": ["故障", "预警", "正常"],
+  "tagStrategy": "column_tag",
+  "tagRule": {
+    "ruleName": "按设备类型和状态打标",
+    "inputs": ["device_type", "status"],
+    "mapping": [
+      { "when": { "device_type": "A", "status": "bad" }, "tag": "故障" }
+    ]
+  },
+  "createdAt": "2026-05-22T10:00:00+08:00",
+  "updatedAt": "2026-05-22T10:00:00+08:00"
+}
