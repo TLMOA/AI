@@ -1636,6 +1636,10 @@ def _export_table_to_rows(conn, table: str, where: str = "") -> Tuple[List[str],
 
 def _register_and_return_meta(path: Path, fmt: str, job_id: Optional[str] = None) -> Dict[str, Any]:
     meta = register_existing_file(path, fmt)
+    try:
+        _write_meta_file(meta)
+    except Exception:
+        pass
     if job_id and job_id in jobs:
         jobs[job_id].setdefault("outputs", []).append(meta["fileId"])
     return meta
@@ -1702,7 +1706,55 @@ def register_existing_file(file_path: Path, file_format: str) -> Dict[str, Any]:
     except Exception:
         pass
 
+    # write companion meta.json to the same dir
+    try:
+        _write_meta_file(file_meta)
+    except Exception:
+        pass
+
     return file_meta
+
+
+def _write_meta_file(meta: Dict[str, Any], extra: Optional[Dict[str, Any]] = None) -> Path:
+    """Write a companion <file>.meta.json next to the file described by meta.
+    Merges existing meta file if present. Returns the Path written.
+    """
+    storage_path = meta.get("storagePath")
+    if not storage_path:
+        raise ValueError("meta missing storagePath")
+    p = Path(storage_path)
+    meta_path = Path(str(p) + ".meta.json")
+
+    # base structure following meta.schema.json
+    base = {
+        "fileId": meta.get("fileId"),
+        "fileName": meta.get("fileName", p.name),
+        "sourceType": meta.get("sourceType", "upload"),
+        "storageType": "tagged" if str(TAGGED_OUTPUT_DIR) in str(p) or "tagged" in str(p) else "plain",
+        "storagePath": str(p),
+        "hasTag": bool(meta.get("tagColumn") or meta.get("hasTag", False)),
+        "tagColumn": meta.get("tagColumn"),
+        "tagName": meta.get("tagName"),
+        "tagRange": meta.get("tagRange"),
+        "tagStrategy": meta.get("tagStrategy", "none"),
+        "tagRule": meta.get("tagRule"),
+        "createdAt": meta.get("createdAt", now_iso()),
+        "updatedAt": now_iso(),
+    }
+
+    # if existing meta file exists, merge
+    if meta_path.exists():
+        try:
+            existing = json.loads(meta_path.read_text(encoding="utf-8"))
+            base.update({k: v for k, v in existing.items() if v is not None})
+        except Exception:
+            pass
+
+    if extra:
+        base.update(extra)
+
+    meta_path.write_text(json.dumps(base, ensure_ascii=False, indent=2), encoding="utf-8")
+    return meta_path
 
 
 def _guess_file_format(file_path: Path) -> Optional[str]:
@@ -2272,7 +2324,11 @@ def manual_table_edit(req: ManualTableEditReq, request: Request, x_trace_id: Opt
 
 
 @app.post("/api/v1/files/upload")
-async def upload_file(file: UploadFile = UploadFileField(...)):
+async def upload_file(file: UploadFile = UploadFileField(...),
+                      hasTag: Optional[bool] = Query(default=None),
+                      tagColumn: Optional[str] = Query(default=None),
+                      tagName: Optional[str] = Query(default=None),
+                      tagRange: Optional[str] = Query(default=None)):
     # Compatibility endpoint: route CSV/JSON/TSV uploads to inbox dirs, others to GENERATED_DIR.
     filename = f"uploaded_{uuid.uuid4().hex[:8]}_{file.filename}"
     content = await file.read()
@@ -2283,20 +2339,44 @@ async def upload_file(file: UploadFile = UploadFileField(...)):
         dest.write_bytes(content)
         meta = register_existing_file(dest, "csv")
         try:
+            extra = {"sourceType": "upload"}
+            if hasTag is not None:
+                extra["hasTag"] = bool(hasTag)
+            if tagColumn:
+                extra["tagColumn"] = tagColumn
+            if tagName:
+                extra["tagName"] = tagName
+            if tagRange:
+                try:
+                    extra["tagRange"] = json.loads(tagRange)
+                except Exception:
+                    extra["tagRange"] = [t.strip() for t in str(tagRange).split(",") if t.strip()]
+            _write_meta_file(meta, extra)
+        except Exception:
+            pass
+        try:
             text = dest.read_text(encoding="utf-8")
             rows = []
             reader = csv.DictReader(text.splitlines())
             for r in reader:
                 rows.append(r)
-            if rows:
-                out_name = f"uploaded_user_csv_{now_ts()}.json"
-                out_path = CSV_TO_JSON_DIR / out_name
-                _write_ndjson(out_path, list(rows[0].keys()), rows)
-                _register_and_return_meta(out_path, "json")
-                out_tsv_name = f"uploaded_user_csv_{now_ts()}.tsv"
-                out_tsv_path = CSV_TO_TSV_DIR / out_tsv_name
-                _write_tsv(out_tsv_path, list(rows[0].keys()), rows)
-                _register_and_return_meta(out_tsv_path, "tsv")
+                if rows:
+                    out_name = f"uploaded_user_csv_{now_ts()}.json"
+                    out_path = CSV_TO_JSON_DIR / out_name
+                    _write_ndjson(out_path, list(rows[0].keys()), rows)
+                    meta2 = _register_and_return_meta(out_path, "json")
+                    try:
+                        _write_meta_file(meta2, extra)
+                    except Exception:
+                        pass
+                    out_tsv_name = f"uploaded_user_csv_{now_ts()}.tsv"
+                    out_tsv_path = CSV_TO_TSV_DIR / out_tsv_name
+                    _write_tsv(out_tsv_path, list(rows[0].keys()), rows)
+                    meta3 = _register_and_return_meta(out_tsv_path, "tsv")
+                    try:
+                        _write_meta_file(meta3, extra)
+                    except Exception:
+                        pass
         except Exception:
             pass
         return ok(meta, make_trace_id(None))
@@ -2305,6 +2385,22 @@ async def upload_file(file: UploadFile = UploadFileField(...)):
         dest = INBOX_JSON_DIR / filename
         dest.write_bytes(content)
         meta = register_existing_file(dest, "json")
+        try:
+            extra = {"sourceType": "upload"}
+            if hasTag is not None:
+                extra["hasTag"] = bool(hasTag)
+            if tagColumn:
+                extra["tagColumn"] = tagColumn
+            if tagName:
+                extra["tagName"] = tagName
+            if tagRange:
+                try:
+                    extra["tagRange"] = json.loads(tagRange)
+                except Exception:
+                    extra["tagRange"] = [t.strip() for t in str(tagRange).split(",") if t.strip()]
+            _write_meta_file(meta, extra)
+        except Exception:
+            pass
         try:
             text = dest.read_text(encoding="utf-8")
             lines = text.splitlines()
@@ -2325,11 +2421,19 @@ async def upload_file(file: UploadFile = UploadFileField(...)):
                 out_name = f"uploaded_user_json_{now_ts()}.csv"
                 out_path = JSON_TO_CSV_DIR / out_name
                 _write_csv(out_path, cols, objs)
-                _register_and_return_meta(out_path, "csv")
+                meta2 = _register_and_return_meta(out_path, "csv")
+                try:
+                    _write_meta_file(meta2, extra)
+                except Exception:
+                    pass
                 out_tsv_name = f"uploaded_user_json_{now_ts()}.tsv"
                 out_tsv_path = JSON_TO_TSV_DIR / out_tsv_name
                 _write_tsv(out_tsv_path, cols, objs)
-                _register_and_return_meta(out_tsv_path, "tsv")
+                meta3 = _register_and_return_meta(out_tsv_path, "tsv")
+                try:
+                    _write_meta_file(meta3, extra)
+                except Exception:
+                    pass
         except Exception:
             pass
         return ok(meta, make_trace_id(None))
@@ -2338,6 +2442,22 @@ async def upload_file(file: UploadFile = UploadFileField(...)):
         dest = INBOX_TSV_DIR / filename
         dest.write_bytes(content)
         meta = register_existing_file(dest, "tsv")
+        try:
+            extra = {"sourceType": "upload"}
+            if hasTag is not None:
+                extra["hasTag"] = bool(hasTag)
+            if tagColumn:
+                extra["tagColumn"] = tagColumn
+            if tagName:
+                extra["tagName"] = tagName
+            if tagRange:
+                try:
+                    extra["tagRange"] = json.loads(tagRange)
+                except Exception:
+                    extra["tagRange"] = [t.strip() for t in str(tagRange).split(",") if t.strip()]
+            _write_meta_file(meta, extra)
+        except Exception:
+            pass
         try:
             lines = dest.read_text(encoding="utf-8").splitlines()
             if lines:
@@ -2350,11 +2470,19 @@ async def upload_file(file: UploadFile = UploadFileField(...)):
                     out_json_name = f"uploaded_user_tsv_{now_ts()}.json"
                     out_json_path = TSV_TO_JSON_DIR / out_json_name
                     _write_ndjson(out_json_path, header, rows)
-                    _register_and_return_meta(out_json_path, "json")
+                    meta2 = _register_and_return_meta(out_json_path, "json")
+                    try:
+                        _write_meta_file(meta2, extra)
+                    except Exception:
+                        pass
                     out_csv_name = f"uploaded_user_tsv_{now_ts()}.csv"
                     out_csv_path = TSV_TO_CSV_DIR / out_csv_name
                     _write_csv(out_csv_path, header, rows)
-                    _register_and_return_meta(out_csv_path, "csv")
+                    meta3 = _register_and_return_meta(out_csv_path, "csv")
+                    try:
+                        _write_meta_file(meta3, extra)
+                    except Exception:
+                        pass
         except Exception:
             pass
         return ok(meta, make_trace_id(None))
@@ -2373,6 +2501,10 @@ async def upload_with_mode(request: Request,
                            username: Optional[str] = Query(default="user"),
                            convertType: Optional[str] = Query(default=None),
                            columns: Optional[str] = Query(default=None),
+                           hasTag: Optional[bool] = Query(default=None),
+                           tagColumn: Optional[str] = Query(default=None),
+                           tagName: Optional[str] = Query(default=None),
+                           tagRange: Optional[str] = Query(default=None),
                            x_trace_id: Optional[str] = Header(default=None)):
     """Unified upload that supports conversionMode: local | nifi | both.
     For PoC: local mode runs a demo conversion (create_demo_file), nifi mode writes file to inbox and leaves job pending.
@@ -2411,7 +2543,23 @@ async def upload_with_mode(request: Request,
     suffix = Path(file.filename or "").suffix.lower()
     saved_path = GENERATED_DIR / filename
     saved_path.write_bytes(content)
-    register_existing_file(saved_path, suffix.lstrip('.') or 'file')
+    meta_saved = register_existing_file(saved_path, suffix.lstrip('.') or 'file')
+    try:
+        extra = {"sourceType": "upload"}
+        if hasTag is not None:
+            extra["hasTag"] = bool(hasTag)
+        if tagColumn:
+            extra["tagColumn"] = tagColumn
+        if tagName:
+            extra["tagName"] = tagName
+        if tagRange:
+            try:
+                extra["tagRange"] = json.loads(tagRange)
+            except Exception:
+                extra["tagRange"] = [t.strip() for t in str(tagRange).split(",") if t.strip()]
+        _write_meta_file(meta_saved, extra)
+    except Exception:
+        pass
 
     import asyncio
 
@@ -2503,6 +2651,10 @@ async def upload_inbox_csv(
     username: Optional[str] = Query(default="user"),
     convertType: Optional[str] = Query(default="csv_to_json"),
     columns: Optional[str] = Query(default=None),
+    hasTag: Optional[bool] = Query(default=None),
+    tagColumn: Optional[str] = Query(default=None),
+    tagName: Optional[str] = Query(default=None),
+    tagRange: Optional[str] = Query(default=None),
 ):
     trace_id = request.state.trace_id
     filename = f"{username}_{uuid.uuid4().hex[:8]}_{file.filename}"
@@ -2545,17 +2697,38 @@ async def upload_inbox_csv(
 
         if rows:
             convert = (convertType or "csv_to_json").lower()
+            extra = {"sourceType": "upload"}
+            if hasTag is not None:
+                extra["hasTag"] = bool(hasTag)
+            if tagColumn:
+                extra["tagColumn"] = tagColumn
+            if tagName:
+                extra["tagName"] = tagName
+            if tagRange:
+                try:
+                    extra["tagRange"] = json.loads(tagRange)
+                except Exception:
+                    extra["tagRange"] = [t.strip() for t in str(tagRange).split(",") if t.strip()]
+
             if convert == "csv_to_tsv":
                 out_name = f"uploaded_{username}_csv_{now_ts()}.tsv"
                 out_path = CSV_TO_TSV_DIR / out_name
                 _write_tsv(out_path, cols, rows)
-                _register_and_return_meta(out_path, "tsv")
+                meta2 = _register_and_return_meta(out_path, "tsv")
+                try:
+                    _write_meta_file(meta2, extra)
+                except Exception:
+                    pass
                 target_path = str(out_path)
             else:
                 out_name = f"uploaded_{username}_csv_{now_ts()}.json"
                 out_path = CSV_TO_JSON_DIR / out_name
                 _write_ndjson(out_path, cols, rows)
-                _register_and_return_meta(out_path, "json")
+                meta2 = _register_and_return_meta(out_path, "json")
+                try:
+                    _write_meta_file(meta2, extra)
+                except Exception:
+                    pass
                 target_path = str(out_path)
     except Exception as ex:
         request.state.observation = {
@@ -2594,6 +2767,10 @@ async def upload_inbox_json(
     file: UploadFile = UploadFileField(...),
     username: Optional[str] = Query(default="user"),
     convertType: Optional[str] = Query(default="json_to_csv"),
+    hasTag: Optional[bool] = Query(default=None),
+    tagColumn: Optional[str] = Query(default=None),
+    tagName: Optional[str] = Query(default=None),
+    tagRange: Optional[str] = Query(default=None),
 ):
     trace_id = request.state.trace_id
     filename = f"{username}_{uuid.uuid4().hex[:8]}_{file.filename}"
@@ -2622,17 +2799,38 @@ async def upload_inbox_json(
         if objs:
             cols = sorted({k for o in objs for k in o.keys()})
             convert = (convertType or "json_to_csv").lower()
+            extra = {"sourceType": "upload"}
+            if hasTag is not None:
+                extra["hasTag"] = bool(hasTag)
+            if tagColumn:
+                extra["tagColumn"] = tagColumn
+            if tagName:
+                extra["tagName"] = tagName
+            if tagRange:
+                try:
+                    extra["tagRange"] = json.loads(tagRange)
+                except Exception:
+                    extra["tagRange"] = [t.strip() for t in str(tagRange).split(",") if t.strip()]
+
             if convert == "json_to_tsv":
                 out_name = f"uploaded_{username}_json_{now_ts()}.tsv"
                 out_path = JSON_TO_TSV_DIR / out_name
                 _write_tsv(out_path, cols, objs)
-                _register_and_return_meta(out_path, "tsv")
+                meta2 = _register_and_return_meta(out_path, "tsv")
+                try:
+                    _write_meta_file(meta2, extra)
+                except Exception:
+                    pass
                 target_path = str(out_path)
             else:
                 out_name = f"uploaded_{username}_json_{now_ts()}.csv"
                 out_path = JSON_TO_CSV_DIR / out_name
                 _write_csv(out_path, cols, objs)
-                _register_and_return_meta(out_path, "csv")
+                meta2 = _register_and_return_meta(out_path, "csv")
+                try:
+                    _write_meta_file(meta2, extra)
+                except Exception:
+                    pass
                 target_path = str(out_path)
     except Exception as ex:
         request.state.observation = {
@@ -2672,6 +2870,10 @@ async def upload_inbox_tsv(
     username: Optional[str] = Query(default="user"),
     convertType: Optional[str] = Query(default="tsv_to_json"),
     columns: Optional[str] = Query(default=None),
+    hasTag: Optional[bool] = Query(default=None),
+    tagColumn: Optional[str] = Query(default=None),
+    tagName: Optional[str] = Query(default=None),
+    tagRange: Optional[str] = Query(default=None),
 ):
     trace_id = request.state.trace_id
     filename = f"{username}_{uuid.uuid4().hex[:8]}_{file.filename}"
@@ -2707,17 +2909,38 @@ async def upload_inbox_tsv(
                 }
                 return err(1002401, "tsv has no data rows; if file has no header please provide columns", trace_id)
             convert = (convertType or "tsv_to_json").lower()
+            extra = {"sourceType": "upload"}
+            if hasTag is not None:
+                extra["hasTag"] = bool(hasTag)
+            if tagColumn:
+                extra["tagColumn"] = tagColumn
+            if tagName:
+                extra["tagName"] = tagName
+            if tagRange:
+                try:
+                    extra["tagRange"] = json.loads(tagRange)
+                except Exception:
+                    extra["tagRange"] = [t.strip() for t in str(tagRange).split(",") if t.strip()]
+
             if convert == "tsv_to_csv":
                 out_name = f"uploaded_{username}_tsv_{now_ts()}.csv"
                 out_path = TSV_TO_CSV_DIR / out_name
                 _write_csv(out_path, header, rows)
-                _register_and_return_meta(out_path, "csv")
+                meta2 = _register_and_return_meta(out_path, "csv")
+                try:
+                    _write_meta_file(meta2, extra)
+                except Exception:
+                    pass
                 target_path = str(out_path)
             else:
                 out_name = f"uploaded_{username}_tsv_{now_ts()}.json"
                 out_path = TSV_TO_JSON_DIR / out_name
                 _write_ndjson(out_path, header, rows)
-                _register_and_return_meta(out_path, "json")
+                meta2 = _register_and_return_meta(out_path, "json")
+                try:
+                    _write_meta_file(meta2, extra)
+                except Exception:
+                    pass
                 target_path = str(out_path)
         else:
             return err(1002401, "tsv header is empty; please provide columns", trace_id)
@@ -2765,7 +2988,11 @@ class MySQLExportReq(BaseModel):
 
 
 @app.post("/api/v1/export/mysql")
-def export_mysql(req: MySQLExportReq, request: Request, x_trace_id: Optional[str] = Header(default=None)):
+def export_mysql(req: MySQLExportReq, request: Request, x_trace_id: Optional[str] = Header(default=None),
+                 hasTag: Optional[bool] = Query(default=None),
+                 tagColumn: Optional[str] = Query(default=None),
+                 tagName: Optional[str] = Query(default=None),
+                 tagRange: Optional[str] = Query(default=None)):
     trace_id = request.state.trace_id
     mode = _current_backend_mode()
     cookie = request.cookies.get("access_token")
@@ -2875,6 +3102,22 @@ def export_mysql(req: MySQLExportReq, request: Request, x_trace_id: Optional[str
             out_path.replace(latest_path)
         reg_path = out_path if out_path.exists() else latest_path
         meta = _register_and_return_meta(reg_path, "csv")
+        try:
+            extra = {"sourceType": "db_export"}
+            if hasTag is not None:
+                extra["hasTag"] = bool(hasTag)
+            if tagColumn:
+                extra["tagColumn"] = tagColumn
+            if tagName:
+                extra["tagName"] = tagName
+            if tagRange:
+                try:
+                    extra["tagRange"] = json.loads(tagRange)
+                except Exception:
+                    extra["tagRange"] = [t.strip() for t in str(tagRange).split(",") if t.strip()]
+            _write_meta_file(meta, extra)
+        except Exception:
+            pass
     elif fmt == "tsv":
         out_path = primary_dir / f"{base_name}.tsv"
         _write_tsv(out_path, cols, rows, append=False)
@@ -2885,6 +3128,22 @@ def export_mysql(req: MySQLExportReq, request: Request, x_trace_id: Optional[str
             out_path.replace(latest_path)
         reg_path = out_path if out_path.exists() else latest_path
         meta = _register_and_return_meta(reg_path, "tsv")
+        try:
+            extra = {"sourceType": "db_export"}
+            if hasTag is not None:
+                extra["hasTag"] = bool(hasTag)
+            if tagColumn:
+                extra["tagColumn"] = tagColumn
+            if tagName:
+                extra["tagName"] = tagName
+            if tagRange:
+                try:
+                    extra["tagRange"] = json.loads(tagRange)
+                except Exception:
+                    extra["tagRange"] = [t.strip() for t in str(tagRange).split(",") if t.strip()]
+            _write_meta_file(meta, extra)
+        except Exception:
+            pass
     else:
         out_path = primary_dir / f"{base_name}.json"
         _write_ndjson(out_path, cols, rows, append=False)
@@ -2895,6 +3154,22 @@ def export_mysql(req: MySQLExportReq, request: Request, x_trace_id: Optional[str
             out_path.replace(latest_path)
         reg_path = out_path if out_path.exists() else latest_path
         meta = _register_and_return_meta(reg_path, "json")
+        try:
+            extra = {"sourceType": "db_export"}
+            if hasTag is not None:
+                extra["hasTag"] = bool(hasTag)
+            if tagColumn:
+                extra["tagColumn"] = tagColumn
+            if tagName:
+                extra["tagName"] = tagName
+            if tagRange:
+                try:
+                    extra["tagRange"] = json.loads(tagRange)
+                except Exception:
+                    extra["tagRange"] = [t.strip() for t in str(tagRange).split(",") if t.strip()]
+            _write_meta_file(meta, extra)
+        except Exception:
+            pass
 
     payload = {"file": meta}
     payload = _with_observation(
@@ -3045,6 +3320,26 @@ def export_generic(body: Dict[str, Any], request: Request):
                             reg_path = res_path
 
                 meta = _register_and_return_meta(reg_path, fmt)
+                try:
+                    extra = {"sourceType": body.get("sourceType") or "db_export"}
+                    if "hasTag" in body:
+                        extra["hasTag"] = bool(body.get("hasTag"))
+                    if body.get("tagColumn"):
+                        extra["tagColumn"] = body.get("tagColumn")
+                    if body.get("tagName"):
+                        extra["tagName"] = body.get("tagName")
+                    if body.get("tagRange"):
+                        tr = body.get("tagRange")
+                        if isinstance(tr, str):
+                            try:
+                                extra["tagRange"] = json.loads(tr)
+                            except Exception:
+                                extra["tagRange"] = [t.strip() for t in tr.split(",") if t.strip()]
+                        else:
+                            extra["tagRange"] = tr
+                    _write_meta_file(meta, extra)
+                except Exception:
+                    pass
                 return ok({"file": meta}, trace_id)
             except Exception:
                 return ok({"path": res.get("path"), "status": res.get("status")}, trace_id)

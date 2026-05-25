@@ -751,9 +751,9 @@ function collectDbConfigForSchedule() {
   const dsn = dsnEl && String(dsnEl.value).trim();
   const DEFAULT_PORTS = { mysql: 3306, postgresql: 5432, sqlserver: 1433, oracle: 1521 };
   // add common Hadoop-related defaults: Hive thrift, HBase thrift, WebHDFS
-  // HIVE: 10000 (Thrift/Beeswax), HBASE: 9090 (Thrift), HDFS(WebHDFS): 9870/50070 (use 9870 modern)
+  // HIVE: 10000 (Thrift/Beeswax), HBASE: 19090 (host-mapped Thrift), HDFS(WebHDFS): 9870/50070 (use 9870 modern)
   DEFAULT_PORTS.hive = 10000;
-  DEFAULT_PORTS.hbase = 9090;
+  DEFAULT_PORTS.hbase = 19090;
   DEFAULT_PORTS.hdfs = 9870;
   const conf = {
     db_type: db_type,
@@ -772,13 +772,50 @@ function collectDbConfigForSchedule() {
   return conf;
 }
 
+const DB_TYPE_DEFAULTS = {
+  mysql: { host: '127.0.0.1', port: '3306', user: 'root', database: 'nifi', password: 'root' },
+  postgres: { host: '127.0.0.1', port: '5432', user: 'postgres', database: 'postgres', password: '' },
+  postgresql: { host: '127.0.0.1', port: '5432', user: 'postgres', database: 'postgres', password: '' },
+  sqlserver: { host: '127.0.0.1', port: '1433', user: 'sa', database: 'master', password: '' },
+  oracle: { host: '127.0.0.1', port: '1521', user: 'system', database: 'XE', password: '' },
+  sqlite: { host: '', port: '', user: '', database: '', password: '' },
+  hive: { host: 'localhost', port: '10000', user: 'hive', database: 'default', password: '' },
+  hdfs: { host: 'localhost', port: '9870', user: 'hadoop', database: '/', password: '', path: '/' },
+  hbase: { host: 'localhost', port: '19090', user: 'root', database: 'default', password: '' },
+};
+
+function applyDbTypeDefaults() {
+  const dbType = (document.getElementById("dbType")?.value || "mysql").toLowerCase();
+  const defaults = DB_TYPE_DEFAULTS[dbType] || DB_TYPE_DEFAULTS.mysql;
+  const previousType = window.__lastDbType || '';
+  const previousDefaults = DB_TYPE_DEFAULTS[previousType] || {};
+  const allKnownValues = (key) => Array.from(new Set(Object.values(DB_TYPE_DEFAULTS).map((item) => item[key]).filter((v) => v !== undefined && v !== null).map(String)));
+  const maybeSet = (id, key) => {
+    const el = document.getElementById(id);
+    if (!el || defaults[key] === undefined) return;
+    const current = String(el.value || '').trim();
+    const previous = previousDefaults[key] !== undefined ? String(previousDefaults[key]) : '';
+    const known = allKnownValues(key);
+    if (!current || current === previous || known.includes(current)) {
+      el.value = defaults[key];
+    }
+  };
+  maybeSet('dbHost', 'host');
+  maybeSet('dbPort', 'port');
+  maybeSet('dbUser', 'user');
+  maybeSet('dbPassword', 'password');
+  maybeSet('dbName', 'database');
+  if (dbType === 'hdfs') maybeSet('dbPath', 'path');
+  window.__lastDbType = dbType;
+}
+
 // Render DB-specific fields and DSN-priority behavior
 function renderDbFields() {
+  applyDbTypeDefaults();
   const dbType = (document.getElementById("dbType")?.value || "mysql").toLowerCase();
   const dsn = (document.getElementById("dbDSN")?.value || "").trim();
-  const DEFAULT_PORTS = { mysql: 3306, postgresql: 5432, sqlserver: 1433, oracle: 1521, sqlite: '', hive: 10000, hbase: 9090, hdfs: 9870 };
+  const DEFAULT_PORTS = Object.fromEntries(Object.entries(DB_TYPE_DEFAULTS).map(([key, value]) => [key, value.port]));
   const dbPathRow = document.getElementById("dbPathRow");
-  const hostInputs = ["dbHost", "dbPort", "dbUser", "dbPassword", "dbName", "dbTableSelect", "dbTableInput", "dbWhere", "dbExportFormat", "dbAppendLatest", "dbTestBtn", "dbListBtn"];
   // Render fields per dbType
   if (dbType === "sqlite") {
     if (dbPathRow) dbPathRow.style.display = '';
@@ -807,7 +844,7 @@ function renderDbFields() {
       const portEl = document.getElementById('dbPort');
       const userEl = document.getElementById('dbUser');
       if (hostEl && (!hostEl.value || ['127.0.0.1', 'localhost'].includes(String(hostEl.value).trim()))) hostEl.value = 'localhost';
-      if (portEl && (!portEl.value || ['3306', '5432', '1433', '1521', '10000', '9090', '9870'].includes(String(portEl.value).trim()))) portEl.value = '9870';
+      if (portEl && (!portEl.value || ['3306', '5432', '1433', '1521', '10000', '9090', '9870', '19090'].includes(String(portEl.value).trim()))) portEl.value = '9870';
       if (userEl && (!userEl.value || ['root', 'hive', 'admin'].includes(String(userEl.value).trim()))) userEl.value = 'hadoop';
       // HDFS 通常不需要密码字段，隐藏 password input 与其 label（仅隐藏，不移除 DOM）
       const pwdEl = document.getElementById('dbPassword');
@@ -892,13 +929,12 @@ function renderDbFields() {
 // update it to the default for the selected dbType so UI reflects expected port.
 function syncPortWithDbType() {
   try {
-    const DEFAULT_PORTS = { mysql: 3306, postgresql: 5432, sqlserver: 1433, oracle: 1521, hive: 10000, hbase: 9090, hdfs: 9870 };
     const dbType = (document.getElementById('dbType')?.value || 'mysql').toLowerCase();
     const portEl = document.getElementById('dbPort');
     if (!portEl) return;
     const cur = (String(portEl.value || '').trim());
-    const known = Object.values(DEFAULT_PORTS).map(String);
-    const def = DEFAULT_PORTS[dbType] ? String(DEFAULT_PORTS[dbType]) : '';
+    const known = Object.values(DB_TYPE_DEFAULTS).map((item) => String(item.port || '')).filter(Boolean);
+    const def = DB_TYPE_DEFAULTS[dbType]?.port ? String(DB_TYPE_DEFAULTS[dbType].port) : '';
     if (cur === '' || known.includes(cur)) {
       if (def) portEl.value = def; else portEl.value = '';
     }
@@ -1225,14 +1261,15 @@ async function init() {
 }
 
 async function testDbConnection() {
-  const host = document.getElementById("dbHost").value.trim();
-  const port = Number(document.getElementById("dbPort").value || 3306);
-  const database = document.getElementById("dbName").value.trim();
-  const username = document.getElementById("dbUser").value.trim();
+  const dbType = (document.getElementById("dbType")?.value || "mysql").toLowerCase();
+  const defaults = DB_TYPE_DEFAULTS[dbType] || DB_TYPE_DEFAULTS.mysql;
+  const host = document.getElementById("dbHost").value.trim() || defaults.host;
+  const port = Number(document.getElementById("dbPort").value || defaults.port || 3306);
+  const database = dbType === 'hdfs' ? (document.getElementById("dbPath")?.value.trim() || '/') : (document.getElementById("dbName").value.trim() || defaults.database || 'default');
+  const username = document.getElementById("dbUser").value.trim() || defaults.user;
   const password = document.getElementById("dbPassword").value;
   const status = document.getElementById("dbConnStatus");
   status.textContent = "测试中...";
-  const dbType = document.getElementById("dbType")?.value || "mysql";
   const payload = { db_type: dbType, host, port, username, password, database };
   const res = await api("/db/test-connection", {
     method: "POST",
@@ -1247,14 +1284,15 @@ async function testDbConnection() {
 }
 
 async function listTables() {
-  const host = document.getElementById("dbHost").value.trim();
-  const port = Number(document.getElementById("dbPort").value || 3306);
-  const database = document.getElementById("dbName").value.trim();
-  const username = document.getElementById("dbUser").value.trim();
+  const dbType = (document.getElementById("dbType")?.value || "mysql").toLowerCase();
+  const defaults = DB_TYPE_DEFAULTS[dbType] || DB_TYPE_DEFAULTS.mysql;
+  const host = document.getElementById("dbHost").value.trim() || defaults.host;
+  const port = Number(document.getElementById("dbPort").value || defaults.port || 3306);
+  const database = dbType === 'hdfs' ? (document.getElementById("dbPath")?.value.trim() || '/') : (document.getElementById("dbName").value.trim() || defaults.database || 'default');
+  const username = document.getElementById("dbUser").value.trim() || defaults.user;
   const password = document.getElementById("dbPassword").value;
   const status = document.getElementById("dbConnStatus");
   status.textContent = "列出表中...";
-  const dbType = document.getElementById("dbType")?.value || "mysql";
   const payload = { db_type: dbType, host, port, username, password, database };
   const res = await api("/db/list-tables", {
     method: "POST",

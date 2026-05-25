@@ -120,10 +120,10 @@ sudo ./enable_nifi_nginx.sh <HOST_IP>
 
 ```bash
 # 浏览器访问
-https://<HOST_IP>/nifi/
+https://<HOST_IP>:9443/nifi/
 
 # API 验证
-curl -k -I https://<HOST_IP>/nifi-api
+curl -k -I https://<HOST_IP>:9443/nifi-api
 ```
 
 登录说明：
