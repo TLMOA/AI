@@ -15,7 +15,7 @@ API / 契约
 - 响应壳：`{ code, message, data: { jobId }, traceId }`
 
 任务 JSON（写入 inbox 示例）
-- 文件路径：`/home/yhz/iot/real_nifi_data/export_jobs/inbox/{jobId}.json`
+- 文件路径：`/home/yhz/real_nifi_data/export_jobs/inbox/{jobId}.json`
 - 示例：
   ```json
   {

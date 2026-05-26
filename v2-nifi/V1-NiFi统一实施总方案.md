@@ -174,8 +174,8 @@
 - 逻辑目录集合（必须统一）：`output_csv|output_json|output_tsv|inbox_csv|inbox_json|inbox_tsv|*_to_*|tagged_output`。  
 - 物理映射：Local 与 NiFi 分别映射到不同根目录，前端仅识别逻辑目录。  
 - 写入原则：临时文件 -> 完整性校验 -> 原子重命名；幂等键为 `jobId+targetPath`。
-- 物理映射补充：本地后端建议使用 `nifi_data`，NiFi 后端相关文件统一落到 `/home/yhz/iot/real_nifi_data`，两者在物理上并列隔离、逻辑目录一致。
-- 写入原则补充：任何 NiFi 产物写入前应先生成临时文件、完成校验后再落到 `/home/yhz/iot/real_nifi_data` 对应逻辑子目录。
+- 物理映射补充：本地后端建议使用 `/home/yhz/nifi-data`，NiFi 后端相关文件统一落到 `/home/yhz/real_nifi_data`，两者在物理上并列隔离、逻辑目录一致。
+- 写入原则补充：任何 NiFi 产物写入前应先生成临时文件、完成校验后再落到 `/home/yhz/real_nifi_data` 对应逻辑子目录。
 
 ## 7. 三阶段执行路线（简明）
 

@@ -131,11 +131,11 @@ Local 和 NiFi 必须共用同一套响应壳、错误码、文件元数据和�
 
 ## 六、存储落地约定
 
-1. NiFi 后端相关文件统一落到 `/home/yhz/iot/real_nifi_data`。
-2. Local 后端文件仍按本地实现目录管理，但对前端暴露时必须走统一逻辑目录。
+1. NiFi 后端相关文件统一落到 `/home/yhz/real_nifi_data`。
+2. Local 后端相关文件统一落到 `/home/yhz/nifi-data`。
 3. 前端不得直接依赖物理路径，只能识别逻辑目录与统一接口返回。
-4. 任何新增的 NiFi 输出、转换、打标、导出结果，都应优先写入 `/home/yhz/iot/real_nifi_data` 下的对应子目录。
-5. 若后续需要目录扩展，必须保持与 `nifi_data` 的逻辑目录映射一致。
+4. 任何新增的 NiFi 输出、转换、打标、导出结果，都应优先写入 `/home/yhz/real_nifi_data` 下的对应子目录。
+5. 若后续需要目录扩展，必须保持与 `/home/yhz/nifi-data` 的逻辑目录映射一致。
 
 ## 七、主要风险
 
@@ -177,7 +177,7 @@ Local 和 NiFi 必须共用同一套响应壳、错误码、文件元数据和�
 4. 不自动部署：后端不创建新 Flow，不自动拉起容器，不在运行时做复杂编排。
 5. 单机 NiFi MVP 优先：先跑通 Docker 单机 NiFi 和固定 Flow，再考虑 Registry、集群、HA。
 6. Local 与 NiFi 共享逻辑目录，但物理目录必须隔离。
-7. NiFi 后端统一使用 `/home/yhz/iot/real_nifi_data` 作为宿主机数据根目录。
+7. NiFi 后端统一使用 `/home/yhz/real_nifi_data` 作为宿主机数据根目录。
 8. 若 NiFi 不可用，明确返回错误或按配置回退 Local，不做静默自动修复。
 
 ### 7.5.2 NiFi 容器与目录前置准备
@@ -185,16 +185,16 @@ Local 和 NiFi 必须共用同一套响应壳、错误码、文件元数据和�
 需要先在宿主机创建以下目录，并由运维或脚本提前启动 NiFi 容器及固定 Flow：
 
 ```bash
-mkdir -p /home/yhz/iot/real_nifi_data/export_jobs/inbox
-mkdir -p /home/yhz/iot/real_nifi_data/export_jobs/done
-mkdir -p /home/yhz/iot/real_nifi_data/export_jobs/error
-mkdir -p /home/yhz/iot/real_nifi_data/output_csv
-mkdir -p /home/yhz/iot/real_nifi_data/output_json
-mkdir -p /home/yhz/iot/real_nifi_data/output_tsv
-mkdir -p /home/yhz/iot/real_nifi_data/inbox_csv
-mkdir -p /home/yhz/iot/real_nifi_data/inbox_json
-mkdir -p /home/yhz/iot/real_nifi_data/inbox_tsv
-mkdir -p /home/yhz/iot/real_nifi_data/tagged_output
+mkdir -p /home/yhz/real_nifi_data/export_jobs/inbox
+mkdir -p /home/yhz/real_nifi_data/export_jobs/done
+mkdir -p /home/yhz/real_nifi_data/export_jobs/error
+mkdir -p /home/yhz/real_nifi_data/output_csv
+mkdir -p /home/yhz/real_nifi_data/output_json
+mkdir -p /home/yhz/real_nifi_data/output_tsv
+mkdir -p /home/yhz/real_nifi_data/inbox_csv
+mkdir -p /home/yhz/real_nifi_data/inbox_json
+mkdir -p /home/yhz/real_nifi_data/inbox_tsv
+mkdir -p /home/yhz/real_nifi_data/tagged_output
 ```
 
 ### 7.5.3 后端只做 NiFi 就绪检查与 Flow 控制
@@ -218,7 +218,7 @@ mkdir -p /home/yhz/iot/real_nifi_data/tagged_output
 docker run -d \
   --name iot-nifi \
   -p 8080:8080 \
-  -v /home/yhz/iot/real_nifi_data:/opt/nifi/nifi-current/data/iot \
+   -v /home/yhz/real_nifi_data:/opt/nifi/nifi-current/data/iot \
   apache/nifi:latest
 ```
 
@@ -298,7 +298,7 @@ Flow 标识建议：
 3. 调用 `ensure_export_flow()`，确认数据库导出 Flow 已存在且可用。
 4. 调用 `start_existing_flow()`，启用该 Flow 开始处理。
 5. 生成数据库导出任务 JSON。
-6. 写入 `/home/yhz/iot/real_nifi_data/export_jobs/inbox/{jobId}.json`。
+6. 写入 `/home/yhz/real_nifi_data/export_jobs/inbox/{jobId}.json`。
 7. 返回前端 `PENDING` / `已提交到 NiFi` 状态。
 8. 后端扫描 `done/error`，或由定时任务同步结果。
 9. 若 NiFi 成功输出文件，则注册 fileId，并供前端预览、下载、追踪。
@@ -347,18 +347,18 @@ Flow 标识建议：
 - 当 `backend_mode=nifi` 且 NiFi 容器未运行时，后端应返回明确的不可用错误或按部署配置回退到 `local`，不得默认自动创建新容器
 - 当数据库导出 Flow 不存在时，后端应记录审计并返回 Flow 不可用；Flow 的部署由运维/发布流程负责，后端不应默认自动创建新 Flow
 - 当数据库导出 Flow 已存在时，后端不得重复创建 Flow，必须复用并确保其处于运行或已启用状态（可由后端启停既有 Flow）
-- 点击数据库导出后，任务 JSON 能自动进入 `/home/yhz/iot/real_nifi_data/export_jobs/inbox`
-- NiFi 能自动消费任务并将结果写入 `/home/yhz/iot/real_nifi_data/output_csv|output_json|output_tsv`
-- NiFi 能写入 `/home/yhz/iot/real_nifi_data/export_jobs/done|error` 状态文件
+- 点击数据库导出后，任务 JSON 能自动进入 `/home/yhz/real_nifi_data/export_jobs/inbox`
+- NiFi 能自动消费任务并将结果写入 `/home/yhz/real_nifi_data/output_csv|output_json|output_tsv`
+- NiFi 能写入 `/home/yhz/real_nifi_data/export_jobs/done|error` 状态文件
 - 后端能同步 NiFi 状态文件并注册 fileId
 - 启动/停止既有 Flow、任务提交、失败回退等关键操作必须记录审计日志
  - 数据库导出、上传转换、定时导出、自动打标能按模式正确路由
  - 当 `backend_mode=nifi` 且 NiFi 容器未运行时，后端应返回明确的不可用错误或按部署配置回退到 `local`，不得在未获运维授权的情况下自动创建新容器
  - 当数据库导出 Flow 不存在时，后端应记录审计并返回 Flow 不可用；Flow 的部署由运维/发布流程负责，后端不应自动创建新 Flow
  - 当数据库导出 Flow 已存在时，后端不得重复创建 Flow，必须复用并确保其处于运行或已启用状态（可由后端启停既有 Flow）
- - 点击数据库导出后，任务 JSON 能自动进入 `/home/yhz/iot/real_nifi_data/export_jobs/inbox`
- - NiFi 能消费任务并将结果写入 `/home/yhz/iot/real_nifi_data/output_csv|output_json|output_tsv`（消费逻辑由 NiFi 侧预置）
- - NiFi 能写入 `/home/yhz/iot/real_nifi_data/export_jobs/done|error` 状态文件
+ - 点击数据库导出后，任务 JSON 能自动进入 `/home/yhz/real_nifi_data/export_jobs/inbox`
+ - NiFi 能消费任务并将结果写入 `/home/yhz/real_nifi_data/output_csv|output_json|output_tsv`（消费逻辑由 NiFi 侧预置）
+ - NiFi 能写入 `/home/yhz/real_nifi_data/export_jobs/done|error` 状态文件
  - 后端能同步 NiFi 状态文件并注册 fileId
  - 启动/停止既有 Flow、任务提交、失败回退等关键操作必须记录审计日志
 

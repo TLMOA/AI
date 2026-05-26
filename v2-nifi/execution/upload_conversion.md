@@ -9,8 +9,8 @@ API
 - 响应：`{ code,message,data: { jobId }, traceId }`
 
 任务 JSON 与存储
-- 文件保存路径（示例）：`/home/yhz/iot/real_nifi_data/inbox_csv/{jobId}.csv`
-- metadata 写入：`/home/yhz/iot/real_nifi_data/inbox_csv/{jobId}.json`
+- 文件保存路径（示例）：`/home/yhz/real_nifi_data/inbox_csv/{jobId}.csv`
+- metadata 写入：`/home/yhz/real_nifi_data/inbox_csv/{jobId}.json`
 - metadata 示例：
   ```json
   { "jobId":"u-0001","uploader":"user-1","storagePath":"inbox_csv/u-0001.csv","format":"csv","options":{} }

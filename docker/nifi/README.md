@@ -14,26 +14,26 @@ chmod +x build.sh
 
 # 启动容器（示例，预置方式）
 docker run -d --name iot-nifi -p 8080:8080 \
-  -v /home/yhz/iot/real_nifi_data:/opt/nifi/nifi-current/data/iot \
+  -v /home/yhz/real_nifi_data:/opt/nifi/nifi-current/data/iot \
   iot-nifi-python:latest
 ```
 
 JDBC 驱动：
-- 将 `mysql-connector-java-<version>.jar` 放到宿主机目录 `/home/yhz/iot/real_nifi_data/lib`，并在 NiFi 容器中将该路径挂载到 NiFi 可加载的目录或在 NiFi UI 中通过 Controller Services 引用该路径。
+- 将 `mysql-connector-java-<version>.jar` 放到宿主机目录 `/home/yhz/real_nifi_data/lib`，并在 NiFi 容器中将该路径挂载到 NiFi 可加载的目录或在 NiFi UI 中通过 Controller Services 引用该路径。
 
 环境变量模板：请参考 `.env.template`。
 
 持久化（包括 `flow` 配置）— 推荐做法
 --------------------------------------------------
-为了确保 NiFi 的 Flow 配置在主机重启、容器重建或断电后不丢失，推荐同时持久化 NiFi 的 `conf`（包含 `flow.xml.gz`）和运行时数据。仓库里已经建议把运行数据挂载到 `/home/yhz/iot/real_nifi_data`，下面给出完整示例和初始化步骤：
+为了确保 NiFi 的 Flow 配置在主机重启、容器重建或断电后不丢失，推荐同时持久化 NiFi 的 `conf`（包含 `flow.xml.gz`）和运行时数据。仓库里已经建议把运行数据挂载到 `/home/yhz/real_nifi_data`，下面给出完整示例和初始化步骤：
 
 1) 创建宿主目录并设置权限（在主机上运行）：
 
 ```bash
-mkdir -p /home/yhz/iot/real_nifi_data
+mkdir -p /home/yhz/real_nifi_data
 mkdir -p /home/yhz/iot/real_nifi_conf
-mkdir -p /home/yhz/iot/real_nifi_data/lib
-sudo chown -R 1000:1000 /home/yhz/iot/real_nifi_data /home/yhz/iot/real_nifi_conf
+mkdir -p /home/yhz/real_nifi_data/lib
+sudo chown -R 1000:1000 /home/yhz/real_nifi_data /home/yhz/iot/real_nifi_conf
 ```
 
 2) 若你还没有 `conf`（首次使用），先用临时容器生成默认配置并拷贝到宿主：
@@ -53,11 +53,11 @@ sudo chown -R 1000:1000 /home/yhz/iot/real_nifi_conf
 
 ```bash
 # 例如
-cp mysql-connector-java-<version>.jar /home/yhz/iot/real_nifi_data/lib/
-sudo chown 1000:1000 /home/yhz/iot/real_nifi_data/lib/mysql-connector-java-<version>.jar
+cp mysql-connector-java-<version>.jar /home/yhz/real_nifi_data/lib/
+sudo chown 1000:1000 /home/yhz/real_nifi_data/lib/mysql-connector-java-<version>.jar
 ```
 
-注意：不要把宿主目录挂载到 `/opt/nifi/nifi-current/lib`。该目录是 NiFi 核心依赖目录，覆盖后会导致 `org.apache.nifi.bootstrap.BootstrapProcess` 类找不到，容器循环重启。JDBC 驱动建议保存在 `/opt/nifi/nifi-current/data/iot/lib`（即宿主 `/home/yhz/iot/real_nifi_data/lib`）并在 Controller Service 的 Driver Location 中引用。
+注意：不要把宿主目录挂载到 `/opt/nifi/nifi-current/lib`。该目录是 NiFi 核心依赖目录，覆盖后会导致 `org.apache.nifi.bootstrap.BootstrapProcess` 类找不到，容器循环重启。JDBC 驱动建议保存在 `/opt/nifi/nifi-current/data/iot/lib`（即宿主 `/home/yhz/real_nifi_data/lib`）并在 Controller Service 的 Driver Location 中引用。
 
 4) 使用 `docker-compose` 启动（仓库已提供示例 `docker-compose.yml`）：
 
@@ -65,6 +65,8 @@ sudo chown 1000:1000 /home/yhz/iot/real_nifi_data/lib/mysql-connector-java-<vers
 cd docker/nifi
 docker-compose up -d --build
 ```
+
+局域网访问保持说明：`docker-compose.yml` 中的 `NIFI_WEB_PROXY_HOST` 默认仍包含 `202.113.76.55:9443`，并且 `NIFI_WEB_PROXY_CONTEXT_PATH` 默认保持 `/nifi`，因此容器改目录时不会丢失 `https://202.113.76.55:9443/nifi/#/login` 这条入口。若你的实际外部地址变化，只需要通过环境变量覆盖 `NIFI_WEB_PROXY_HOST` 和必要时的 `NIFI_WEB_PROXY_CONTEXT_PATH`，不要删掉局域网入口。
 
 5) 验证与备份
 
@@ -76,7 +78,7 @@ docker ps -a | grep iot-nifi
 docker logs -f iot-nifi
 
 # 备份 flow（必要时）
-docker cp iot-nifi:/opt/nifi/nifi-current/conf/flow.xml.gz /home/yhz/iot/real_nifi_data/backup/flow.xml.gz
+docker cp iot-nifi:/opt/nifi/nifi-current/conf/flow.xml.gz /home/yhz/real_nifi_data/backup/flow.xml.gz
 ```
 
 访问说明：当前证书的 SAN 包含 `localhost` 和容器名，不包含 `127.0.0.1`。如果浏览器提示 `invalid SNI`，请优先使用 `https://localhost:8080` 打开 NiFi；若必须通过 IP 访问，需要重新生成包含该 IP 的证书。

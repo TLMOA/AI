@@ -245,7 +245,7 @@ def ensure_nifi_docker(image='iot-nifi-python:latest', name='iot-nifi', ports=No
     if ports is None:
         ports = {'8080': '8080'}
     if mounts is None:
-        mounts = {os.path.abspath('/home/yhz/iot/real_nifi_data'): '/opt/nifi/nifi-current/data/iot'}
+        mounts = {os.path.abspath('/home/yhz/real_nifi_data'): '/opt/nifi/nifi-current/data/iot'}
 
     # 检查是否已有容器存在
     res = _run(f"docker ps -a --filter name={name} --format '{{{{.ID}}}} {{{{.Status}}}}'")

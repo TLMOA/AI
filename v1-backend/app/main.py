@@ -261,6 +261,8 @@ def _scan_nifi_export_results() -> Dict[str, Any]:
     seen_jobs: set[str] = set()
     for folder, status in ((dirs["done"], "done"), (dirs["error"], "error")):
         for path in folder.glob("*.json"):
+            if path.name.endswith(".meta.json"):
+                continue
             payload = _read_json_file(path)
             if not payload:
                 try:
@@ -703,6 +705,8 @@ def _collect_local_files(root: Path, source_type: str) -> List[Dict[str, Any]]:
     for p in root.rglob("*"):
         if not p.is_file():
             continue
+        if p.name.endswith(".meta.json"):
+            continue
         try:
             stat = p.stat()
         except Exception:
@@ -782,6 +786,8 @@ def _copy_path_to_in_data(src: Path, factory_id: str, base_name: Optional[str] =
 
     for file_path in src.rglob("*"):
         if not file_path.is_file():
+            continue
+        if file_path.name.endswith(".meta.json"):
             continue
         try:
             rel = file_path.relative_to(src)
@@ -1303,6 +1309,8 @@ def api_list_factory_assets(
         for file_path in IN_DATA_BASE_DIR.rglob("*"):
             if not file_path.is_file():
                 continue
+            if file_path.name.endswith(".meta.json"):
+                continue
             try:
                 stat = file_path.stat()
             except Exception:
@@ -1655,6 +1663,11 @@ async def run_job(job_id: str) -> None:
 
 
 def register_existing_file(file_path: Path, file_format: str) -> Dict[str, Any]:
+    original_path = file_path
+    if file_path.name.endswith(".meta.json"):
+        file_path = Path(str(file_path)[: -len(".meta.json")])
+        if not file_path.exists():
+            return {}
     resolved_path = file_path.resolve()
     existing_meta = next((meta for meta in files.values() if str(meta.get("storagePath", "")) == str(resolved_path)), None)
     if existing_meta is not None:
@@ -1723,6 +1736,8 @@ def _write_meta_file(meta: Dict[str, Any], extra: Optional[Dict[str, Any]] = Non
     if not storage_path:
         raise ValueError("meta missing storagePath")
     p = Path(storage_path)
+    while p.name.endswith(".meta.json"):
+        p = Path(str(p)[: -len(".meta.json")])
     meta_path = Path(str(p) + ".meta.json")
 
     # base structure following meta.schema.json
@@ -1779,6 +1794,8 @@ def _sync_nifi_files() -> None:
             continue
         for p in root.rglob("*"):
             if not p.is_file():
+                continue
+            if p.name.endswith(".meta.json"):
                 continue
             if "export_jobs" in p.parts:
                 continue

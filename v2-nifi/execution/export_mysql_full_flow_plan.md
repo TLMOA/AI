@@ -32,9 +32,9 @@
 
 ### 3. NiFi 接入入口
 
-- 后端导出任务会写入：`/home/yhz/iot/real_nifi_data/export_jobs/inbox/{jobId}.json`
-- 输出目录：`/home/yhz/iot/real_nifi_data/output_csv|output_json|output_tsv`
-- 状态目录：`/home/yhz/iot/real_nifi_data/export_jobs/done|error`
+- 后端导出任务会写入：`/home/yhz/real_nifi_data/export_jobs/inbox/{jobId}.json`
+- 输出目录：`/home/yhz/real_nifi_data/output_csv|output_json|output_tsv`
+- 状态目录：`/home/yhz/real_nifi_data/export_jobs/done|error`
 
 ## 三、前置条件
 
@@ -46,7 +46,7 @@
 docker run -d \
   --name iot-nifi \
   -p 8080:8080 \
-  -v /home/yhz/iot/real_nifi_data:/opt/nifi/nifi-current/data/iot \
+  -v /home/yhz/real_nifi_data:/opt/nifi/nifi-current/data/iot \
   apache/nifi:latest
 ```
 
@@ -107,7 +107,7 @@ docker run -d \
 
 后端生成导出任务 JSON，并原子写入：
 
-`/home/yhz/iot/real_nifi_data/export_jobs/inbox/{jobId}.json`
+`/home/yhz/real_nifi_data/export_jobs/inbox/{jobId}.json`
 
 任务状态应先返回 `PENDING`，让前端显示“已提交到 NiFi”。
 
@@ -154,7 +154,7 @@ NiFi 侧消费任务后执行：
   "format": "CSV",
   "appendToLatest": false,
   "targetDir": "/opt/nifi/nifi-current/data/iot/output_csv",
-  "targetRoot": "/home/yhz/iot/real_nifi_data",
+  "targetRoot": "/home/yhz/real_nifi_data",
   "submittedAt": "2026-05-12T10:00:00+08:00"
 }
 ```
