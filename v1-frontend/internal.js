@@ -53,9 +53,11 @@
       normalizedConfigured,
       pageRelative,
       "/api/v1",
+      "/api",
     ];
     if (isLocalPage) {
-      candidates.push("http://127.0.0.1:8081/api/v1", "http://localhost:8081/api/v1");
+      candidates.push("http://127.0.0.1:8081/api/v1", "http://localhost:8081/api/v1",
+                      "http://127.0.0.1:8081/api", "http://localhost:8081/api");
     }
     return [...new Set(candidates.filter(Boolean))];
   }
@@ -421,6 +423,7 @@
       toggle.checked = false;
       toggle.disabled = true;
       triggerBtn.disabled = true;
+      console.warn('[silent-export] status load failed:', JSON.stringify(res));
       return;
     }
     const cfg = res.data || {};

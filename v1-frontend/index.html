@@ -25,63 +25,10 @@
       </div>
     </header>
 
-    <section class="card">
-      <h2>创建任务</h2>
-      <div class="row">
-        <label>任务类型</label>
-        <select id="jobType">
-          <option value="CONVERT" title="数据格式转换（例如 CSV <-> JSON）">CONVERT</option>
-          <option value="TAG_AUTO" title="自动打标签：按规则自动标注数据">TAG_AUTO</option>
-          <option value="COPY_MULTI_FORMAT" title="复制多种输出格式（同时生成 CSV/JSON/TSV）">COPY_MULTI_FORMAT</option>
-          <option value="IMPORT_EXTERNAL" title="导入到外部系统/数据库的任务">IMPORT_EXTERNAL</option>
-          <option value="TAG_MANUAL" title="手动标注：用户在前端打开文件并手工标注">TAG_MANUAL</option>
-        </select>
-      </div>
-      <div class="row">
-        <label>输出格式</label>
-        <select id="format">
-          <option value="CSV">CSV</option>
-          <option value="JSON">JSON</option>
-          <option value="TSV">TSV</option>
-        </select>
-      </div>
-      <button id="createBtn">创建任务</button>
-      <p id="createResult"></p>
-    </section>
+    
 
     <section class="card">
-      <h2>任务列表</h2>
-      <button id="refreshBtn">刷新列表</button>
-      <table>
-        <thead>
-          <tr><th>jobId</th><th>类型</th><th>状态</th><th>进度</th><th>操作</th></tr>
-        </thead>
-        <tbody id="jobTable"></tbody>
-      </table>
-    </section>
-
-    <section class="card">
-      <h2>任务详情</h2>
-      <p id="jobDetail">请选择任务</p>
-      <h3>产物</h3>
-      <ul id="outputs"></ul>
-    </section>
-
-    <section class="card">
-      <h2>触发 NiFi 流程</h2>
-      <p>快速触发项目中的五个流程（会创建任务并展示进度）</p>
-      <div class="row">
-        <button class="nifi-btn" data-type="CONVERT">触发 CONVERT</button>
-        <button class="nifi-btn" data-type="TAG_AUTO">触发 TAG_AUTO</button>
-        <button class="nifi-btn" data-type="COPY_MULTI_FORMAT">触发 COPY_MULTI_FORMAT</button>
-        <button class="nifi-btn" data-type="IMPORT_EXTERNAL">触发 IMPORT_EXTERNAL</button>
-        <button class="nifi-btn" data-type="TAG_MANUAL">触发 TAG_MANUAL</button>
-      </div>
-      <p>输出文件位置：后端本地生成目录为 <code>/home/yhz/iot/v1-backend/data/generated/</code>；若使用真实 NiFi，NiFi 输出目录为 <code>/home/yhz/nifi-data/output_csv/</code></p>
-    </section>
-
-    <section class="card">
-      <h2>数据库导出（MySQL）</h2>
+      <h2>数据库导出</h2>
       <div class="row">
         <label>数据库类型</label>
         <select id="dbType">
@@ -127,26 +74,30 @@
         </span>
         <label>Where</label>
         <input id="dbWhere" type="text" placeholder="可选，例如 id > 100" />
-      </div>
-      <div class="row">
         <button id="dbTestBtn">测试连接</button>
         <button id="dbListBtn">列出表</button>
+      </div>
+      <div class="row" style="margin-top:12px; padding-top:12px; border-top:1px dashed #ccc;">
+        <strong style="margin-right:12px; color:#555;">手动导出</strong>
         <label>格式</label>
         <select id="dbExportFormat"><option>CSV</option><option>JSON</option><option>TSV</option></select>
-          <label>定时频率</label>
-          <select id="dbScheduleFreq">
-            <option value="5m">每5分钟</option>
-            <option value="15m">每15分钟</option>
-            <option value="1h">每小时</option>
-            <option value="daily">每日</option>
-            <option value="cron">自定义 cron</option>
-          </select>
-          <input id="dbScheduleCron" type="text" placeholder="cron 表达式（选择自定义时填写）" />
         <label>追加到 latest</label>
         <input id="dbAppendLatest" type="checkbox" />
-        <button id="dbExportBtn">导出并写入 NiFi 输出目录</button>
-          <button id="dbCreateScheduleBtn" class="secondary">创建定时任务</button>
-          <button id="dbManageSchedulesBtn" class="secondary">定时任务管理</button>
+        <button id="dbExportBtn">立即导出</button>
+      </div>
+      <div class="row" style="margin-top:8px; padding-top:12px; border-top:1px dashed #ccc;">
+        <strong style="margin-right:12px; color:#555;">定时导出</strong>
+        <label>频率</label>
+        <select id="dbScheduleFreq">
+          <option value="5m">每5分钟</option>
+          <option value="15m">每15分钟</option>
+          <option value="1h">每小时</option>
+          <option value="daily">每日</option>
+          <option value="cron">自定义 cron</option>
+        </select>
+        <input id="dbScheduleCron" type="text" placeholder="cron 表达式（选择自定义时填写）" />
+        <button id="dbCreateScheduleBtn" class="secondary">创建定时任务</button>
+        <button id="dbManageSchedulesBtn" class="secondary">管理已有任务</button>
       </div>
       <p id="dbConnStatus"></p>
       <p id="dbExportResult"></p>

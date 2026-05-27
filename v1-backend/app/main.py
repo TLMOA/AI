@@ -102,7 +102,7 @@ BACKEND_MODE_FILE = GENERATED_DIR / "backend_mode.json"
 app = FastAPI(title="AI Module V1 Backend", version="0.1.0")
 app.include_router(db_router)
 app.include_router(auth_router)
-app.include_router(admin_router)
+app.include_router(admin_router, prefix="/api/v1")
 
 
 def _require_admin(request: Request):
@@ -1738,7 +1738,7 @@ def _write_meta_file(meta: Dict[str, Any], extra: Optional[Dict[str, Any]] = Non
     p = Path(storage_path)
     while p.name.endswith(".meta.json"):
         p = Path(str(p)[: -len(".meta.json")])
-    meta_path = Path(str(p) + ".meta.json")
+    meta_path = p.with_suffix('.meta.json')
 
     # base structure following meta.schema.json
     base = {
@@ -1797,7 +1797,7 @@ def _sync_nifi_files() -> None:
                 continue
             if p.name.endswith(".meta.json"):
                 continue
-            if "export_jobs" in p.parts:
+            if "export_jobs" in p.parts or "exports" in p.parts:
                 continue
             disk_paths.add(str(p.resolve()))
 
@@ -3355,6 +3355,14 @@ def export_generic(body: Dict[str, Any], request: Request):
                         else:
                             extra["tagRange"] = tr
                     _write_meta_file(meta, extra)
+                except Exception:
+                    pass
+                # register table for silent export if enabled
+                try:
+                    if table and db_conf:
+                        from .silent_export_worker import register_table
+                        factory_id = job.get("factory_id") or DEFAULT_FACTORY_ID
+                        register_table(db_conf, table, factory_id)
                 except Exception:
                     pass
                 return ok({"file": meta}, trace_id)

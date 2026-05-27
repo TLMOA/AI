@@ -1,11 +1,13 @@
 """Silent export executor.
 
-Implements the方案 requirements at a pragmatic level:
-- per-tenant config stored in `data/generated/silent_export_config.json`
-- first run emits a full table snapshot
-- later runs append incrementally by marker column
-- schema changes roll a new dated file and keep old files intact
-- each table keeps a `.meta.json` file with execution metadata
+Manifest-driven approach:
+- When silent export is enabled, every manual table export automatically
+  registers that table's (db_config, table) pair into a manifest.
+- The background scheduler iterates the manifest and exports each entry.
+- Output: /home/yhz/nifi-data/silent_exports/<tenant>/<db_key>/<table>_silent_export.csv
+- First run = full snapshot; later runs = incremental append via marker column.
+- Schema changes roll a new dated file and keep old files intact.
+- Each table keeps a .meta.json file with execution metadata.
 """
 from pathlib import Path
 import csv
@@ -24,25 +26,81 @@ import sqlalchemy
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 GENERATED = BASE_DIR / "data" / "generated"
-REQUESTS = GENERATED / "silent_export_requests.ndjson"
+MANIFEST = GENERATED / "silent_export_manifest.json"
 CONFIG = GENERATED / "silent_export_config.json"
-NIFI_SILENT_DIR = Path("/home/yhz/iot/nifi_data") / "silent_exports"
+NIFI_SILENT_DIR = Path("/home/yhz/nifi-data") / "silent_exports"
 SILENT_EXPORT_TMP_DIRNAME = "tmp"
 DEFAULT_SCHEDULE = os.getenv("SILENT_EXPORT_SCHEDULE", "daily")
 
 
-def _load_config() -> dict:
-    if not CONFIG.exists():
-        return {"tenants": {}}
+# ── manifest ──────────────────────────────────────────────────────────
+
+def _load_manifest() -> dict:
+    if not MANIFEST.exists():
+        return {}
     try:
-        return json.loads(CONFIG.read_text(encoding="utf-8"))
+        return json.loads(MANIFEST.read_text(encoding="utf-8"))
     except Exception:
-        return {"tenants": {}}
+        return {}
 
 
-def _save_config(data: dict):
-    CONFIG.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+def _save_manifest(data: dict):
+    MANIFEST.parent.mkdir(parents=True, exist_ok=True)
+    MANIFEST.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
+
+def _is_silent_export_enabled(tenant: str) -> bool:
+    """Check if silent export is enabled for a tenant."""
+    if not CONFIG.exists():
+        return False
+    try:
+        cfg = json.loads(CONFIG.read_text(encoding="utf-8"))
+        tenants = cfg.get("tenants", {})
+        tcfg = tenants.get(tenant, {})
+        return bool(tcfg.get("enabled"))
+    except Exception:
+        return False
+
+
+def _db_key(db_conf: Dict[str, Any]) -> str:
+    """Generate a unique identifier for a database configuration."""
+    db_type = (db_conf.get("db_type") or "mysql").lower()
+    if db_type == "sqlite":
+        path = db_conf.get("path") or db_conf.get("database") or "unknown"
+        name = Path(path).stem
+        return f"sqlite_{name}"
+    host = db_conf.get("host") or "127.0.0.1"
+    port = db_conf.get("port") or 0
+    database = db_conf.get("database") or db_conf.get("path") or "unknown"
+    return f"{db_type}_{host}_{port}_{database}"
+
+
+def _manifest_key(db_conf: Dict[str, Any], table: str) -> str:
+    return f"{_db_key(db_conf)}|{table}"
+
+
+def register_table(db_conf: Dict[str, Any], table: str, tenant: str):
+    """Register a table into the silent export manifest.
+    Called from the export handler after a successful manual export.
+    No-op if silent export is not enabled for this tenant.
+    """
+    if not _is_silent_export_enabled(tenant):
+        return
+
+    key = _manifest_key(db_conf, table)
+    manifest = _load_manifest()
+    if key not in manifest:
+        manifest[key] = {
+            "db": db_conf,
+            "table": table,
+            "tenant": tenant,
+            "registered_at": datetime.utcnow().isoformat(),
+        }
+        _save_manifest(manifest)
+        print(f"silent export: registered {key} for tenant={tenant}")
+
+
+# ── helpers ────────────────────────────────────────────────────────────
 
 def _schema_hash(columns: List[str]) -> str:
     return hashlib.sha256("|".join(columns).encode("utf-8")).hexdigest()[:16]
@@ -82,8 +140,18 @@ def _append_atomic(final_path: Path, tmp_path: Path):
 
 
 def _read_table_rows(conn, table: str, marker_col: Optional[str], marker_value: Any = None) -> Tuple[List[str], List[Dict[str, Any]]]:
-    q = f'SELECT * FROM "{table}"' if marker_col is None or marker_value is None else f'SELECT * FROM "{table}" WHERE "{marker_col}" > :m'
-    res = conn.execute(sqlalchemy.text(q), {"m": marker_value} if marker_col is not None and marker_value is not None else {})
+    # Use dialect-appropriate identifier quoting (e.g. backticks for MySQL)
+    from sqlalchemy.sql import quoted_name
+    import sqlalchemy as sa
+    qt = quoted_name(table, True)
+    if marker_col is None or marker_value is None:
+        q = sa.text(f'SELECT * FROM {qt}')
+        params = {}
+    else:
+        qm = quoted_name(marker_col, True)
+        q = sa.text(f'SELECT * FROM {qt} WHERE {qm} > :m')
+        params = {"m": marker_value}
+    res = conn.execute(q, params)
     cols = list(res.keys())
     rows = [dict(r._mapping) for r in res.fetchall()]
     return cols, rows
@@ -100,8 +168,11 @@ def _write_csv(path: Path, columns: List[str], rows: List[Dict[str, Any]]) -> No
         os.fsync(fh.fileno())
 
 
-def _export_table(engine, tenant: str, table: str, marker_col: Optional[str], last_marker) -> Optional[dict]:
-    out_dir = NIFI_SILENT_DIR / tenant
+# ── per-table export ───────────────────────────────────────────────────
+
+def _export_table(engine, tenant: str, db_key: str, table: str,
+                  marker_col: Optional[str], last_marker) -> Optional[dict]:
+    out_dir = NIFI_SILENT_DIR / tenant / db_key
     tmp_dir = out_dir / SILENT_EXPORT_TMP_DIRNAME
     out_dir.mkdir(parents=True, exist_ok=True)
     tmp_dir.mkdir(parents=True, exist_ok=True)
@@ -156,9 +227,10 @@ def _export_table(engine, tenant: str, table: str, marker_col: Optional[str], la
 
         current_meta = {
             "tenant": tenant,
+            "db_key": db_key,
             "table": table,
             "traceId": f"silent-{int(time.time())}",
-            "jobId": f"silent-{tenant}-{table}",
+            "jobId": f"silent-{tenant}-{db_key}-{table}",
             "operator": "scheduler",
             "triggerReason": trigger_reason,
             "last_export_marker": new_marker,
@@ -175,69 +247,68 @@ def _export_table(engine, tenant: str, table: str, marker_col: Optional[str], la
         return {"rows_exported": rows_exported, "new_marker": new_marker, "schema_changed": schema_changed}
 
 
-def _iter_enabled_tenants(cfg: Dict[str, Any]) -> List[Tuple[str, Dict[str, Any]]]:
-    tenants = cfg.get("tenants", {}) if isinstance(cfg, dict) else {}
-    items = []
-    for tenant, tcfg in tenants.items():
-        if isinstance(tcfg, dict) and tcfg.get("enabled"):
-            items.append((tenant, tcfg))
-    return items
+# ── main processing loop ───────────────────────────────────────────────
 
-
-def _get_table_list(engine) -> List[str]:
-    with engine.connect() as conn:
-        try:
-            tbls = [r[0] for r in conn.execute(sqlalchemy.text("SHOW TABLES")).fetchall()]
-        except Exception:
-            tbls = [r[0] for r in conn.execute(sqlalchemy.text("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'" )).fetchall()]
-    return tbls
+def _get_marker_column_from_config(tenant: str) -> Optional[str]:
+    if not CONFIG.exists():
+        return None
+    try:
+        cfg = json.loads(CONFIG.read_text(encoding="utf-8"))
+        tenants = cfg.get("tenants", {})
+        tcfg = tenants.get(tenant, {})
+        return tcfg.get("incremental_marker_column", "updated_at")
+    except Exception:
+        return "updated_at"
 
 
 def process_once(tenant_filter: Optional[str] = None):
-    cfg = _load_config()
-    tenants_cfg = cfg.get("tenants", {})
-    targets = _iter_enabled_tenants(cfg)
-    if tenant_filter:
-        targets = [(t, c) for t, c in targets if t == tenant_filter]
+    manifest = _load_manifest()
+    if not manifest:
+        print("no entries in silent export manifest")
+        return 0
 
-    if not targets:
+    # group entries by tenant
+    entries_by_tenant: Dict[str, List[Dict[str, Any]]] = {}
+    for key, entry in manifest.items():
+        tenant = entry.get("tenant", "unknown")
+        if tenant_filter and tenant != tenant_filter:
+            continue
+        entries_by_tenant.setdefault(tenant, []).append(entry)
+
+    if not entries_by_tenant:
         print("no enabled silent export tenants")
         return 0
 
     processed = 0
-    for tenant, tcfg in targets:
-        print(f"processing silent export for tenant={tenant}")
-        db_conf = tcfg.get("db") or {}
-        if not db_conf:
-            db_conf = {
-                "db_type": "mysql",
-                "user": tcfg.get("db_user") or "root",
-                "password": tcfg.get("db_password") or "root",
-                "host": tcfg.get("db_host") or "127.0.0.1",
-                "port": int(tcfg.get("db_port") or 3306),
-                "database": tcfg.get("db_name") or "test",
-            }
-
-        try:
-            engine = engine_from_config(db_conf)
-            tbls = _get_table_list(engine)
-        except Exception as e:
-            print(f"failed to init/list for tenant={tenant}: {e}")
+    for tenant, entries in entries_by_tenant.items():
+        # only process if silent export is still enabled for this tenant
+        if not _is_silent_export_enabled(tenant):
             continue
 
-        marker_col = tcfg.get("incremental_marker_column")
-        last_marker_by_table = tcfg.get("last_export_marker_by_table") or {}
-        for table in tbls:
+        marker_col = _get_marker_column_from_config(tenant)
+        print(f"processing silent export for tenant={tenant}, {len(entries)} table(s)")
+
+        for entry in entries:
+            db_conf = entry.get("db") or {}
+            table = entry.get("table")
+            db_key = _db_key(db_conf)
+
+            if not db_conf or not table:
+                print(f"skipping malformed entry: {entry}")
+                continue
+
             try:
-                res = _export_table(engine, tenant, table, marker_col, last_marker_by_table.get(table))
-                if res and res.get("new_marker") is not None:
-                    per_table = tenants_cfg.setdefault(tenant, {}).setdefault("last_export_marker_by_table", {})
-                    per_table[table] = res.get("new_marker")
-                    cfg["tenants"] = tenants_cfg
-                    _save_config(cfg)
-                print(f"exported table={table} rows={res['rows_exported'] if res else 0}")
+                engine = engine_from_config(db_conf)
             except Exception as e:
-                print(f"failed exporting table={table} for tenant={tenant}: {e}")
+                print(f"failed to connect for db_key={db_key}: {e}")
+                continue
+
+            try:
+                res = _export_table(engine, tenant, db_key, table, marker_col, None)
+                print(f"exported {db_key}/{table} rows={res['rows_exported'] if res else 0}")
+            except Exception as e:
+                print(f"failed exporting {db_key}/{table}: {e}")
+
         processed += 1
 
     return processed

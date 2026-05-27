@@ -16,7 +16,7 @@ def _get_generated_dir() -> Path:
 
 
 def _get_silent_export_dir() -> Path:
-    return Path("/home/yhz/iot/nifi_data") / "silent_exports"
+    return Path("/home/yhz/nifi-data") / "silent_exports"
 
 
 def _config_path() -> Path:
@@ -47,10 +47,9 @@ class SilentExportConfig(BaseModel):
     retention_days: Optional[int] = 7
     incremental_marker_column: Optional[str] = "updated_at"
     max_concurrent: Optional[int] = 1
-    db: Optional[Dict[str, Any]] = None
 
 
-@router.get("/api/internal/tenants/{tenant}/silent-export")
+@router.get("/internal/tenants/{tenant}/silent-export")
 def get_silent_export(tenant: str):
     cfgp = _config_path()
     if not cfgp.exists():
@@ -66,7 +65,7 @@ def get_silent_export(tenant: str):
         raise HTTPException(status_code=500, detail=f"读取配置失败: {e}")
 
 
-@router.post("/api/internal/tenants/{tenant}/silent-export")
+@router.post("/internal/tenants/{tenant}/silent-export")
 def set_silent_export(tenant: str, req: SilentExportConfig, request: Request = None):
     user = _require_admin(request)
     cfgp = _config_path()
@@ -78,14 +77,12 @@ def set_silent_export(tenant: str, req: SilentExportConfig, request: Request = N
             data = {"tenants": {}}
 
     tenants = data.setdefault("tenants", {})
-    old = tenants.get(tenant, {})
     tenants[tenant] = {
         "enabled": bool(req.enabled),
         "cron": req.cron or "daily",
         "retention_days": int(req.retention_days or 7),
         "incremental_marker_column": req.incremental_marker_column or "updated_at",
         "max_concurrent": int(req.max_concurrent or 1),
-        "db": req.db or old.get("db") or {},
         "updated_at": datetime.utcnow().isoformat(),
         "updated_by": user.get("username") if isinstance(user, dict) else None,
     }
@@ -93,7 +90,7 @@ def set_silent_export(tenant: str, req: SilentExportConfig, request: Request = N
     return {"code": 0, "message": "OK", "data": tenants[tenant], "traceId": ""}
 
 
-@router.post("/api/internal/tenants/{tenant}/silent-export/trigger")
+@router.post("/internal/tenants/{tenant}/silent-export/trigger")
 def trigger_silent_export(tenant: str, payload: Optional[Dict[str, Any]] = None, request: Request = None):
     user = _require_admin(request)
     req = payload or {}

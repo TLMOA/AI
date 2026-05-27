@@ -18,9 +18,6 @@ const KNOWN_NIFI_DIRS = [
 ];
 
 const state = {
-  jobs: [],
-  currentJobId: null,
-  pollTimer: null,
   allFiles: [],
   files: [],
   rootDir: "/home/yhz/nifi-data",
@@ -208,20 +205,6 @@ async function exportJobsApi(path, options = {}) {
 }
 
 function mockApi(path, options = {}) {
-  if (path === "/jobs" && options.method === "POST") {
-    const id = `job_mock_${Date.now()}`;
-    return Promise.resolve({ code: 0, message: "OK", traceId: "mock", data: { jobId: id, status: "PENDING", createdAt: new Date().toISOString() } });
-  }
-  if (path.startsWith("/jobs/") && path.endsWith("/outputs")) {
-    return Promise.resolve({ code: 0, message: "OK", traceId: "mock", data: [] });
-  }
-  if (path.startsWith("/jobs/")) {
-    const jobId = path.split("/")[2];
-    return Promise.resolve({ code: 0, message: "OK", traceId: "mock", data: { jobId, jobType: "CONVERT", status: "RUNNING", progress: 60, source: {}, target: {}, createdAt: new Date().toISOString() } });
-  }
-  if (path.startsWith("/jobs")) {
-    return Promise.resolve({ code: 0, message: "OK", traceId: "mock", data: { total: 0, pageNo: 1, pageSize: 20, rows: [] } });
-  }
   if (path.startsWith("/files")) {
     return Promise.resolve({ code: 0, message: "OK", traceId: "mock", data: { total: 0, pageNo: 1, pageSize: 20, rows: [] } });
   }
@@ -229,105 +212,6 @@ function mockApi(path, options = {}) {
     return Promise.resolve({ code: 0, message: "OK", traceId: "mock", data: [{ ruleId: "NIFI_RULE_ID_V5", ruleName: "Mock rule", ruleVersion: "v1", enabled: true }] });
   }
   return Promise.resolve({ code: 0, message: "OK", traceId: "mock", data: null });
-}
-
-function renderJobs() {
-  const tbody = document.getElementById("jobTable");
-  tbody.innerHTML = "";
-  state.jobs.forEach((job) => {
-    const tr = document.createElement("tr");
-    tr.innerHTML = `
-      <td>${job.jobId}</td>
-      <td>${job.jobType}</td>
-      <td><span class="status ${job.status}">${job.status}</span></td>
-      <td>${job.progress ?? 0}%</td>
-      <td><button class="secondary" data-id="${job.jobId}">查看</button></td>
-    `;
-    tr.querySelector("button").addEventListener("click", () => loadJobDetail(job.jobId));
-    tbody.appendChild(tr);
-  });
-}
-
-async function loadJobs() {
-  const res = await api("/jobs");
-  if (res.code !== 0) return;
-  state.jobs = res.data.rows || [];
-  renderJobs();
-}
-
-async function createJob() {
-  const jobType = document.getElementById("jobType").value;
-  const format = document.getElementById("format").value;
-  const payload = {
-    jobType,
-    source: { sourceType: "MYSQL_TABLE", tableName: "sensor_data" },
-    target: { format, outputDir: "/data/jobs" },
-    tagConfig: { mode: "AUTO", ruleId: "NIFI_RULE_ID_V5" },
-    copyFormats: [],
-    cron: "",
-    runBy: (state.currentUser && state.currentUser.username) || "user-001",
-    remark: "created from v1 frontend",
-  };
-
-  const res = await api("/jobs", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload),
-  });
-
-  const msg = document.getElementById("createResult");
-  if (res.code !== 0) {
-    msg.textContent = `创建失败: ${res.message}`;
-    return;
-  }
-  msg.textContent = `创建成功: ${res.data.jobId}`;
-  await loadJobs();
-  await loadJobDetail(res.data.jobId);
-}
-
-async function loadJobDetail(jobId) {
-  state.currentJobId = jobId;
-  const res = await api(`/jobs/${jobId}`);
-  if (res.code !== 0) return;
-  const job = res.data;
-  let detail = `${job.jobId} | ${job.status} | ${job.progress}%`;
-  if (job.nifiFlowId) {
-    detail += `\nflowId: ${job.nifiFlowId}`;
-  }
-  if (typeof job.nifiRetryCount === "number") {
-    detail += `\nretry: ${job.nifiRetryCount}`;
-  }
-  if (job.status === "FAILED") {
-    const hint = toErrorHint(job.errorCode);
-    if (job.errorCode) {
-      detail += `\nerrorCode: ${job.errorCode}`;
-    }
-    if (hint) {
-      detail += `\n提示: ${hint}`;
-    }
-    if (job.errorMessage) {
-      detail += `\nerror: ${job.errorMessage}`;
-    }
-  }
-  document.getElementById("jobDetail").textContent = detail;
-  await loadOutputs(jobId);
-
-  if (state.pollTimer) clearTimeout(state.pollTimer);
-  if (["PENDING", "RUNNING"].includes(job.status)) {
-    state.pollTimer = setTimeout(() => loadJobDetail(jobId), 3000);
-  }
-}
-
-async function loadOutputs(jobId) {
-  const res = await api(`/jobs/${jobId}/outputs`);
-  const ul = document.getElementById("outputs");
-  ul.innerHTML = "";
-  if (res.code !== 0) return;
-  res.data.forEach((f) => {
-    const li = document.createElement("li");
-    li.innerHTML = `${f.fileName} (${f.fileFormat}) - <a href="${getBackendApiBase()}/files/${f.fileId}/download" target="_blank">下载</a> <span class="small">路径: ${f.storagePath || ''}</span>`;
-    ul.appendChild(li);
-  });
 }
 
 function renderFiles() {
@@ -738,10 +622,6 @@ async function triggerAutoTag() {
   } else {
     msg.textContent = `自动标签任务已创建: ${data.jobId || "-"}`;
   }
-  await loadJobs();
-  if (data.jobId) {
-    await loadJobDetail(data.jobId);
-  }
   await loadFiles();
 }
 
@@ -832,8 +712,8 @@ function renderDbFields() {
     try {
       ["dbHost", "dbPort"].forEach((id) => { const el = document.getElementById(id); if (el) { el.disabled = true; const row = el.closest('.row'); if (row) row.style.display = 'none'; } });
       ["dbName", "dbUser", "dbPassword"].forEach((id) => { const el = document.getElementById(id); if (el) { el.disabled = true; const row = el.closest('.row'); if (row) row.style.display = 'none'; } });
-      // table selector/input also not applicable for raw sqlite path mode
-      ["dbTableSelect", "dbTableInput", "dbWhere"].forEach((id) => { const el = document.getElementById(id); if (el) { el.disabled = true; const row = el.closest('.row'); if (row) row.style.display = 'none'; } });
+      // SQLite also supports table listing via sqlite_master
+      ["dbTableSelect", "dbTableInput", "dbWhere"].forEach((id) => { const el = document.getElementById(id); if (el) { el.disabled = false; const row = el.closest('.row'); if (row) row.style.display = ''; } });
     } catch (e) {
       ["dbHost", "dbPort", "dbName", "dbUser", "dbPassword"].forEach((id) => { const el = document.getElementById(id); if (el) el.disabled = true; });
     }
@@ -1162,8 +1042,6 @@ async function triggerExportJob(id) {
 }
 
 function bindEvents() {
-  document.getElementById("createBtn").addEventListener("click", createJob);
-  document.getElementById("refreshBtn").addEventListener("click", loadJobs);
   document.getElementById("loadFilesBtn").addEventListener("click", loadFiles);
   document.getElementById("loadRulesBtn").addEventListener("click", loadTagRules);
   document.getElementById("autoTagBtn").addEventListener("click", triggerAutoTag);
@@ -1209,10 +1087,8 @@ async function init() {
   } catch (_) {}
   updateBackendToggleUI();
   bindEvents();
-  loadJobs();
   loadFiles();
   loadTagRules();
-    bindNiFiButtons(); // Add NiFi trigger button handler implementation
 
   // Check current user to decide whether to show internal management link
   (async function checkCurrentUser(){
@@ -1240,34 +1116,6 @@ async function init() {
       state.currentUser = null;
     }
   })();
-  
-    // NiFi quick trigger helpers
-    function bindNiFiButtons() {
-      document.querySelectorAll(".nifi-btn").forEach((btn) => {
-        btn.addEventListener("click", async () => {
-          const jobType = btn.dataset.type;
-            const payload = {
-            jobType,
-            source: { sourceType: "MYSQL_TABLE" },
-            target: { format: "CSV", outputDir: "/data/jobs" },
-            tagConfig: { mode: jobType === "TAG_MANUAL" ? "MANUAL" : "AUTO", ruleId: "NIFI_RULE_ID_V5" },
-            runBy: (state.currentUser && state.currentUser.username) || "user-001",
-          };
-          const res = await api("/jobs", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify(payload),
-          });
-          if (res.code !== 0) {
-            alert(`触发失败: ${res.message}`);
-            return;
-          }
-          alert(`已创建任务 ${res.data.jobId}，开始执行`);
-          await loadJobs();
-          await loadJobDetail(res.data.jobId);
-        });
-      });
-    }
 }
 
 async function testDbConnection() {
