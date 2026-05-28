@@ -15,6 +15,7 @@ const KNOWN_NIFI_DIRS = [
   "/home/yhz/nifi-data/csv_to_tsv",
   "/home/yhz/nifi-data/tsv_to_csv",
   "/home/yhz/nifi-data/tagged_output",
+  "/home/yhz/nifi-data/exports",
 ];
 
 const state = {
@@ -156,52 +157,14 @@ async function requestJson(path, options = {}, mode = state.backendMode || confi
 }
 
 async function exportJobsApi(path, options = {}) {
-  const apiBaseNormalized = _normalizeBase(config.API_BASE || "");
-  const apiBaseNoV1 = apiBaseNormalized.replace(/\/v1\/?$/, "");
-  const apiBaseRelative = apiBaseNormalized.replace(/^\//, "");
-  const apiBaseNoV1Relative = apiBaseNoV1.replace(/^\//, "");
-  const candidates = [];
-
-  const absoluteOrigins = [
-    "http://127.0.0.1:8081",
-    "http://localhost:8081",
-  ];
-
-  ["/api/v1", "api/v1", apiBaseNormalized, apiBaseRelative, "/api", "api", apiBaseNoV1, apiBaseNoV1Relative].forEach((base) => {
-    if (!base) return;
-    if (!candidates.includes(base)) {
-      candidates.push(base);
-    }
-  });
-
-  absoluteOrigins.forEach((origin) => {
-    ["/api", "/api/v1", apiBaseNoV1 || "/api", apiBaseNormalized || "/api/v1"].forEach((base) => {
-      const merged = `${origin}${base.startsWith("/") ? base : `/${base}`}`;
-      if (!candidates.includes(merged)) {
-        candidates.push(merged);
-      }
-    });
-  });
-
-  let lastError = null;
-  for (const base of candidates) {
-    try {
-      const prefix = base.endsWith("/") ? base.slice(0, -1) : base;
-      const res = await requestJson(`${prefix}${path}`, options, "local");
-      if (res.code && res.code !== 0 && res.code !== 200) {
-        if (res.code === 404 || res.code === 405 || res.code === 501) {
-          lastError = { code: res.code, message: res.message };
-          continue;
-        }
-        return res;
-      }
-      return res;
-    } catch (e) {
-      lastError = { code: -1, message: e?.message || String(e) };
-    }
+  if (config.USE_MOCK_API) {
+    return mockApi(path, options);
   }
-
-  return { code: lastError?.code || -1, message: `request failed: ${lastError?.message || "no reachable export-jobs endpoint"}`, data: null };
+  try {
+    return await api(path, options);
+  } catch (e) {
+    return { code: -1, message: `request failed: ${e?.message || String(e)}`, data: null };
+  }
 }
 
 function mockApi(path, options = {}) {
@@ -897,7 +860,7 @@ function buildSchedulePayload() {
     file_format: format,
     enabled: true,
     mode: "visible",
-    destination: { type: "local", path: "nifi_data/exports" },
+    destination: { type: "local", path: "" },
     db_config: collectDbConfigForSchedule(),
     payload: { table },
   };

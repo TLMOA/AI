@@ -390,19 +390,28 @@ def run_export_job(job_record: dict) -> dict:
     filename = state.get("output_file") or f"job_{job_id}_{now_ts()}.{fmt}"
 
     # Determine primary output directory:
-    # 1) if job_record.destination.path provided, use it
-    # 2) otherwise default to NIFI_BASE_DIR/output_<format>
+    # If destination type is "local", write directly to exports archive.
+    # Otherwise, resolve destination.path or default to NIFI_BASE_DIR/output_<format>
+    # and mirror a copy to exports.
+    nifi_root = Path(os.getenv("NIFI_BASE_DIR", str(DEFAULT_NIFI_BASE)))
     destination = job_record.get("destination") or {}
-    primary_dir = None
-    if isinstance(destination, dict):
-        p = destination.get("path")
-        if p:
-            primary_dir = Path(p)
-    if primary_dir is None:
-        # use NIFI base dir as root and create format-specific folder
-        nifi_root = Path(os.getenv("NIFI_BASE_DIR", str(DEFAULT_NIFI_BASE)))
-        primary_dir = nifi_root / f"output_{fmt}"
-    primary_dir.mkdir(parents=True, exist_ok=True)
+    is_local = isinstance(destination, dict) and (destination.get("type") or "").lower() == "local"
+
+    if is_local:
+        primary_dir = dest_dir
+    else:
+        primary_dir = None
+        if isinstance(destination, dict):
+            p = destination.get("path")
+            if p:
+                parsed = Path(p)
+                if not parsed.is_absolute():
+                    primary_dir = nifi_root / parsed
+                else:
+                    primary_dir = parsed
+        if primary_dir is None:
+            primary_dir = nifi_root / f"output_{fmt}"
+        primary_dir.mkdir(parents=True, exist_ok=True)
 
     out_path = primary_dir / filename
 
@@ -415,17 +424,18 @@ def run_export_job(job_record: dict) -> dict:
         table = db_conf.get("table")
 
     if not table:
-        # no table provided - create a tiny demo file in primary output and mirror to exports
+        # no table provided - create a tiny demo file
         with out_path.open("w", encoding="utf-8") as f:
             f.write("id,ts\n")
             for i in range(1, 6):
                 f.write(f"{i},{now_ts()}\n")
-        # mirror to per-job export archive
-        try:
-            mirror_path = dest_dir / filename
-            shutil.copy2(str(out_path), str(mirror_path))
-        except Exception:
-            mirror_path = None
+        mirror_path = None
+        if not is_local:
+            try:
+                mirror_path = dest_dir / filename
+                shutil.copy2(str(out_path), str(mirror_path))
+            except Exception:
+                mirror_path = None
         _append_audit(dest_dir, {"status": "demo_written", "factory_id": factory_id, "primary_path": str(out_path), "mirror_path": str(mirror_path) if mirror_path else None})
         return {"status": "demo_written", "path": str(out_path)}
 
@@ -463,12 +473,13 @@ def run_export_job(job_record: dict) -> dict:
             # append rows to primary output
             _append_rows(out_path, fmt, cols, rows)
 
-            # mirror/copy the primary output to per-job export archive
-            try:
-                mirror_path = dest_dir / filename
-                shutil.copy2(str(out_path), str(mirror_path))
-            except Exception:
-                mirror_path = None
+            mirror_path = None
+            if not is_local:
+                try:
+                    mirror_path = dest_dir / filename
+                    shutil.copy2(str(out_path), str(mirror_path))
+                except Exception:
+                    mirror_path = None
 
             new_last = rows[-1].get(key_col)
             state.update({

@@ -1797,7 +1797,7 @@ def _sync_nifi_files() -> None:
                 continue
             if p.name.endswith(".meta.json"):
                 continue
-            if "export_jobs" in p.parts or "exports" in p.parts:
+            if "export_jobs" in p.parts:
                 continue
             disk_paths.add(str(p.resolve()))
 

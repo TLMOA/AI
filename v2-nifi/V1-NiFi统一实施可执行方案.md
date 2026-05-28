@@ -158,31 +158,31 @@ Local 和 NiFi 必须共用同一套响应壳、错误码、文件元数据和�
 
 1. 先在 `index.html` 上做全局切换按钮。
 2. 再把前端请求收敛到统一 API adapter。
-3. 然后实现后端 NiFi 一键接入能力：前端操作保持不变，后端只对接运维预置好的容器与 Flow，按任务需要启动/关闭既有 Flow，不在运行时自动部署新 Flow。
+3. 然后实现后端 NiFi 一键接入能力：前端操作保持不变，后端只对接运维预置好的容器与已运行的处理器，不在运行时自动部署新处理器。
 4. 再补齐数据库导出、上传转换、定时导出、自动打标四条高并发链路的 Local / NiFi 双路径实现。
 5. 再补目录扫描、任务回调、审计、回滚与演练。
 6. 最后再考虑更复杂的数据接入和扩展场景。
 
 ## 七点五、NiFi 后端一键接入方案
 
-本项目目标采用“NiFi 容器与 Flow 由后端麻烦地预先配置好，前端保持和 Local 一样一键触发”的方式实现 `backend-nifi`：用户在 `nifi` 模式下点击数据库导出时，前端不感知 NiFi 细节；后端只接入已存在的 NiFi 容器与已建好的 Flow，在一次导出任务中负责启动既有 Flow、投递任务、等待完成、回收结果，任务结束后可按需要关闭该 Flow。
+本项目目标采用“NiFi 容器与 Flow 由后端麻烦地预先配置好，前端保持和 Local 一样一键触发”的方式实现 `backend-nifi`：用户在 `nifi` 模式下点击数据库导出时，前端不感知 NiFi 细节；后端只确认 NiFi 容器和处理器已就绪，然后投递任务到共享目录，由 NiFi 自动消费并完成导出。
 
-这种模式适合阶段一和生产初版：前端体验和 Local 一样是一键完成，后端复杂度被限制在预置配置与任务调度上，最容易先把主链路跑通。
+这种模式适合阶段一和生产初版：前端体验和 Local 一样是一键完成，两个处理器始终保持 RUNNING 状态，后端只需写入任务 JSON 并轮询结果，复杂度最低。
 
 ### 7.5.1 基本原则
 
-1. 预置优先：`backend_mode=nifi` 时，NiFi 容器和目标 Flow 由运维/脚本提前准备好。
+1. 预置优先：`backend_mode=nifi` 时，NiFi 容器和处理器由运维/脚本提前准备好并保持运行。
 2. 一键优先：前端点击导出后，体验应和 Local 一样，不要求用户手工进入 NiFi 页面。
-3. 后端只做接入：后端负责检查 NiFi 是否可用、启动既有 Flow、提交任务、同步结果、记录审计。
-4. 不自动部署：后端不创建新 Flow，不自动拉起容器，不在运行时做复杂编排。
-5. 单机 NiFi MVP 优先：先跑通 Docker 单机 NiFi 和固定 Flow，再考虑 Registry、集群、HA。
+3. 后端只做接入：后端负责检查 NiFi 是否可用、确认处理器已就绪、投递任务、同步结果、记录审计。
+4. 不自动部署：后端不创建新处理器，不在运行时做复杂编排。
+5. 单机 NiFi MVP 优先：先跑通 Docker 单机 NiFi 和 2 个固定处理器，再考虑集群、HA。
 6. Local 与 NiFi 共享逻辑目录，但物理目录必须隔离。
 7. NiFi 后端统一使用 `/home/yhz/real_nifi_data` 作为宿主机数据根目录。
 8. 若 NiFi 不可用，明确返回错误或按配置回退 Local，不做静默自动修复。
 
 ### 7.5.2 NiFi 容器与目录前置准备
 
-需要先在宿主机创建以下目录，并由运维或脚本提前启动 NiFi 容器及固定 Flow：
+需要先在宿主机创建以下目录，并由运维或脚本提前启动 NiFi 容器及预置处理器：
 
 ```bash
 mkdir -p /home/yhz/real_nifi_data/export_jobs/inbox
@@ -195,6 +195,12 @@ mkdir -p /home/yhz/real_nifi_data/inbox_csv
 mkdir -p /home/yhz/real_nifi_data/inbox_json
 mkdir -p /home/yhz/real_nifi_data/inbox_tsv
 mkdir -p /home/yhz/real_nifi_data/tagged_output
+mkdir -p /home/yhz/real_nifi_data/csv_to_json
+mkdir -p /home/yhz/real_nifi_data/csv_to_tsv
+mkdir -p /home/yhz/real_nifi_data/json_to_csv
+mkdir -p /home/yhz/real_nifi_data/json_to_tsv
+mkdir -p /home/yhz/real_nifi_data/tsv_to_csv
+mkdir -p /home/yhz/real_nifi_data/tsv_to_json
 ```
 
 ### 7.5.3 后端只做 NiFi 就绪检查与 Flow 控制
@@ -205,12 +211,10 @@ mkdir -p /home/yhz/real_nifi_data/tagged_output
 
 1. 检查 NiFi 容器或服务是否已经在运行。
 2. 检查 NiFi API 是否可访问。
-3. 检查目标 Flow 是否已存在且处于可用状态。
-4. 需要时启动既有 Flow（启用/停止 Flow 的生命周期由后端控制，但不创建新 Flow）。
-5. 任务执行完成后按需要关闭既有 Flow。
-6. 若未就绪则返回明确错误，或按配置回退 Local，并记录审计。
+3. 检查目标处理器（GetFile + ExecuteStreamCommand）是否已存在且处于 RUNNING 状态。
+4. 若未就绪则返回明确错误，或按配置回退 Local，并记录审计。
 
-默认策略应是“只做后端对接，不在运行时自动创建容器或自动部署 Flow”；如确需演示或联调，可通过显式环境变量单独开启自动化能力，并保持审计可追踪。
+默认策略应是“只做后端对接，不在运行时自动创建容器或自动部署处理器”；如确需演示或联调，可通过显式环境变量单独开启自动化能力，并保持审计可追踪。
 
 运维或脚本预置容器时的等价命令如下：
 
@@ -227,7 +231,7 @@ docker run -d \
 后续正式化时，应改为 `docker-compose.yml` 或 Docker SDK 管理，并补充：
 
 - NiFi 数据库/Flow 仓库持久化 volume
-- MySQL JDBC 驱动挂载
+- Python pymysql 依赖预装（Worker 脚本需要，见 7.5.4）
 - 用户认证配置
 - 时区配置
 - 日志目录挂载
@@ -238,103 +242,311 @@ docker run -d \
 建议新增后端模块：`nifi_orchestrator`，职责包括：
 
 - `check_nifi_ready()`：检查 NiFi API 是否可访问，确认容器/服务已预置。
-- `start_existing_flow()`：启用既有数据库导出 Flow，开始处理任务。
-- `stop_existing_flow()`：在任务完成后关闭既有 Flow。
-- `ensure_export_flow()`：确认数据库导出 Flow 已存在且可用。
-- `submit_export_job()`：写入导出任务 JSON 到 `export_jobs/inbox`。
+- `ensure_export_flow()`：确认 GetFile + ExecuteStreamCommand 两个处理器已存在且 RUNNING，pymysql 已安装，Worker 脚本就位。
+- `submit_export_job()`：写入导出任务 JSON 到 `export_jobs/inbox`（密码来自前端，原样传递）。
 - `sync_export_result()`：扫描 `done/error` 并注册文件资源。
 
 后端导出接口不得直接散落 NiFi HTTP 调用，必须通过该接入模块统一封装。
 
-### 7.5.4 MySQL JDBC 驱动
+### 7.5.4 Python Worker 与 pymysql（替代 JDBC + DBCP）
 
-数据库导出 Flow 需要 NiFi 能连接 MySQL，因此必须准备 MySQL Connector/J，并在 NiFi 中配置 `DBCPConnectionPool`。
+> 本方案不使用 JDBC / DBCPConnectionPool / ExecuteSQLRecord。
+> 原因：DBCP 的密码需要在 NiFi Controller Service 中**静态配置**，无法满足"前端用户填写不同数据库凭据，每次导出各用各的密码"这一核心需求。
+
+数据库连接由 **Python Worker 脚本**直接从任务 JSON 读取动态参数（dbType / host / port / user / password / database），根据 `dbType` 字段自动选择对应驱动（pymysql、psycopg2、pymssql、oracledb、sqlite3、pyhive、hdfs、happybase）连接。
+
+密码传递链路：**前端表单 → 后端任务 JSON → NiFi GetFile → ExecuteStreamCommand stdin → Worker → 驱动 connect()**。每一步都不对密码做加工，前端填什么，目标数据库就收到什么。
 
 最小要求：
 
-1. 将 MySQL JDBC jar 挂载到 NiFi 容器可访问目录。
-2. 在 NiFi Controller Services 中新增 `DBCPConnectionPool`。
-3. 配置 JDBC URL、驱动类、用户名、密码。
-4. 在 `ExecuteSQL` 或 `ExecuteSQLRecord` 中引用该连接池。
+1. NiFi 容器中安装所需数据库驱动：
+   ```bash
+   docker exec iot-nifi pip3 install pymysql psycopg2-binary pymssql
+   # 可选：oracledb pyhive pyarrow hdfs happybase
+   ```
+2. Worker 脚本部署到共享目录：
+   ```bash
+   cp v1-backend/scripts/nifi_db_export_worker.py \
+      /home/yhz/iot/real_nifi_data/bin/nifi_db_export_worker.py
+   ```
+3. 容器内可见：`/opt/nifi/nifi-current/data/iot/bin/nifi_db_export_worker.py`
+4. Worker 从 stdin 读取任务 JSON，根据 `dbType` 选择驱动，`password` 字段直接传给驱动的 connect 函数。
+5. 无需配置任何 NiFi Controller Service（0 个 CS）。
 
-### 7.5.5 数据库导出 Flow MVP
+详见 `02-db-export-flow.md` 第三章"完整数据流"。
 
-数据库导出最小 Flow 顺序：
+### 7.5.5 数据库导出 Flow MVP（仅 2 个处理器，8 种数据源通用）
 
-1. `GetFile` 或 `ListFile + FetchFile` 监听 `/opt/nifi/nifi-current/data/iot/export_jobs/inbox`。
-2. `EvaluateJsonPath` 解析任务 JSON。
-3. `UpdateAttribute` 提取 `jobId、factoryId、host、port、database、table、where、format、targetDir`。
-4. `ExecuteSQL` 或 `ExecuteSQLRecord` 执行 MySQL 查询。
-5. `ConvertRecord` 或脚本处理器转换为 CSV / JSON / TSV。
-6. `PutFile` 写入 `/opt/nifi/nifi-current/data/iot/output_csv|output_json|output_tsv`。
-7. 成功后写 `/opt/nifi/nifi-current/data/iot/export_jobs/done/{jobId}.json`。
-8. 失败后写 `/opt/nifi/nifi-current/data/iot/export_jobs/error/{jobId}.json`。
+```
+GetFile (Root Group) ──success──┐
+                                │
+                                ▼
+                 ExecuteStreamCommand (Root Group)
+                         │
+                         │ 调用: python3 /opt/nifi/.../bin/nifi_db_export_worker.py
+                         │ 传参: stdin ← 任务 JSON（含 dbType / host/port/user/password/database/table）
+                         │
+                         ▼
+              nifi_db_export_worker.py（通用 Worker）
+              ├── json.load(sys.stdin) → 动态凭据
+              ├── 根据 dbType 选择驱动（mysql→pymysql, postgres→psycopg2, ...）
+              ├── output_{format}/{jobId}_{timestamp}.{csv|json|tsv}
+              └── export_jobs/done|error/{jobId}.json
+```
+
+**2 个处理器，0 个 Controller Service，无需任何 JDBC jar。支持全部 8 种数据源：MySQL、PostgreSQL、SQLServer、Oracle、SQLite、Hive、HDFS、HBase。**
+
+1. `GetFile`：监听 `/opt/nifi/nifi-current/data/iot/export_jobs/inbox`，匹配 `*.json`，消费后删除。
+2. `ExecuteStreamCommand`：通过 stdin 将任务 JSON 全文传给 Python Worker，Worker 负责解析、驱动选择、连接、查询（或 HDFS/HBase 读取）、格式转换、写入结果和状态文件。
+
+创建方式：通过 NiFi REST API 一键部署（Python 脚本），详见 `02-db-export-flow.md` 第五章。
 
 ### 7.5.5.1 Flow 预置与复用要求
 
 后端不负责自动部署 Flow，而是按以下规则处理：
 
-1. NiFi 侧提前准备好数据库导出 Process Group。
-2. 后端通过 NiFi API 检查该 Process Group 是否存在且可用。
-3. 后端在执行任务前启用这个既有 Flow，任务完成后按需关闭。
-4. 若已存在但不可用，则返回明确错误或回退 Local。
+1. NiFi 侧提前在 Root Group 准备好 `GetFile` + `ExecuteStreamCommand` 两个处理器（通过 `02-db-export-flow.md` 第五章的 Python 一键部署脚本创建）。
+2. 后端通过 NiFi API 检查两个处理器是否存在且处于 RUNNING 状态。
+3. 后端只需确认 Worker 脚本部署到位、所需驱动已安装、inbox 目录存在即可。
+4. 若不存在或不可用，则返回明确错误或回退 Local。
 5. 部署和版本管理由运维、脚本或单独发布流程完成。
-6. 建议记录 Flow 标识，例如 `processGroupId`、`flowName`、`version`。
-7. 后续数据库导出任务复用同一个 Flow，只通过 `export_jobs/inbox` 投递不同任务 JSON。
+6. 处理器标识：
+   - GetFile 名称：`iot_db_export_getfile_v1`
+   - ExecuteStreamCommand 名称：`iot_db_export_command_v1`
+7. 所有数据源、手动导出、定时导出任务复用同一组处理器，只通过 `export_jobs/inbox` 投递不同的任务 JSON。
 
-Flow 标识建议：
-
-- Flow 名称：`iot_mysql_export_flow_v1`
-- Process Group 名称：`iot-mysql-export`
-- 监听目录：`/opt/nifi/nifi-current/data/iot/export_jobs/inbox`
-- 输出根目录：`/opt/nifi/nifi-current/data/iot`
-
-### 7.5.6 后端半自动接入执行顺序
+### 7.5.6 后端接入执行顺序
 
 用户在 `backend_mode=nifi` 下点击数据库导出时，后端必须按以下顺序执行：
 
 1. 读取当前 tenant 的 `backend_mode`，确认是 `nifi`。
-2. 调用 `check_nifi_ready()`，确认 NiFi API 可访问且目标 Flow 已预置。
-3. 调用 `ensure_export_flow()`，确认数据库导出 Flow 已存在且可用。
-4. 调用 `start_existing_flow()`，启用该 Flow 开始处理。
-5. 生成数据库导出任务 JSON。
-6. 写入 `/home/yhz/real_nifi_data/export_jobs/inbox/{jobId}.json`。
-7. 返回前端 `PENDING` / `已提交到 NiFi` 状态。
-8. 后端扫描 `done/error`，或由定时任务同步结果。
-9. 若 NiFi 成功输出文件，则注册 fileId，并供前端预览、下载、追踪。
-10. 任务结束后调用 `stop_existing_flow()`，关闭该 Flow。
+2. 调用 `check_nifi_ready()`，确认 NiFi API 可访问。
+3. 调用 `ensure_export_flow()`，确认 GetFile + ExecuteStreamCommand 两个处理器已存在且 Worker 脚本就位。
+4. 生成数据库导出任务 JSON（密码来自前端，原样写入）。
+5. 写入 `/home/yhz/real_nifi_data/export_jobs/inbox/{jobId}.json`。
+6. 返回前端 `PENDING` / `已提交到 NiFi` 状态。
+7. 后端扫描 `done/error`，或由定时任务同步结果。
+8. 若 NiFi 成功输出文件，则注册 fileId，并供前端预览、下载、追踪。
 
-### 7.5.6.1 半自动接入失败处理
+> 注：新方案中两个处理器始终处于 RUNNING 状态，无需 `start_existing_flow()` / `stop_existing_flow()` 步骤。
+
+### 7.5.6.1 接入失败处理
 
 后端接入失败时，必须按统一策略处理：
 
 1. Docker/服务不可用：返回明确错误或按配置回退 Local。
 2. NiFi API 不可访问：记录审计，并返回 NiFi 不可用。
-3. 目标 Flow 不存在或不可用：记录审计，并返回 Flow 不可用。
-4. Flow 启动失败或关闭失败：记录审计，并返回 Flow 不可用或任务失败。
-5. 任务 JSON 写入失败：返回任务提交失败。
-6. 任何回退 Local 的行为都必须写入审计，不允许静默回退。
+3. 目标处理器不存在或不可用：记录审计，并返回 Flow 不可用。
+4. 任务 JSON 写入失败：返回任务提交失败。
+5. 任何回退 Local 的行为都必须写入审计，不允许静默回退。
 
 ### 7.5.6.2 与后端联调顺序
 
 1. 先由运维或脚本确保 NiFi 容器已启动。
 2. 后端能检测 NiFi API 是否可访问。
-3. 后端能检查数据库导出 Flow 是否存在且可用。
-4. 后端能启用和关闭既有 Flow。
-5. 后端能写入导出任务 JSON。
-6. NiFi 能消费任务并生成 CSV/JSON/TSV。
-7. NiFi 能写入 `done/error` 状态文件。
-8. 后端能扫描结果并注册 fileId。
+3. 后端能检查 GetFile + ExecuteStreamCommand 两个处理器是否存在且 RUNNING。
+4. 后端能写入导出任务 JSON。
+5. NiFi 能消费任务并生成 CSV/JSON/TSV。
+6. NiFi 能写入 `done/error` 状态文件。
+7. 后端能扫描结果并注册 fileId。
 
 ### 7.5.7 数据库导出点击行为要求
 
-当用户点击“数据库导出”时：
+当用户点击"数据库导出"时：
 
 - `backend_mode=local`：后端本地执行导出。
-- `backend_mode=nifi`：后端必须先确认 NiFi 容器/服务和数据库导出 Flow 已预置且可用，然后启用该 Flow、提交 NiFi 任务，由 NiFi 完成 SQL 查询、格式转换与文件落盘。
+- `backend_mode=nifi`：后端必须先确认 NiFi 容器/服务可用、GetFile + ExecuteStreamCommand 两个处理器已预置且 RUNNING、Worker 脚本就位，然后提交 NiFi 任务，由 Worker 完成 SQL 查询、格式转换与文件落盘。
 - NiFi 可用且任务提交成功时，不允许后端本地直接生成导出文件。
-- NiFi 不可用、Flow 不存在或不可用、Flow 启动/关闭失败、任务提交失败时，才允许根据降级策略回退 Local，并必须记录审计。
-- 前端不需要知道容器启动、Flow 部署、Flow 启动等细节，只接收统一响应：`PENDING`、`SUCCEEDED`、`FAILED` 或明确错误。
+- NiFi 不可用、处理器不存在或不可用、任务提交失败时，才允许根据降级策略回退 Local，并必须记录审计。
+- 前端不需要知道容器启动、Worker 脚本等细节，只接收统一响应：`PENDING`、`SUCCEEDED`、`FAILED` 或明确错误。
+
+### 7.5.8 上传自动转换 NiFi 方案
+
+> 详细配置步骤见 `03-upload-convert-flow.md`
+
+与数据库导出同模式——前端上传文件后，后端将源文件保存到 `inbox_csv|inbox_json|inbox_tsv`，并投递转换任务 JSON，NiFi 消费后调用 Worker 完成格式转换。
+
+**处理器数量**：3（ListFile + FetchFile + ExecuteStreamCommand），0 个 Controller Service。
+
+**ListFile**：持续扫描 `/opt/nifi/nifi-current/data/iot/convert_jobs/inbox/*.json`，`schedulingPeriod: 5 sec`。
+
+**FetchFile**：读取 ListFile 发现的文件内容（即任务 JSON），传给下游。
+
+**ExecuteStreamCommand**：调用 `python3 /opt/nifi/nifi-current/data/iot/bin/nifi_upload_convert_worker.py`，通过 stdin 传入任务 JSON。
+
+**Worker 职责**：
+- 解析任务 JSON（sourcePath / sourceFormat / targetFormats）
+- 读取源文件（CSV / NDJSON / JSON 数组 / JSON 单对象 / TSV 自动检测）
+- 转换为目标格式：CSV↔JSON↔TSV 六向转换
+- 原子写输出到 `csv_to_json/`, `csv_to_tsv/`, `json_to_csv/`, `json_to_tsv/`, `tsv_to_csv/`, `tsv_to_json/`
+- 写状态文件到 `convert_jobs/done|error/{jobId}.json`
+
+**前提依赖**：
+- Worker 脚本：`v1-backend/scripts/nifi_upload_convert_worker.py` 部署到 `real_nifi_data/bin/`
+- 目录创建：`convert_jobs/`, `*_to_*` 六个转换输出目录
+- 无外部 pip 依赖（纯标准库 csv / json）
+
+**创建方式**：Python API 一键部署脚本，详见 `03-upload-convert-flow.md` 第四章。
+
+**处理器标识建议**：
+- ListFile: `iot_upload_convert_listfile_v1`
+- FetchFile: `iot_upload_convert_fetchfile_v1`
+- ExecuteStreamCommand: `iot_upload_convert_command_v1`
+
+**后端接入要点**：
+1. `nifi_orchestrator` 新增 `ensure_convert_flow()`：检查 ListFile + FetchFile + ExecuteStreamCommand 三级处理器是否 RUNNING。
+2. 上传接口收到文件后，后端保存源文件到对应 `inbox_*` 目录。
+3. 构建转换任务 JSON → 写入 `convert_jobs/inbox/{jobId}.json`。
+4. 扫描 `convert_jobs/done|error` 同步结果。
+
+**任务 JSON 结构**：
+```json
+{
+  "jobId": "convert_abc123",
+  "sourcePath": "/opt/nifi/nifi-current/data/iot/inbox_csv/uploaded_user_csv_20260528_120000.csv",
+  "sourceFormat": "CSV",
+  "targetFormats": ["JSON", "TSV"],
+  "fileName": "uploaded_user_csv_20260528_120000",
+  "ownerId": "user-001",
+  "factoryId": "factory-001"
+}
+```
+
+### 7.5.9 自动打标 NiFi 方案
+
+> 详细配置步骤见 `04-auto-tagging-flow.md`
+
+前端选择文件 + 配置打标规则后，后端投递打标任务 JSON，NiFi 消费后调用 Worker 应用标签并输出到 `tagged_output`。
+
+**处理器数量**：2（GetFile + ExecuteStreamCommand），0 个 Controller Service。与数据库导出完全一致的架构。
+
+**GetFile**：监听 `/opt/nifi/nifi-current/data/iot/tagging_jobs/inbox/*.json`，消费后删除。
+
+**ExecuteStreamCommand**：调用 `python3 /opt/nifi/nifi-current/data/iot/bin/nifi_auto_tagging_worker.py`，通过 stdin 传入任务 JSON。
+
+**Worker 职责**：
+- 解析任务 JSON（sourcePath / tagType / tagConfig / targetFormat）
+- 读取源文件（CSV / JSON / TSV）
+- 根据 tagType 应用打标规则：
+  - `manual-table`：逐列映射 `值→标签`
+  - `auto-rule`：预定义规则引擎（正则 / 范围 / 条件表达式）
+  - `ai-suggestion`：AI 服务推荐（预留接口）
+- 原子写输出到 `tagged_output/<source>_tagged_YYYYMMDD_HHMMSS.<ext>`
+- 写状态文件到 `tagging_jobs/done|error/{jobId}.json`
+
+**前提依赖**：
+- Worker 脚本：`v1-backend/scripts/nifi_auto_tagging_worker.py` 部署到 `real_nifi_data/bin/`
+- 目录创建：`tagging_jobs/`, `tagged_output/`
+- 无外部 pip 依赖（纯标准库 csv / json）
+
+**创建方式**：Python API 一键部署脚本，详见 `04-auto-tagging-flow.md` 第四章。
+
+**处理器标识建议**：
+- GetFile: `iot_auto_tagging_getfile_v1`
+- ExecuteStreamCommand: `iot_auto_tagging_command_v1`
+
+**后端接入要点**：
+1. `nifi_orchestrator` 新增 `ensure_tagging_flow()`：检查 GetFile + ExecuteStreamCommand 处理器是否 RUNNING。
+2. 打标接口收到请求后，构建任务 JSON → 写入 `tagging_jobs/inbox/{jobId}.json`。
+3. 扫描 `tagging_jobs/done|error` 同步结果。
+
+**任务 JSON 结构**：
+```json
+{
+  "jobId": "tag_abc123",
+  "sourcePath": "/opt/nifi/nifi-current/data/iot/output_csv/sensor_data.csv",
+  "sourceFormat": "CSV",
+  "tagType": "manual-table",
+  "tagConfig": {
+    "columns": ["status"],
+    "mappings": {
+      "row_rules": [{ "column": "status", "mapping": {"0": "正常", "1": "告警"}}]
+    }
+  },
+  "targetFormat": "CSV",
+  "fileName": "sensor_data_export_20260528",
+  "factoryId": "factory-001",
+  "ownerId": "admin"
+}
+```
+
+### 7.5.10 其余功能说明
+
+以下功能不需要独立的 NiFi Flow，由后端直接处理或复用已有 Flow：
+
+#### 7.5.10.1 定时导出
+
+定时导出**不创建单独的 NiFi Flow**，而是复用 02 数据库导出 Flow（GetFile + ExecuteStreamCommand + MySQL Export Worker）。
+
+**实现方式**：
+- 后端通过 cron / APScheduler 按调度策略触发
+- 到了调度时间点，后端生成与数据库导出完全一致的任务 JSON
+- 写入同一个 `export_jobs/inbox` 目录
+- NiFi 现有的 GetFile + ExecuteStreamCommand 处理器自动消费，Worker 正常执行
+- 输出仍落 `output_csv|output_json|output_tsv`
+- 命名加 `_scheduled` 前缀区分手动导出
+
+**后端新增逻辑**：
+- `schedule_export_job()`：按工厂调度配置定时生成任务 JSON 并投递
+- 调度配置持久化到数据库（工厂级 `export_schedule` 字段）
+
+#### 7.5.10.2 文件中心目录扫描
+
+**不需要 NiFi 承接**。这是一个纯后端操作：
+
+- 后端直接扫描 `/home/yhz/real_nifi_data` 和 `/home/yhz/nifi-data` 的目录树
+- 建立文件索引（fileId, fileName, fileFormat, fileSize, storagePath, createdAt）
+- 提供 `/api/v1/files` 列表接口
+- 前端通过统一 adapter 获取文件列表
+
+NiFi 模式下文件索引更新与 Local 模式完全一致，无额外 NiFi 配置。
+
+#### 7.5.10.3 任务状态与回调
+
+**不需要 NiFi 承接**。后端轮询机制统一处理：
+
+- 所有 NiFi Flow（02/03/04）的 Worker 均写入 `done|error/{jobId}.json` 状态文件
+- 后端 `nifi_orchestrator.sync_*_result()` 定期扫描各 `done/error` 目录
+- 检测到新状态文件后：解析内容 → 注册 fileId → 更新任务状态 → 通知前端
+- 轮询间隔建议 5 秒（与 ListFile schedulingPeriod 一致）
+
+---
+
+### 7.5.11 所有 Flow 全景图
+
+```
+┌──────────────────────────────────────────────────────────────────────┐
+│                    NiFi Root Group                                     │
+│                                                                        │
+│  ┌─────────────────────────────────────────────────────────────────┐ │
+│  │ 02 数据库导出 + 定时导出复用（8 种数据源通用）                     │ │
+│  │ GetFile ──→ ExecuteStreamCommand ──→ nifi_db_export_worker       │ │
+│  │ inbox: export_jobs/inbox  │  输出: output_csv|output_json|output_tsv│
+│  │ 处理器: iot_db_export_getfile_v1, iot_db_export_command_v1        │ │
+│  └─────────────────────────────────────────────────────────────────┘ │
+│                                                                        │
+│  ┌─────────────────────────────────────────────────────────────────┐ │
+│  │ 03 上传自动转换                                                    │ │
+│  │ ListFile → FetchFile → ExecuteStreamCommand → upload_convert_worker│
+│  │ inbox: convert_jobs/inbox  │  输出: *_to_* (6个子目录)             │ │
+│  │ 处理器: iot_upload_convert_listfile_v1, ...fetchfile_v1, ...cmd_v1│ │
+│  └─────────────────────────────────────────────────────────────────┘ │
+│                                                                        │
+│  ┌─────────────────────────────────────────────────────────────────┐ │
+│  │ 04 自动打标                                                        │ │
+│  │ GetFile ──→ ExecuteStreamCommand ──→ nifi_auto_tagging_worker    │ │
+│  │ inbox: tagging_jobs/inbox  │  输出: tagged_output                 │ │
+│  │ 处理器: iot_auto_tagging_getfile_v1, iot_auto_tagging_command_v1 │ │
+│  └─────────────────────────────────────────────────────────────────┘ │
+│                                                                        │
+│  ┌──────────────────────────────────────────────────────────────────┐│
+│  │ 后端直接处理（无需 NiFi Flow）                                      ││
+│  │ · 文件中心目录扫描 → 后端扫描 real_nifi_data + nifi-data           ││
+│  │ · 任务状态回调   → 后端轮询各 Flow 的 done/error 目录              ││
+│  │ · 定时导出       → 后端 cron 触发，复用 02 Flow 的 inbox           ││
+│  └──────────────────────────────────────────────────────────────────┘│
+└──────────────────────────────────────────────────────────────────────┘
+```
 
 ## 八、验收标准
 
@@ -345,30 +557,38 @@ Flow 标识建议：
 - Local 和 NiFi 返回结构一致
 - 数据库导出、上传转换、定时导出、自动打标能按模式正确路由
 - 当 `backend_mode=nifi` 且 NiFi 容器未运行时，后端应返回明确的不可用错误或按部署配置回退到 `local`，不得默认自动创建新容器
-- 当数据库导出 Flow 不存在时，后端应记录审计并返回 Flow 不可用；Flow 的部署由运维/发布流程负责，后端不应默认自动创建新 Flow
-- 当数据库导出 Flow 已存在时，后端不得重复创建 Flow，必须复用并确保其处于运行或已启用状态（可由后端启停既有 Flow）
+- 当数据库导出处理器已存在时，后端不得重复创建，必须复用并确保其处于 RUNNING 状态
 - 点击数据库导出后，任务 JSON 能自动进入 `/home/yhz/real_nifi_data/export_jobs/inbox`
 - NiFi 能自动消费任务并将结果写入 `/home/yhz/real_nifi_data/output_csv|output_json|output_tsv`
 - NiFi 能写入 `/home/yhz/real_nifi_data/export_jobs/done|error` 状态文件
 - 后端能同步 NiFi 状态文件并注册 fileId
-- 启动/停止既有 Flow、任务提交、失败回退等关键操作必须记录审计日志
- - 数据库导出、上传转换、定时导出、自动打标能按模式正确路由
- - 当 `backend_mode=nifi` 且 NiFi 容器未运行时，后端应返回明确的不可用错误或按部署配置回退到 `local`，不得在未获运维授权的情况下自动创建新容器
- - 当数据库导出 Flow 不存在时，后端应记录审计并返回 Flow 不可用；Flow 的部署由运维/发布流程负责，后端不应自动创建新 Flow
- - 当数据库导出 Flow 已存在时，后端不得重复创建 Flow，必须复用并确保其处于运行或已启用状态（可由后端启停既有 Flow）
- - 点击数据库导出后，任务 JSON 能自动进入 `/home/yhz/real_nifi_data/export_jobs/inbox`
- - NiFi 能消费任务并将结果写入 `/home/yhz/real_nifi_data/output_csv|output_json|output_tsv`（消费逻辑由 NiFi 侧预置）
- - NiFi 能写入 `/home/yhz/real_nifi_data/export_jobs/done|error` 状态文件
- - 后端能同步 NiFi 状态文件并注册 fileId
- - 启动/停止既有 Flow、任务提交、失败回退等关键操作必须记录审计日志
+- 启动/停止既有处理器、任务提交、失败回退等关键操作必须记录审计日志
 
 ## 九、与现有文档的关系
 
-本文件是实施版，配合：
-- `V2执行清单/V1-NiFi统一实施总方案.md`
+本文件是实施版，配合以下文档使用：
+
+**总方案**：
+- `V2执行清单/V1-NiFi统一实施总方案.md` — 原则和边界
+
+**NiFi Flow 详细配置（v2-nifi/ 目录）**：
+| 文档 | 功能 | 处理器数量 |
+|------|------|-----------|
+| `01-cleanup-old-flow.md` | 清理旧方案遗留 | — |
+| `02-db-export-flow.md` | 数据库导出（8 种数据源通用 + 定时导出复用） | 2（GetFile + ExecuteStreamCommand） |
+| `03-upload-convert-flow.md` | 上传自动转换 | 3（ListFile + FetchFile + ExecuteStreamCommand） |
+| `04-auto-tagging-flow.md` | 自动打标 | 2（GetFile + ExecuteStreamCommand） |
+| 本文件 | 统一实施可执行方案（交叉索引总控） | — |
+
+**后端对接**：
+- `v1-backend/app/nifi_orchestrator.py` — NiFi 接入模块
+- `v1-backend/scripts/nifi_db_export_worker.py` — 数据库导出 Worker（8 种数据源通用）
+- `v1-backend/scripts/nifi_upload_convert_worker.py` — 上传转换 Worker（待创建）
+- `v1-backend/scripts/nifi_auto_tagging_worker.py` — 自动打标 Worker（待创建）
 
 使用方式：
 - 总方案负责原则和边界
-- 本文件负责落地顺序和验收
+- 各 Flow md 负责对应功能的 NiFi 配置细化步骤
+- 本文件负责落地顺序、交叉索引和验收
 
 
