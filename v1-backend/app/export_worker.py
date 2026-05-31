@@ -378,16 +378,36 @@ def _export_from_hdfs(db_conf: Dict, hdfs_path: str, output_path: Path, file_for
         }
 
 
+def _sanitize_fn(value: Optional[str]) -> str:
+    if not value:
+        return "unknown"
+    s = str(value)
+    out_chars = []
+    for ch in s:
+        if ch.isalnum() or ch in {"_", "-"}:
+            out_chars.append(ch)
+        else:
+            out_chars.append("_")
+    return "".join(out_chars).rstrip("_") or "unknown"
+
+
 def run_export_job(job_record: dict) -> dict:
     """job_record expects keys: job_name, owner_id, db_config, file_format, destination"""
     job_id = job_record.get("id") or uuid.uuid4().hex[:8]
     factory_id = job_record.get("factory_id") or os.getenv("DEFAULT_FACTORY_ID", "factory-001")
     customer = job_record.get("owner_id") or "unknown"
+    db_conf = job_record.get("db_config") or {}
+    payload = job_record.get("payload") or {}
+    table = (payload.get("table") if isinstance(payload, dict) else None) or (
+        db_conf.get("table") if isinstance(db_conf, dict) else None
+    ) or "data"
+    owner = _sanitize_fn(customer)
+    table_safe = _sanitize_fn(table)
+    fmt = (job_record.get("file_format") or "csv").lower()
     # mirror/export directory (per-job archive)
     dest_dir = ensure_export_dir(customer, job_id)
-    fmt = (job_record.get("file_format") or "csv").lower()
     state = _load_state(dest_dir)
-    filename = state.get("output_file") or f"job_{job_id}_{now_ts()}.{fmt}"
+    filename = state.get("output_file") or f"export_{owner}_{table_safe}_{now_ts()}.{fmt}"
 
     # Determine primary output directory:
     # If destination type is "local", write directly to exports archive.
@@ -415,11 +435,6 @@ def run_export_job(job_record: dict) -> dict:
 
     out_path = primary_dir / filename
 
-    db_conf = job_record.get("db_config") or {}
-    table = None
-    payload = job_record.get("payload") or {}
-    if isinstance(payload, dict):
-        table = payload.get("table")
     if not table and isinstance(db_conf, dict):
         table = db_conf.get("table")
 

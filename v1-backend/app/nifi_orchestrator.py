@@ -23,8 +23,13 @@ NIFI_AUTO_CREATE_CONTAINER = os.getenv("NIFI_AUTO_CREATE_CONTAINER", "false").lo
 NIFI_AUTO_START_CONTAINER = os.getenv("NIFI_AUTO_START_CONTAINER", "false").lower() == "true"
 NIFI_AUTO_DEPLOY_FLOW = os.getenv("NIFI_AUTO_DEPLOY_FLOW", "false").lower() == "true"
 NIFI_FLOW_MARKER = NIFI_REAL_BASE_DIR / "export_jobs" / ".iot_mysql_export_flow_v1.ready.json"
-NIFI_WORKER_SOURCE = Path(__file__).resolve().parent.parent / "scripts" / "nifi_mysql_export_worker.py"
-NIFI_WORKER_TARGET = NIFI_REAL_BASE_DIR / "bin" / "nifi_mysql_export_worker.py"
+# ═══════════════════════════════════════════════════════════════════
+# v2-nifi 对齐：已从旧版 nifi_mysql_export_worker 切换为多数据源通用
+# Worker nifi_db_export_worker.py（支持 MySQL/PG/SQLServer/Oracle/SQLite/
+# Hive/HDFS/HBase 共 8 种），处理器名也对应更新为 iot_db_export_*。
+# ═══════════════════════════════════════════════════════════════════
+NIFI_WORKER_SOURCE = Path(__file__).resolve().parent.parent / "scripts" / "nifi_db_export_worker.py"
+NIFI_WORKER_TARGET = NIFI_REAL_BASE_DIR / "bin" / "nifi_db_export_worker.py"
 NIFI_FLOW_DOC_SOURCE = Path(__file__).resolve().parent.parent / "nifi_mysql_export_flow.md"
 NIFI_FLOW_DOC_TARGET = NIFI_REAL_BASE_DIR / "export_jobs" / "nifi_mysql_export_flow.md"
 
@@ -346,7 +351,7 @@ def _start_processor(proc: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _ensure_getfile_processor() -> Dict[str, Any]:
-    name = "iot_mysql_export_getfile_v1"
+    name = "iot_db_export_getfile_v1"
     proc = _find_processor_by_name(name)
     created = False
     if proc is None:
@@ -368,7 +373,7 @@ def _ensure_getfile_processor() -> Dict[str, Any]:
 
 
 def _ensure_command_processor() -> Dict[str, Any]:
-    name = "iot_mysql_export_command_v1"
+    name = "iot_db_export_command_v1"
     proc = _find_processor_by_name(name)
     created = False
     if proc is None:
@@ -434,8 +439,8 @@ def _deploy_mysql_export_flow_via_api() -> Dict[str, Any]:
 
 
 def inspect_export_flow() -> Dict[str, Any]:
-    getfile = _find_processor_by_name("iot_mysql_export_getfile_v1")
-    command = _find_processor_by_name("iot_mysql_export_command_v1")
+    getfile = _find_processor_by_name("iot_db_export_getfile_v1")
+    command = _find_processor_by_name("iot_db_export_command_v1")
     api_exists = bool(getfile and command)
     marker_payload = None
     if NIFI_FLOW_MARKER.exists():

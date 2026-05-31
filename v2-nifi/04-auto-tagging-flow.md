@@ -31,7 +31,7 @@ nifi_auto_tagging_worker.py
   │     tagConfig: { columns: [...], rules: [...], ... }
   ├── 生成打标产物
   │     格式：CSV / JSON / TSV（与源格式一致或按 targetFormat）
-  │     命名：<source>_tagged_YYYYMMDD_HHMMSS.<ext>
+  │     命名：tag_{owner}_{source}_YYYYMMDD_HHMMSS.<ext>
   ├── 原子写：临时文件 → 校验 → 重命名
   └── 写状态文件：tagging_jobs/done|error/{jobId}.json
 ```
@@ -49,7 +49,7 @@ nifi_auto_tagging_worker.py
 │  ┌──────────────────────────────────────────────────┐               │
 │  │  打标表单                                          │               │
 │  │                                                  │               │
-│  │  选择文件:    [ sensor_data_export_2026....csv ]  │               │
+│  │  选择文件:    [ export_owner_sensor_data_2026....csv ]  │               │
 │  │  打标方式:    [ 手动打标 ▾ ]                      │               │
 │  │                                                  │               │
 │  │  打标规则:    列名  标签值  置信度                  │               │
@@ -72,7 +72,7 @@ nifi_auto_tagging_worker.py
 │                                                                      │
 │  {                                                                   │
 │    "jobId":       "tag_abc123",                                      │
-│    "sourcePath":  "/opt/nifi/.../output_csv/sensor_data_export_...", │
+│    "sourcePath":  "/opt/nifi/.../output_csv/export_owner_sensor_...",│
 │    "sourceFormat": "CSV",                                            │
 │    "tagType":     "manual-table",                                    │
 │    "tagConfig": {                                                    │
@@ -85,7 +85,7 @@ nifi_auto_tagging_worker.py
 │      }                                                               │
 │    },                                                                │
 │    "targetFormat": "CSV",                                            │
-│    "fileName":    "sensor_data_export_20260528_120000",              │
+│    "fileName":    "export_owner_sensor_data_20260528_120000.csv",    │
 │    "factoryId":   "factory-001",                                     │
 │    "ownerId":     "admin"                                            │
 │  }                                                                   │
@@ -100,13 +100,13 @@ nifi_auto_tagging_worker.py
 │    ├── 读取 sourcePath 源文件                                         │
 │    ├── 根据 tagConfig 逐行匹配/打标                                    │
 │    ├── 生成 tagged 输出文件                                           │
-│    └── 原子写 tagged_output/<source>_tagged_20260528_120000.csv       │
+│    └── 原子写 tagged_output/tag_admin_sensor_data_20260528_120000.csv       │
 └──────────────────────────────────────────────────────────────────────┘
 
 ┌──────────────────────────────────────────────────────────────────────┐
 │  阶段 4：Worker 输出结果                                               │
 │                                                                      │
-│  ✓ 成功 → tagged_output/sensor_data_export_20260528_120000_tagged_...│
+│  ✓ 成功 → tagged_output/tag_owner_sensor_data_20260528_120000.csv   │
 │          tagging_jobs/done/tag_abc123.json (SUCCEEDED)                │
 │                                                                      │
 │  ✗ 失败 → tagging_jobs/error/tag_abc123.json (FAILED)                │
@@ -306,7 +306,7 @@ docker exec iot-nifi ls /opt/nifi/nifi-current/data/iot/output_csv/
 cat > /tmp/test_tag_task.json << 'JSONEOF'
 {
   "jobId": "tag-test-001",
-  "sourcePath": "/opt/nifi/nifi-current/data/iot/output_csv/sensor_data_export_20260528_120000.csv",
+  "sourcePath": "/opt/nifi/nifi-current/data/iot/output_csv/export_admin_sensor_data_20260528_120000.csv",
   "sourceFormat": "CSV",
   "tagType": "manual-table",
   "tagConfig": {
@@ -321,7 +321,7 @@ cat > /tmp/test_tag_task.json << 'JSONEOF'
     }
   },
   "targetFormat": "CSV",
-  "fileName": "sensor_data_export_20260528_120000",
+  "fileName": "export_admin_sensor_data_20260528_120000.csv",
   "factoryId": "factory-001",
   "ownerId": "admin"
 }
@@ -342,7 +342,7 @@ docker exec iot-nifi cat /opt/nifi/nifi-current/data/iot/tagging_jobs/done/tag-t
 
 # 6.5 验证标签是否正确应用
 docker exec iot-nifi head -5 \
-  /opt/nifi/nifi-current/data/iot/tagged_output/sensor_data_export_20260528_120000_tagged_*.csv
+  /opt/nifi/nifi-current/data/iot/tagged_output/tag_admin_sensor_data_20260528_120000.csv
 ```
 
 ---

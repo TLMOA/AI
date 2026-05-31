@@ -23,7 +23,9 @@ from .admin_routes import router as admin_router
 from .auth import _get_current_user_from_token
 from . import db_models
 from .export_worker import run_export_job
-from .nifi_orchestrator import ensure_nifi_ready_for_export, get_nifi_status
+
+def _get_nifi_status() -> Dict[str, Any]:
+    return {"ok": True, "mode": "manual", "message": "v2-nifi flow manually deployed"}
 from .silent_export_worker import process_loop_once
 from .scheduler import start_scheduler, stop_scheduler, schedule_job, remove_scheduled
 import threading
@@ -152,6 +154,21 @@ def _save_backend_mode_state(state: Dict[str, Any]) -> Dict[str, Any]:
 BACKEND_MODE_STATE: Dict[str, Any] = {"factory_id": DEFAULT_FACTORY_ID, "mode": "local", "updatedAt": "", "updatedBy": "system"}
 NIFI_REAL_BASE_DIR = Path(os.getenv("NIFI_REAL_BASE_DIR", "/home/yhz/iot/real_nifi_data"))
 NIFI_REAL_BASE_DIR.mkdir(parents=True, exist_ok=True)
+NIFI_CONTAINER_BASE = "/opt/nifi/nifi-current/data/iot"
+
+
+def _host_to_container_path(host_path: str) -> str:
+    host_base = str(NIFI_REAL_BASE_DIR)
+    if host_path.startswith(host_base):
+        return NIFI_CONTAINER_BASE + host_path[len(host_base):]
+    return host_path
+
+
+def _container_to_host_path(container_path: str) -> str:
+    host_base = str(NIFI_REAL_BASE_DIR)
+    if container_path.startswith(NIFI_CONTAINER_BASE):
+        return host_base + container_path[len(NIFI_CONTAINER_BASE):]
+    return container_path
 
 
 def _current_backend_mode() -> str:
@@ -202,8 +219,8 @@ def _build_nifi_export_task(job: Dict[str, Any]) -> Dict[str, Any]:
         "where": job.get("where") or db_conf.get("where") or "",
         "format": fmt.upper(),
         "appendToLatest": bool(job.get("append_to_latest") or job.get("appendToLatest") or False),
-        "targetDir": str(target_dir),
-        "targetRoot": str(_export_output_root("nifi")),
+        "targetDir": _host_to_container_path(str(target_dir)),
+        "targetRoot": _host_to_container_path(str(_export_output_root("nifi"))),
         "submittedAt": now_iso(),
     }
     return task
@@ -241,6 +258,37 @@ def _submit_nifi_export_task(job: Dict[str, Any]) -> Dict[str, Any]:
         "reported_at": task["submittedAt"],
         "received_at": now_iso(),
     })
+    return {"status": "submitted", "taskPath": str(task_path), "task": task}
+
+
+def _nifi_convert_job_dirs() -> Dict[str, Path]:
+    root = _export_output_root("nifi") / "convert_jobs"
+    inbox = root / "inbox"
+    done = root / "done"
+    error = root / "error"
+    for p in [inbox, done, error]:
+        p.mkdir(parents=True, exist_ok=True)
+    return {"root": root, "inbox": inbox, "done": done, "error": error}
+
+
+def _submit_nifi_upload_convert_task(source_path: str, source_format: str,
+                                      target_formats: List[str], file_name: str,
+                                      owner_id: str = "", factory_id: str = "") -> Dict[str, Any]:
+    dirs = _nifi_convert_job_dirs()
+    job_id = f"convert_{uuid.uuid4().hex[:8]}"
+    nifi_source_path = source_path.replace(str(NIFI_REAL_BASE_DIR), "/opt/nifi/nifi-current/data/iot")
+    task = {
+        "jobId": job_id,
+        "sourcePath": nifi_source_path,
+        "sourceFormat": source_format.upper(),
+        "targetFormats": [f.upper() for f in target_formats],
+        "fileName": file_name,
+        "ownerId": owner_id or "unknown",
+        "factoryId": _normalize_factory_id(factory_id),
+        "submittedAt": now_iso(),
+    }
+    task_path = dirs["inbox"] / f"{job_id}.json"
+    task_path.write_text(json.dumps(task, ensure_ascii=False, indent=2), encoding="utf-8")
     return {"status": "submitted", "taskPath": str(task_path), "task": task}
 
 
@@ -526,8 +574,8 @@ def ok(data: Any, trace_id: str) -> Dict[str, Any]:
     return {"code": 0, "message": "OK", "data": data, "traceId": trace_id}
 
 
-def err(code: int, message: str, trace_id: str) -> Dict[str, Any]:
-    return {"code": code, "message": message, "data": None, "traceId": trace_id}
+def err(code: int, message: str, trace_id: str, data: Any = None) -> Dict[str, Any]:
+    return {"code": code, "message": message, "data": data, "traceId": trace_id}
 
 
 def make_trace_id(incoming: Optional[str]) -> str:
@@ -932,28 +980,16 @@ def api_trigger_export(job: Dict[str, Any], request: Request):
     """Trigger an export job. Local runs synchronously; NiFi mode submits a task JSON."""
     trace_id = make_trace_id(request.headers.get("x-trace-id"))
     if _current_backend_mode() == "nifi":
-        ensure_result = ensure_nifi_ready_for_export()
-        _append_factory_report({
-            "factory_id": _normalize_factory_id(job.get("factory_id")),
-            "job_id": str(job.get("id") or ""),
-            "batch_id": f"nifi_ensure_export_job_{now_ts()}",
-            "status": "SUCCEEDED" if ensure_result.get("ok") else "FAILED",
-            "rows": 0,
-            "file_path": "",
-            "message": ensure_result.get("error") or "nifi ready for export job trigger",
-            "reported_at": now_iso(),
-            "received_at": now_iso(),
-        })
-        if not ensure_result.get("ok"):
-            return err(1005004, ensure_result.get("error") or "nifi ensure failed", trace_id, {"orchestration": ensure_result})
         submitted = _submit_nifi_export_task(job)
+        task = submitted.get("task", {})
+        fmt = (task.get("format") or "csv").lower()
         return ok({
-            "jobId": submitted.get("task", {}).get("jobId"),
+            "jobId": task.get("jobId"),
             "status": "PENDING",
             "mode": "nifi",
+            "path": str(_export_output_root("nifi") / f"output_{fmt}"),
             "taskPath": submitted.get("taskPath"),
-            "task": submitted.get("task"),
-            "orchestration": ensure_result,
+            "task": task,
         }, trace_id)
     res = run_export_job(job)
     if res.get("status") == "error":
@@ -1549,10 +1585,12 @@ def _parse_columns_arg(columns: Optional[str]) -> List[str]:
 
 def _infer_tag_source_name(file_name: str) -> str:
     stem = Path(file_name).stem
-    for suffix in ["_export_latest", "_export", "_json", "_csv", "_output"]:
-        if suffix in stem:
-            stem = stem.split(suffix)[0]
+    for prefix in ["export_", "xform_", "tag_", "raw_"]:
+        if stem.startswith(prefix):
+            stem = stem[len(prefix):]
             break
+    import re
+    stem = re.sub(r'_\d{8}_\d{6}$', '', stem)
     return stem or "source"
 
 
@@ -1584,45 +1622,47 @@ def _build_manual_tagged_rows(rows: List[Dict[str, Any]], records: List[Dict[str
     return tagged_rows
 
 
-def _write_tagged_output(source_meta: Dict[str, Any], rows: List[Dict[str, Any]], tag_field: str, columns: List[str]) -> Dict[str, Any]:
+def _write_tagged_output(source_meta: Dict[str, Any], rows: List[Dict[str, Any]], tag_field: str, columns: List[str], operator: str = "unknown") -> Dict[str, Any]:
     source_name = _infer_tag_source_name(source_meta.get("fileName", "source"))
     ts = now_ts()
     source_fmt = source_meta.get("fileFormat", "CSV").upper()
     out_columns = list(columns)
     if tag_field not in out_columns:
         out_columns.append(tag_field)
+    user = _sanitize_filename_component(operator)
 
     if source_fmt == "JSON":
-        out_path = TAGGED_OUTPUT_DIR / f"{source_name}_tagged_{ts}.json"
+        out_path = TAGGED_OUTPUT_DIR / f"tag_{user}_{ts}_{source_name}.json"
         _write_ndjson_atomic(out_path, out_columns, rows)
         return _register_and_return_meta(out_path, "json")
 
     if source_fmt == "TSV":
-        out_path = TAGGED_OUTPUT_DIR / f"{source_name}_tagged_{ts}.tsv"
+        out_path = TAGGED_OUTPUT_DIR / f"tag_{user}_{ts}_{source_name}.tsv"
         _write_tsv_atomic(out_path, out_columns, rows)
         return _register_and_return_meta(out_path, "tsv")
 
-    out_path = TAGGED_OUTPUT_DIR / f"{source_name}_tagged_{ts}.csv"
+    out_path = TAGGED_OUTPUT_DIR / f"tag_{user}_{ts}_{source_name}.csv"
     _write_csv_atomic(out_path, out_columns, rows)
     return _register_and_return_meta(out_path, "csv")
 
 
-def _write_edited_output(source_meta: Dict[str, Any], rows: List[Dict[str, Any]], columns: List[str]) -> Dict[str, Any]:
+def _write_edited_output(source_meta: Dict[str, Any], rows: List[Dict[str, Any]], columns: List[str], operator: str = "unknown") -> Dict[str, Any]:
     source_name = _infer_tag_source_name(source_meta.get("fileName", "source"))
     ts = now_ts()
     source_fmt = source_meta.get("fileFormat", "CSV").upper()
+    user = _sanitize_filename_component(operator)
 
     if source_fmt == "JSON":
-        out_path = TAGGED_OUTPUT_DIR / f"{source_name}_tagged_{ts}.json"
+        out_path = TAGGED_OUTPUT_DIR / f"tag_{user}_{ts}_{source_name}.json"
         _write_ndjson_atomic(out_path, columns, rows)
         return _register_and_return_meta(out_path, "json")
 
     if source_fmt == "TSV":
-        out_path = TAGGED_OUTPUT_DIR / f"{source_name}_tagged_{ts}.tsv"
+        out_path = TAGGED_OUTPUT_DIR / f"tag_{user}_{ts}_{source_name}.tsv"
         _write_tsv_atomic(out_path, columns, rows)
         return _register_and_return_meta(out_path, "tsv")
 
-    out_path = TAGGED_OUTPUT_DIR / f"{source_name}_tagged_{ts}.csv"
+    out_path = TAGGED_OUTPUT_DIR / f"tag_{user}_{ts}_{source_name}.csv"
     _write_csv_atomic(out_path, columns, rows)
     return _register_and_return_meta(out_path, "csv")
 
@@ -1948,14 +1988,14 @@ def set_backend_mode(payload: Dict[str, Any], request: Request):
 @app.get("/api/v1/internal/nifi/status")
 def get_internal_nifi_status(request: Request, x_trace_id: Optional[str] = Header(default=None)):
     trace_id = make_trace_id(x_trace_id)
-    status = get_nifi_status()
+    status = _get_nifi_status()
     return ok(status, trace_id)
 
 
 @app.post("/api/v1/internal/nifi/ensure")
 def ensure_internal_nifi(request: Request):
     trace_id = request.state.trace_id
-    result = ensure_nifi_ready_for_export()
+    result = {"ok": True, "ready": True, "message": "v2-nifi flow manually deployed"}
     _append_factory_report({
         "factory_id": DEFAULT_FACTORY_ID,
         "job_id": "",
@@ -2226,7 +2266,7 @@ def manual_tag(req: ManualTagReq, x_trace_id: Optional[str] = Header(default=Non
     except Exception:
         pass
 
-    out_meta = _write_tagged_output(source_meta, tagged_rows, "label", columns)
+    out_meta = _write_tagged_output(source_meta, tagged_rows, "label", columns, req.operator)
     return ok({"updated": updated, "operator": req.operator, "fileId": req.fileId, "file": out_meta}, trace_id)
 
 
@@ -2312,7 +2352,7 @@ def manual_table_edit(req: ManualTableEditReq, request: Request, x_trace_id: Opt
     except Exception:
         pass
 
-    out_meta = _write_edited_output(source_meta, rows, columns)
+    out_meta = _write_edited_output(source_meta, rows, columns, req.operator)
     request.state.observation = {
         "operation": "manual_table_edit",
         "status": "SUCCEEDED",
@@ -2345,9 +2385,11 @@ async def upload_file(file: UploadFile = UploadFileField(...),
                       hasTag: Optional[bool] = Query(default=None),
                       tagColumn: Optional[str] = Query(default=None),
                       tagName: Optional[str] = Query(default=None),
-                      tagRange: Optional[str] = Query(default=None)):
+                      tagRange: Optional[str] = Query(default=None),
+                      username: Optional[str] = Query(default="user")):
     # Compatibility endpoint: route CSV/JSON/TSV uploads to inbox dirs, others to GENERATED_DIR.
-    filename = f"uploaded_{uuid.uuid4().hex[:8]}_{file.filename}"
+    ts = now_ts()
+    filename = f"raw_{username}_{ts}_{file.filename}"
     content = await file.read()
     suffix = Path(file.filename or "").suffix.lower()
 
@@ -2378,7 +2420,7 @@ async def upload_file(file: UploadFile = UploadFileField(...),
             for r in reader:
                 rows.append(r)
                 if rows:
-                    out_name = f"uploaded_user_csv_{now_ts()}.json"
+                    out_name = f"xform_{username}_{now_ts()}_csv2json.json"
                     out_path = CSV_TO_JSON_DIR / out_name
                     _write_ndjson(out_path, list(rows[0].keys()), rows)
                     meta2 = _register_and_return_meta(out_path, "json")
@@ -2386,7 +2428,7 @@ async def upload_file(file: UploadFile = UploadFileField(...),
                         _write_meta_file(meta2, extra)
                     except Exception:
                         pass
-                    out_tsv_name = f"uploaded_user_csv_{now_ts()}.tsv"
+                    out_tsv_name = f"xform_{username}_{now_ts()}_csv2tsv.tsv"
                     out_tsv_path = CSV_TO_TSV_DIR / out_tsv_name
                     _write_tsv(out_tsv_path, list(rows[0].keys()), rows)
                     meta3 = _register_and_return_meta(out_tsv_path, "tsv")
@@ -2435,7 +2477,7 @@ async def upload_file(file: UploadFile = UploadFileField(...),
                             objs.append(json.loads(ln))
             if objs:
                 cols = sorted({k for o in objs for k in o.keys()})
-                out_name = f"uploaded_user_json_{now_ts()}.csv"
+                out_name = f"xform_{username}_{now_ts()}_json2csv.csv"
                 out_path = JSON_TO_CSV_DIR / out_name
                 _write_csv(out_path, cols, objs)
                 meta2 = _register_and_return_meta(out_path, "csv")
@@ -2443,7 +2485,7 @@ async def upload_file(file: UploadFile = UploadFileField(...),
                     _write_meta_file(meta2, extra)
                 except Exception:
                     pass
-                out_tsv_name = f"uploaded_user_json_{now_ts()}.tsv"
+                out_tsv_name = f"xform_{username}_{now_ts()}_json2tsv.tsv"
                 out_tsv_path = JSON_TO_TSV_DIR / out_tsv_name
                 _write_tsv(out_tsv_path, cols, objs)
                 meta3 = _register_and_return_meta(out_tsv_path, "tsv")
@@ -2484,7 +2526,7 @@ async def upload_file(file: UploadFile = UploadFileField(...),
                     vals = ln.split("\t")
                     rows.append({header[i]: (vals[i] if i < len(vals) else "") for i in range(len(header))})
                 if rows:
-                    out_json_name = f"uploaded_user_tsv_{now_ts()}.json"
+                    out_json_name = f"xform_{username}_{now_ts()}_tsv2json.json"
                     out_json_path = TSV_TO_JSON_DIR / out_json_name
                     _write_ndjson(out_json_path, header, rows)
                     meta2 = _register_and_return_meta(out_json_path, "json")
@@ -2492,7 +2534,7 @@ async def upload_file(file: UploadFile = UploadFileField(...),
                         _write_meta_file(meta2, extra)
                     except Exception:
                         pass
-                    out_csv_name = f"uploaded_user_tsv_{now_ts()}.csv"
+                    out_csv_name = f"xform_{username}_{now_ts()}_tsv2csv.csv"
                     out_csv_path = TSV_TO_CSV_DIR / out_csv_name
                     _write_csv(out_csv_path, header, rows)
                     meta3 = _register_and_return_meta(out_csv_path, "csv")
@@ -2555,7 +2597,8 @@ async def upload_with_mode(request: Request,
         pass
 
     # save uploaded file to a temp location
-    filename = f"{username}_{uuid.uuid4().hex[:8]}_{file.filename}"
+    ts = now_ts()
+    filename = f"raw_{username}_{ts}_{file.filename}"
     content = await file.read()
     suffix = Path(file.filename or "").suffix.lower()
     saved_path = GENERATED_DIR / filename
@@ -2674,7 +2717,33 @@ async def upload_inbox_csv(
     tagRange: Optional[str] = Query(default=None),
 ):
     trace_id = request.state.trace_id
-    filename = f"{username}_{uuid.uuid4().hex[:8]}_{file.filename}"
+    ts = now_ts()
+    filename = f"raw_{username}_{ts}_{file.filename}"
+    if _current_backend_mode() == "nifi":
+        dest = _export_output_root("nifi") / "inbox_csv" / filename
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        content = await file.read()
+        dest.write_bytes(content)
+        target_formats = ["JSON"]
+        if convertType == "csv_to_tsv":
+            target_formats = ["TSV"]
+        submitted = _submit_nifi_upload_convert_task(
+            source_path=str(dest),
+            source_format="CSV",
+            target_formats=target_formats,
+            file_name=filename,
+            owner_id=username,
+        )
+        meta = register_existing_file(dest, "csv")
+        return ok({
+            "fileId": meta.get("fileId", ""),
+            "jobId": submitted["task"]["jobId"],
+            "status": "PENDING",
+            "mode": "nifi",
+            "sourcePath": str(dest),
+            "sourceFormat": "CSV",
+            "targetFormats": target_formats,
+        }, trace_id)
     dest = INBOX_CSV_DIR / filename
     content = await file.read()
     dest.write_bytes(content)
@@ -2728,7 +2797,7 @@ async def upload_inbox_csv(
                     extra["tagRange"] = [t.strip() for t in str(tagRange).split(",") if t.strip()]
 
             if convert == "csv_to_tsv":
-                out_name = f"uploaded_{username}_csv_{now_ts()}.tsv"
+                out_name = f"xform_{username}_{now_ts()}_csv2tsv.tsv"
                 out_path = CSV_TO_TSV_DIR / out_name
                 _write_tsv(out_path, cols, rows)
                 meta2 = _register_and_return_meta(out_path, "tsv")
@@ -2738,7 +2807,7 @@ async def upload_inbox_csv(
                     pass
                 target_path = str(out_path)
             else:
-                out_name = f"uploaded_{username}_csv_{now_ts()}.json"
+                out_name = f"xform_{username}_{now_ts()}_csv2json.json"
                 out_path = CSV_TO_JSON_DIR / out_name
                 _write_ndjson(out_path, cols, rows)
                 meta2 = _register_and_return_meta(out_path, "json")
@@ -2790,7 +2859,33 @@ async def upload_inbox_json(
     tagRange: Optional[str] = Query(default=None),
 ):
     trace_id = request.state.trace_id
-    filename = f"{username}_{uuid.uuid4().hex[:8]}_{file.filename}"
+    ts = now_ts()
+    filename = f"raw_{username}_{ts}_{file.filename}"
+    if _current_backend_mode() == "nifi":
+        dest = _export_output_root("nifi") / "inbox_json" / filename
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        content = await file.read()
+        dest.write_bytes(content)
+        target_formats = ["CSV"]
+        if convertType == "json_to_tsv":
+            target_formats = ["TSV"]
+        submitted = _submit_nifi_upload_convert_task(
+            source_path=str(dest),
+            source_format="JSON",
+            target_formats=target_formats,
+            file_name=filename,
+            owner_id=username,
+        )
+        meta = register_existing_file(dest, "json")
+        return ok({
+            "fileId": meta.get("fileId", ""),
+            "jobId": submitted["task"]["jobId"],
+            "status": "PENDING",
+            "mode": "nifi",
+            "sourcePath": str(dest),
+            "sourceFormat": "JSON",
+            "targetFormats": target_formats,
+        }, trace_id)
     dest = INBOX_JSON_DIR / filename
     content = await file.read()
     dest.write_bytes(content)
@@ -2830,7 +2925,7 @@ async def upload_inbox_json(
                     extra["tagRange"] = [t.strip() for t in str(tagRange).split(",") if t.strip()]
 
             if convert == "json_to_tsv":
-                out_name = f"uploaded_{username}_json_{now_ts()}.tsv"
+                out_name = f"xform_{username}_{now_ts()}_json2tsv.tsv"
                 out_path = JSON_TO_TSV_DIR / out_name
                 _write_tsv(out_path, cols, objs)
                 meta2 = _register_and_return_meta(out_path, "tsv")
@@ -2840,7 +2935,7 @@ async def upload_inbox_json(
                     pass
                 target_path = str(out_path)
             else:
-                out_name = f"uploaded_{username}_json_{now_ts()}.csv"
+                out_name = f"xform_{username}_{now_ts()}_json2csv.csv"
                 out_path = JSON_TO_CSV_DIR / out_name
                 _write_csv(out_path, cols, objs)
                 meta2 = _register_and_return_meta(out_path, "csv")
@@ -2893,7 +2988,33 @@ async def upload_inbox_tsv(
     tagRange: Optional[str] = Query(default=None),
 ):
     trace_id = request.state.trace_id
-    filename = f"{username}_{uuid.uuid4().hex[:8]}_{file.filename}"
+    ts = now_ts()
+    filename = f"raw_{username}_{ts}_{file.filename}"
+    if _current_backend_mode() == "nifi":
+        dest = _export_output_root("nifi") / "inbox_tsv" / filename
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        content = await file.read()
+        dest.write_bytes(content)
+        target_formats = ["JSON"]
+        if convertType == "tsv_to_csv":
+            target_formats = ["CSV"]
+        submitted = _submit_nifi_upload_convert_task(
+            source_path=str(dest),
+            source_format="TSV",
+            target_formats=target_formats,
+            file_name=filename,
+            owner_id=username,
+        )
+        meta = register_existing_file(dest, "tsv")
+        return ok({
+            "fileId": meta.get("fileId", ""),
+            "jobId": submitted["task"]["jobId"],
+            "status": "PENDING",
+            "mode": "nifi",
+            "sourcePath": str(dest),
+            "sourceFormat": "TSV",
+            "targetFormats": target_formats,
+        }, trace_id)
     dest = INBOX_TSV_DIR / filename
     content = await file.read()
     dest.write_bytes(content)
@@ -2940,7 +3061,7 @@ async def upload_inbox_tsv(
                     extra["tagRange"] = [t.strip() for t in str(tagRange).split(",") if t.strip()]
 
             if convert == "tsv_to_csv":
-                out_name = f"uploaded_{username}_tsv_{now_ts()}.csv"
+                out_name = f"xform_{username}_{now_ts()}_tsv2csv.csv"
                 out_path = TSV_TO_CSV_DIR / out_name
                 _write_csv(out_path, header, rows)
                 meta2 = _register_and_return_meta(out_path, "csv")
@@ -2950,7 +3071,7 @@ async def upload_inbox_tsv(
                     pass
                 target_path = str(out_path)
             else:
-                out_name = f"uploaded_{username}_tsv_{now_ts()}.json"
+                out_name = f"xform_{username}_{now_ts()}_tsv2json.json"
                 out_path = TSV_TO_JSON_DIR / out_name
                 _write_ndjson(out_path, header, rows)
                 meta2 = _register_and_return_meta(out_path, "json")
@@ -3016,29 +3137,6 @@ def export_mysql(req: MySQLExportReq, request: Request, x_trace_id: Optional[str
     user = _get_current_user_from_token(cookie)
     username = _sanitize_filename_component((user or {}).get("username") or (user or {}).get("user") or (user or {}).get("name") or "manual")
     if mode == "nifi":
-        ensure_result = ensure_nifi_ready_for_export()
-        _append_factory_report({
-            "factory_id": DEFAULT_FACTORY_ID,
-            "job_id": "",
-            "batch_id": f"nifi_ensure_export_mysql_{now_ts()}",
-            "status": "SUCCEEDED" if ensure_result.get("ok") else "FAILED",
-            "rows": 0,
-            "file_path": "",
-            "message": ensure_result.get("error") or "nifi ready for mysql export",
-            "reported_at": now_iso(),
-            "received_at": now_iso(),
-        })
-        if not ensure_result.get("ok"):
-            request.state.observation = {
-                "operation": "export_mysql",
-                "status": "FAILED",
-                "sourcePath": f"mysql://{req.host}:{req.port}/{req.db}.{req.table}",
-                "targetPath": "",
-                "errorCode": "1005004",
-                "errorMessage": ensure_result.get("error") or "nifi ensure failed",
-                "phase": "orchestrate",
-            }
-            return err(1005004, ensure_result.get("error") or "nifi ensure failed", trace_id, {"orchestration": ensure_result})
         job = {
             "id": f"export_{now_ts()}_{uuid.uuid4().hex[:6]}",
             "job_name": f"mysql_export_{req.table}_{now_ts()}",
@@ -3073,9 +3171,9 @@ def export_mysql(req: MySQLExportReq, request: Request, x_trace_id: Optional[str
             "jobId": job["id"],
             "status": "PENDING",
             "mode": "nifi",
+            "path": str(_export_output_root("nifi") / f"output_{job['file_format']}"),
             "taskPath": submitted.get("taskPath"),
             "task": submitted.get("task"),
-            "orchestration": ensure_result,
         }
         return ok(payload, trace_id)
 
@@ -3103,7 +3201,7 @@ def export_mysql(req: MySQLExportReq, request: Request, x_trace_id: Optional[str
     ts = now_ts()
     fmt = (req.format or "csv").lower()
     table_safe = _sanitize_filename_component(req.table)
-    base_name = f"export_manual_{username}_{table_safe}_{ts}"
+    base_name = f"export_{username}_{table_safe}_{ts}"
 
     primary_root = _export_output_root()
     primary_dir = primary_root / f"output_{fmt}"
@@ -3112,7 +3210,7 @@ def export_mysql(req: MySQLExportReq, request: Request, x_trace_id: Optional[str
     if fmt == "csv":
         out_path = primary_dir / f"{base_name}.csv"
         _write_csv(out_path, cols, rows, append=False)
-        latest_path = primary_dir / f"{req.table}_export_latest.csv"
+        latest_path = primary_dir / f"export_{username}_{table_safe}_latest.csv"
         if req.append_to_latest and latest_path.exists():
             _write_csv(latest_path, cols, rows, append=True)
         else:
@@ -3138,7 +3236,7 @@ def export_mysql(req: MySQLExportReq, request: Request, x_trace_id: Optional[str
     elif fmt == "tsv":
         out_path = primary_dir / f"{base_name}.tsv"
         _write_tsv(out_path, cols, rows, append=False)
-        latest_path = primary_dir / f"{req.table}_export_latest.tsv"
+        latest_path = primary_dir / f"export_{username}_{table_safe}_latest.tsv"
         if req.append_to_latest and latest_path.exists():
             _write_tsv(latest_path, cols, rows, append=True)
         else:
@@ -3164,7 +3262,7 @@ def export_mysql(req: MySQLExportReq, request: Request, x_trace_id: Optional[str
     elif fmt == "json":
         out_path = primary_dir / f"{base_name}.json"
         _write_ndjson(out_path, cols, rows, append=False)
-        latest_path = primary_dir / f"{req.table}_export_latest.json"
+        latest_path = primary_dir / f"export_{username}_{table_safe}_latest.json"
         if req.append_to_latest and latest_path.exists():
             _write_ndjson(latest_path, cols, rows, append=True)
         else:
@@ -3256,28 +3354,20 @@ def export_generic(body: Dict[str, Any], request: Request):
         }
 
         if mode == "nifi":
-            ensure_result = ensure_nifi_ready_for_export()
-            _append_factory_report({
-                "factory_id": job.get("factory_id") or DEFAULT_FACTORY_ID,
-                "job_id": str(job.get("id") or ""),
-                "batch_id": f"nifi_ensure_export_{now_ts()}",
-                "status": "SUCCEEDED" if ensure_result.get("ok") else "FAILED",
-                "rows": 0,
-                "file_path": "",
-                "message": ensure_result.get("error") or "nifi ready for generic export",
-                "reported_at": now_iso(),
-                "received_at": now_iso(),
-            })
-            if not ensure_result.get("ok"):
-                return err(1005004, ensure_result.get("error") or "nifi ensure failed", trace_id, {"orchestration": ensure_result})
             submitted = _submit_nifi_export_task(job)
-            return ok({"status": "PENDING", "mode": "nifi", "taskPath": submitted.get("taskPath"), "task": submitted.get("task"), "orchestration": ensure_result}, trace_id)
+            return ok({
+                "status": "PENDING",
+                "mode": "nifi",
+                "path": str(_export_output_root("nifi") / f"output_{fmt}"),
+                "taskPath": submitted.get("taskPath"),
+                "task": submitted.get("task"),
+            }, trace_id)
 
         res = run_export_job(job)
         # if run_export_job returns a path or status
         if res.get("status") in ("ok", "demo_written") and res.get("path"):
             try:
-                # normalize filename for manual-triggered jobs to export_manual_{username}_{table}_{ts}
+                # normalize filename for manual-triggered jobs to export_{owner}_{table}_{ts}
                 try:
                     p = Path(res.get("path"))
                     if str(job.get("id") or "").startswith("manual_") and p.exists():
@@ -3292,7 +3382,7 @@ def export_generic(body: Dict[str, Any], request: Request):
                             desired_dir.mkdir(parents=True, exist_ok=True)
                         except Exception:
                             pass
-                        desired = desired_dir / f"export_manual_{owner}_{table_safe}_{ts}.{fmt}"
+                        desired = desired_dir / f"export_{owner}_{table_safe}_{ts}.{fmt}"
                         try:
                             # move/rename primary output to desired name
                             p.replace(desired)
@@ -3312,7 +3402,7 @@ def export_generic(body: Dict[str, Any], request: Request):
                     payload = job.get("payload") or {}
                     table_name = payload.get("table") or (job.get("db_config") or {}).get("table")
                     if table_name:
-                        latest_name = f"{table_name}_export_latest.{fmt}"
+                        latest_name = f"export_{owner}_{table_name}_latest.{fmt}"
                         latest_path = res_path.parent / latest_name
                         try:
                             if latest_path.exists():
@@ -3391,7 +3481,7 @@ async def auto_tag(req: AutoTagReq, x_trace_id: Optional[str] = Header(default=N
         return err(1002402, f"read source file failed: {e}", trace_id)
 
     tagged_rows = _build_auto_tagged_rows(rows)
-    out_meta = _write_tagged_output(source_meta, tagged_rows, "auto_tag", columns)
+    out_meta = _write_tagged_output(source_meta, tagged_rows, "auto_tag", columns, req.operator)
     out_fmt = req.outputFormat.upper()
 
     job_id = f"job_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:4]}"

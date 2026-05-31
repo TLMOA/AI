@@ -205,7 +205,7 @@ if pid: processor_ids["ConvertRecord"] = pid
 pid = create_processor(PG_ID, "UpdateAttribute-filename",
     "org.apache.nifi.processors.attributes.UpdateAttribute",
     {
-        "filename": "${table_name}_export_${now():format('yyyyMMdd_HHmmss')}.${format}",
+        "filename": "export_${ownerId:defaultValue('unknown')}_${table_name}_${now():format('yyyyMMdd_HHmmss')}.${format}",
     }, 1800, 0)
 if pid: processor_ids["UpdateFilename"] = pid
 

@@ -107,35 +107,41 @@
 1. MySQL -> CSV 导出
 	- 逻辑目录：`output_csv`
 	- 格式要求：UTF-8、逗号分隔、LF、含表头
-	- 命名要求：`<table>_export_YYYYMMDD_HHMMSS.csv`
+	- 命名要求：`export_{owner}_{table}_YYYYMMDD_HHMMSS.csv`
 2. MySQL -> JSON 导出
 	- 逻辑目录：`output_json`
 	- 格式要求：NDJSON（每行一条 JSON）
-	- 命名要求：`<table>_export_YYYYMMDD_HHMMSS.json`
+	- 命名要求：`export_{owner}_{table}_YYYYMMDD_HHMMSS.json`
 3. 上传 CSV -> 转换
 	- 逻辑目录：`inbox_csv` -> `csv_to_json` 或 `csv_to_tsv`
-	- 命名要求：`uploaded_<user>_csv_YYYYMMDD_HHMMSS.<ext>`
+	- 命名要求：原始文件 `raw_{user}_YYYYMMDD_HHMMSS_<filename>.csv`，转换文件 `xform_{user}_YYYYMMDD_HHMMSS_csv2json.json`
 4. 上传 JSON -> 转换
 	- 逻辑目录：`inbox_json` -> `json_to_csv` 或 `json_to_tsv`
 	- 输入支持：NDJSON / JSON 数组 / 单对象
-	- 命名要求：`uploaded_<user>_json_YYYYMMDD_HHMMSS.<ext>`
+	- 命名要求：原始文件 `raw_{user}_YYYYMMDD_HHMMSS_<filename>.json`，转换文件 `xform_{user}_YYYYMMDD_HHMMSS_json2csv.csv`
 5. 上传 TSV -> 转换
 	- 逻辑目录：`inbox_tsv` -> `tsv_to_json` 或 `tsv_to_csv`
-	- 命名要求：`uploaded_<user>_tsv_YYYYMMDD_HHMMSS.<ext>`
+	- 命名要求：原始文件 `raw_{user}_YYYYMMDD_HHMMSS_<filename>.tsv`，转换文件 `xform_{user}_YYYYMMDD_HHMMSS_tsv2csv.csv`
 6. 打标产物输出
 	- 逻辑目录：`tagged_output`
-	- 命名要求：`<source>_tagged_YYYYMMDD_HHMMSS.<ext>`
+	- 命名要求：`tag_{owner}_{source}_YYYYMMDD_HHMMSS.<ext>`
 	- 写入要求：原子写（临时文件 + 重命名）
 
 7. MySQL -> TSV 导出
 	- 逻辑目录：`output_tsv`
 	- 格式要求：UTF-8、制表符分隔、LF、含表头
-	- 命名要求：`<table>_export_YYYYMMDD_HHMMSS.tsv`
+	- 命名要求：`export_{owner}_{table}_YYYYMMDD_HHMMSS.tsv`
 
 8. 定时导出（Scheduled export）
-	- 逻辑目录：`export`
+	- 逻辑目录：`output_csv|json|tsv`
 	- 说明：支持基于调度器的定时导出（例如每日/每小时），包括 CSV/JSON/TSV 格式，需同样遵守命名与原子写入规则
-	- 命名建议：`<table>_scheduled_export_YYYYMMDD_HHMMSS.<ext>`
+	- 命名建议：`export_{owner}_{table}_YYYYMMDD_HHMMSS.<ext>`（与手动导出命名一致）
+
+9. 静默导出（Silent export）
+	- 逻辑目录：`output/silent_exports/<tenant>/<db_key>/`
+	- 说明：后台自动增量导出，每次手动导出后自动注册到清单，由调度器定期执行
+	- 命名规则：`export_system_{table}_YYYYMMDD_HHMMSS.csv`
+	- Schema变更：`export_system_{table}_YYYYMMDD_HHMMSS_YYYYMMDD.csv`（日期后缀表示schema变更时间）
 
 ### 5.2 接口与响应对等（强制）
 

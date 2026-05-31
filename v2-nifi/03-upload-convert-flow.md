@@ -68,16 +68,16 @@ nifi_upload_convert_worker.py
 │  阶段 2：后端保存文件 + 写入任务 JSON                              │
 │                                                                  │
 │  v1-backend/app/main.py                                          │
-│  1. 保存 uploaded_<user>_csv_YYYYMMDD_HHMMSS.csv 到             │
+│  1. 保存 raw_<user>_YYYYMMDD_HHMMSS_<filename>.csv 到           │
 │     real_nifi_data/inbox_csv/                                    │
 │  2. 生成任务 JSON → real_nifi_data/convert_jobs/inbox/           │
 │                                                                  │
 │  {                                                               │
 │    "jobId":        "convert_abc123",                             │
-│    "sourcePath":   "/opt/nifi/.../inbox_csv/uploaded_user_csv_...│
+│    "sourcePath":   "/opt/nifi/.../inbox_csv/raw_user_20260528...│
 │    "sourceFormat": "CSV",                                        │
 │    "targetFormats": ["JSON", "TSV"],                             │
-│    "fileName":     "uploaded_user_csv_20260528_120000",          │
+│    "fileName":     "raw_user_20260528_120000_data.csv",          │
 │    "ownerId":      "user-001",                                   │
 │    "factoryId":    "factory-001"                                 │
 │  }                                                               │
@@ -102,8 +102,8 @@ nifi_upload_convert_worker.py
 ┌──────────────────────────────────────────────────────────────────┐
 │  阶段 4：Worker 输出结果                                           │
 │                                                                  │
-│  ✓ 成功 → csv_to_json/uploaded_user_csv_20260528_120000.json     │
-│          csv_to_tsv/uploaded_user_csv_20260528_120000.tsv         │
+│  ✓ 成功 → csv_to_json/xform_user_20260528_120000_csv2json.json   │
+│          csv_to_tsv/xform_user_20260528_120000_csv2tsv.tsv        │
 │          convert_jobs/done/convert_abc123.json (SUCCEEDED)        │
 │                                                                  │
 │  ✗ 失败 → convert_jobs/error/convert_abc123.json (FAILED)        │
@@ -311,16 +311,16 @@ id,name,value
 CSVEOF
 
 docker cp /tmp/test_upload.csv \
-  iot-nifi:/opt/nifi/nifi-current/data/iot/inbox_csv/uploaded_admin_csv_20260528_120000.csv
+  iot-nifi:/opt/nifi/nifi-current/data/iot/inbox_csv/raw_admin_20260528_120000_data.csv
 
 # 6.2 投递转换任务 JSON
 cat > /tmp/test_convert_task.json << 'JSONEOF'
 {
   "jobId": "convert-test-001",
-  "sourcePath": "/opt/nifi/nifi-current/data/iot/inbox_csv/uploaded_admin_csv_20260528_120000.csv",
+  "sourcePath": "/opt/nifi/nifi-current/data/iot/inbox_csv/raw_admin_20260528_120000_data.csv",
   "sourceFormat": "CSV",
   "targetFormats": ["JSON", "TSV"],
-  "fileName": "uploaded_admin_csv_20260528_120000",
+  "fileName": "raw_admin_20260528_120000_data.csv",
   "ownerId": "admin",
   "factoryId": "factory-001"
 }

@@ -107,7 +107,8 @@ def _schema_hash(columns: List[str]) -> str:
 
 
 def _file_name_for_table(table: str, suffix: str = "") -> str:
-    return f"{table}_silent_export{suffix}.csv"
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return f"export_system_{table}_{ts}{suffix}.csv"
 
 
 def _acquire_lock(fp):

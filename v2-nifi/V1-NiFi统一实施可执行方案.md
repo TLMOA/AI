@@ -403,10 +403,10 @@ GetFile (Root Group) ──success──┐
 ```json
 {
   "jobId": "convert_abc123",
-  "sourcePath": "/opt/nifi/nifi-current/data/iot/inbox_csv/uploaded_user_csv_20260528_120000.csv",
+  "sourcePath": "/opt/nifi/nifi-current/data/iot/inbox_csv/raw_user_20260528_120000_data.csv",
   "sourceFormat": "CSV",
   "targetFormats": ["JSON", "TSV"],
-  "fileName": "uploaded_user_csv_20260528_120000",
+  "fileName": "raw_user_20260528_120000_data.csv",
   "ownerId": "user-001",
   "factoryId": "factory-001"
 }
@@ -431,7 +431,7 @@ GetFile (Root Group) ──success──┐
   - `manual-table`：逐列映射 `值→标签`
   - `auto-rule`：预定义规则引擎（正则 / 范围 / 条件表达式）
   - `ai-suggestion`：AI 服务推荐（预留接口）
-- 原子写输出到 `tagged_output/<source>_tagged_YYYYMMDD_HHMMSS.<ext>`
+- 原子写输出到 `tagged_output/tag_{owner}_{source}_YYYYMMDD_HHMMSS.<ext>`
 - 写状态文件到 `tagging_jobs/done|error/{jobId}.json`
 
 **前提依赖**：
@@ -464,7 +464,7 @@ GetFile (Root Group) ──success──┐
     }
   },
   "targetFormat": "CSV",
-  "fileName": "sensor_data_export_20260528",
+  "fileName": "export_admin_sensor_data_20260528_120000.csv",
   "factoryId": "factory-001",
   "ownerId": "admin"
 }

@@ -115,9 +115,9 @@ def output_path(task: Dict[str, Any], fmt: str) -> Path:
         root = Path(str(task.get("targetRoot") or "/home/yhz/iot/real_nifi_data"))
         target_dir = root / f"output_{fmt}"
     target_dir.mkdir(parents=True, exist_ok=True)
-    job_id = safe_ident(str(task.get("jobId") or f"export_{uuid.uuid4().hex[:8]}").replace("-", "_"), "jobId")
+    owner = safe_ident(str(task.get("ownerId") or task.get("owner") or "unknown"), "owner")
     table = safe_ident(str(task.get("table") or "table"), "table")
-    filename = f"{table}_{job_id}_{now_ts()}.{fmt}"
+    filename = f"export_{owner}_{table}_{now_ts()}.{fmt}"
     return target_dir / filename
 
 

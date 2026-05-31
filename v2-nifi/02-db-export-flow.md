@@ -203,7 +203,7 @@ GetFile (Root Group) ──success──┐
 ┌─────────────────────────────────────────────────────────────────────────┐
 │  阶段 4：Worker 输出结果                                                 │
 │                                                                         │
-│  ✓ 成功 → output_csv/sensor_data_export_abc123_20260528_120000.csv     │
+│  ✓ 成功 → output_csv/export_owner_sensor_data_20260528_120000.csv      │
 │          export_jobs/done/export_abc123.json（status: SUCCEEDED）       │
 │                                                                         │
 │  ✗ 失败 → export_jobs/error/export_abc123.json（status: FAILED）        │
@@ -674,7 +674,7 @@ def on_schedule_tick(schedule_config: dict):
 | Worker 脚本 | `nifi_db_export_worker.py` | 同一个 |
 | 任务 JSON inbox | `export_jobs/inbox/` | 同一个 |
 | 输出目录 | `output_csv\|json\|tsv` | 同一个 |
-| 文件命名 | `<table>_export_<jobId>_<ts>.csv` | `<table>_scheduled_export_<jobId>_<ts>.csv` |
+| 文件命名 | `export_{owner}_{table}_{ts}.csv` | `export_{owner}_{table}_{ts}.csv` |
 | jobId 前缀 | `export_` | `scheduled_` |
 | 触发方 | 前端用户点击 | 后端 cron / APScheduler |
 
