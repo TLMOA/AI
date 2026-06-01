@@ -152,7 +152,7 @@ def _save_backend_mode_state(state: Dict[str, Any]) -> Dict[str, Any]:
 
 
 BACKEND_MODE_STATE: Dict[str, Any] = {"factory_id": DEFAULT_FACTORY_ID, "mode": "local", "updatedAt": "", "updatedBy": "system"}
-NIFI_REAL_BASE_DIR = Path(os.getenv("NIFI_REAL_BASE_DIR", "/home/yhz/iot/real_nifi_data"))
+NIFI_REAL_BASE_DIR = Path(os.getenv("NIFI_REAL_BASE_DIR", "/home/yhz/real_nifi_data")).resolve()
 NIFI_REAL_BASE_DIR.mkdir(parents=True, exist_ok=True)
 NIFI_CONTAINER_BASE = "/opt/nifi/nifi-current/data/iot"
 

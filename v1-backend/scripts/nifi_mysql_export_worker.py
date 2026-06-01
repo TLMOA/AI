@@ -112,7 +112,7 @@ def normalized_format(task: Dict[str, Any]) -> str:
 def output_path(task: Dict[str, Any], fmt: str) -> Path:
     target_dir = Path(str(task.get("targetDir") or "")).expanduser()
     if not str(target_dir):
-        root = Path(str(task.get("targetRoot") or "/home/yhz/iot/real_nifi_data"))
+        root = Path(str(task.get("targetRoot") or "/opt/nifi/nifi-current/data/iot"))
         target_dir = root / f"output_{fmt}"
     target_dir.mkdir(parents=True, exist_ok=True)
     owner = safe_ident(str(task.get("ownerId") or task.get("owner") or "unknown"), "owner")
@@ -168,7 +168,7 @@ def write_rows(path: Path, fmt: str, columns: List[str], rows: Iterable[Dict[str
 
 
 def status_dirs(task: Dict[str, Any]) -> Tuple[Path, Path]:
-    root = Path(str(task.get("targetRoot") or "/home/yhz/iot/real_nifi_data")) / "export_jobs"
+    root = Path(str(task.get("targetRoot") or "/opt/nifi/nifi-current/data/iot")) / "export_jobs"
     done = root / "done"
     error = root / "error"
     done.mkdir(parents=True, exist_ok=True)

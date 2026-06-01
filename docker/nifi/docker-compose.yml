@@ -8,7 +8,9 @@ services:
     volumes:
       - /home/yhz/iot/real_nifi_conf:/opt/nifi/nifi-current/conf
       - /home/yhz/real_nifi_data:/opt/nifi/nifi-current/data/iot
+      - /etc/localtime:/etc/localtime:ro
     environment:
+      - TZ=Asia/Shanghai
       - NIFI_WEB_HTTPS_PORT=8443
       - NIFI_WEB_PROXY_HOST=${NIFI_WEB_PROXY_HOST:-127.0.0.1:8080,localhost:8080,202.113.76.55:9443}
       - NIFI_WEB_PROXY_CONTEXT_PATH=${NIFI_WEB_PROXY_CONTEXT_PATH:-/nifi}

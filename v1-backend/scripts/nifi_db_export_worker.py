@@ -81,6 +81,8 @@ def output_path(task: Dict[str, Any], fmt: str) -> Path:
         root = Path(str(task.get("targetRoot") or "/opt/nifi/nifi-current/data/iot"))
         target_dir = root / f"output_{fmt}"
     target_dir.mkdir(parents=True, exist_ok=True)
+    if task.get("targetFile"):
+        return target_dir / str(task.get("targetFile"))
     owner = safe_ident(str(task.get("ownerId") or task.get("owner") or "unknown"), "owner")
     table = safe_ident(str(task.get("table") or "table"), "table")
     filename = f"export_{owner}_{table}_{now_ts()}.{fmt}"
@@ -150,82 +152,114 @@ def write_status(task: Dict[str, Any], payload: Dict[str, Any], failed: bool = F
     return status_path
 
 
+def _default_gateway_ip() -> str:
+    try:
+        with open("/proc/net/route", "r", encoding="utf-8") as fh:
+            for line in fh:
+                parts = line.strip().split()
+                if len(parts) >= 3 and parts[1] == "00000000":
+                    gw = parts[2]
+                    if len(gw) == 8:
+                        raw = bytes.fromhex(gw)
+                        gateway = raw[::-1]
+                        return ".".join(str(b) for b in gateway)
+    except Exception:
+        pass
+    return ""
+
+
+def _resolve_database_hosts(task: Dict[str, Any]) -> list[str]:
+    host = str(task.get("host") or "127.0.0.1").strip()
+    candidates = [host]
+    if host in {"127.0.0.1", "localhost"}:
+        candidates.extend(["host.docker.internal", _default_gateway_ip(), "172.17.0.1", "172.18.0.1", "172.19.0.1"])
+    # keep unique, preserve order
+    seen = set()
+    unique = []
+    for candidate in candidates:
+        if candidate and candidate not in seen:
+            seen.add(candidate)
+            unique.append(candidate)
+    return unique
+
+
 def connect_db(task: Dict[str, Any]):
     db_type = str(task.get("dbType") or "").strip().lower()
+    hosts = _resolve_database_hosts(task)
+    errors: list[str] = []
 
-    if db_type == "mysql":
-        import pymysql
-        return pymysql.connect(
-            host=str(task.get("host") or "127.0.0.1"),
-            port=int(task.get("port") or 3306),
-            user=str(task.get("user") or "root"),
-            password=str(task.get("password") or ""),
-            database=str(task.get("database") or ""),
-            charset="utf8mb4",
-            cursorclass=pymysql.cursors.DictCursor,
-        )
-
-    elif db_type in ("postgres", "postgresql"):
-        import psycopg2
-        import psycopg2.extras
-        return psycopg2.connect(
-            host=str(task.get("host") or "127.0.0.1"),
-            port=int(task.get("port") or 5432),
-            user=str(task.get("user") or "postgres"),
-            password=str(task.get("password") or ""),
-            dbname=str(task.get("database") or ""),
-            cursor_factory=psycopg2.extras.RealDictCursor,
-        )
-
-    elif db_type == "sqlserver":
-        import pymssql
-        return pymssql.connect(
-            server=str(task.get("host") or "127.0.0.1"),
-            port=int(task.get("port") or 1433),
-            user=str(task.get("user") or "sa"),
-            password=str(task.get("password") or ""),
-            database=str(task.get("database") or ""),
-        )
-
-    elif db_type == "oracle":
-        import oracledb
-        dsn = str(task.get("dsn") or f"{task.get('host','127.0.0.1')}:{task.get('port',1521)}/{task.get('database','')}")
-        return oracledb.connect(
-            user=str(task.get("user") or ""),
-            password=str(task.get("password") or ""),
-            dsn=dsn,
-        )
-
-    elif db_type == "sqlite":
-        import sqlite3
-        path = str(task.get("path") or task.get("database") or ":memory:")
-        conn = sqlite3.connect(path)
-        conn.row_factory = sqlite3.Row
-        return conn
-
-    elif db_type == "hive":
-        import pyhive.hive
-        return pyhive.hive.connect(
-            host=str(task.get("host") or "127.0.0.1"),
-            port=int(task.get("port") or 10000),
-            username=str(task.get("user") or ""),
-            database=str(task.get("database") or "default"),
-        )
-
-    elif db_type == "hdfs":
-        import hdfs
-        url = str(task.get("dsn") or f"http://{task.get('host','127.0.0.1')}:{task.get('port',50070)}")
-        return hdfs.InsecureClient(url, user=str(task.get("user") or ""))
-
-    elif db_type == "hbase":
-        import happybase
-        return happybase.Connection(
-            host=str(task.get("host") or "127.0.0.1"),
-            port=int(task.get("port") or 9090),
-        )
-
-    else:
+    def _connect(host_value: str):
+        if db_type == "mysql":
+            import pymysql
+            return pymysql.connect(
+                host=host_value,
+                port=int(task.get("port") or 3306),
+                user=str(task.get("user") or "root"),
+                password=str(task.get("password") or ""),
+                database=str(task.get("database") or ""),
+                charset="utf8mb4",
+                cursorclass=pymysql.cursors.DictCursor,
+            )
+        if db_type in ("postgres", "postgresql"):
+            import psycopg2
+            import psycopg2.extras
+            return psycopg2.connect(
+                host=host_value,
+                port=int(task.get("port") or 5432),
+                user=str(task.get("user") or "postgres"),
+                password=str(task.get("password") or ""),
+                dbname=str(task.get("database") or ""),
+                cursor_factory=psycopg2.extras.RealDictCursor,
+            )
+        if db_type == "sqlserver":
+            import pymssql
+            return pymssql.connect(
+                server=host_value,
+                port=int(task.get("port") or 1433),
+                user=str(task.get("user") or "sa"),
+                password=str(task.get("password") or ""),
+                database=str(task.get("database") or ""),
+            )
+        if db_type == "oracle":
+            import oracledb
+            dsn = str(task.get("dsn") or f"{host_value}:{task.get('port',1521)}/{task.get('database','')}")
+            return oracledb.connect(
+                user=str(task.get("user") or ""),
+                password=str(task.get("password") or ""),
+                dsn=dsn,
+            )
+        if db_type == "sqlite":
+            import sqlite3
+            path = str(task.get("path") or task.get("database") or ":memory:")
+            conn = sqlite3.connect(path)
+            conn.row_factory = sqlite3.Row
+            return conn
+        if db_type == "hive":
+            import pyhive.hive
+            return pyhive.hive.connect(
+                host=host_value,
+                port=int(task.get("port") or 10000),
+                username=str(task.get("user") or ""),
+                database=str(task.get("database") or "default"),
+            )
+        if db_type == "hdfs":
+            import hdfs
+            url = str(task.get("dsn") or f"http://{host_value}:{task.get('port',50070)}")
+            return hdfs.InsecureClient(url, user=str(task.get("user") or ""))
+        if db_type == "hbase":
+            import happybase
+            return happybase.Connection(
+                host=host_value,
+                port=int(task.get("port") or 9090),
+            )
         raise ValueError(f"unsupported dbType: {db_type}")
+
+    for host_value in hosts:
+        try:
+            return _connect(host_value)
+        except Exception as exc:
+            errors.append(f"{host_value}:{str(exc)}")
+    raise RuntimeError(f"failed to connect to {db_type} on hosts {hosts}: {'; '.join(errors)}")
 
 
 def fetch_sql_data(task: Dict[str, Any]) -> Tuple[List[str], List[Dict[str, Any]]]:
