@@ -351,6 +351,40 @@ async function previewFile(fileId) {
     return;
   }
     preview.textContent = JSON.stringify(res.data, null, 2);
+    // 显示元数据摘要
+    const metaInfoBar = document.getElementById("metaInfoBar");
+    const metaInfoContent = document.getElementById("metaInfoContent");
+    if (metaInfoBar && metaInfoContent && res.data && res.data.meta) {
+      const m = res.data.meta;
+      const hasTag = m.hasTag ? "是" : "否";
+      const parts = [`hasTag: ${hasTag}`];
+      if (m.tagColumn) parts.push(`tagColumn: ${m.tagColumn}`);
+      if (m.tagName) parts.push(`tagName: ${m.tagName}`);
+      if (m.tagRange && Array.isArray(m.tagRange)) parts.push(`tagRange: [${m.tagRange.join(", ")}]`);
+      if (m.failedTag) parts.push(`failedTag: ${m.failedTag}`);
+      metaInfoContent.textContent = parts.join(" | ");
+      metaInfoBar.style.display = "";
+    } else if (metaInfoBar) {
+      metaInfoBar.style.display = "none";
+    }
+    // 控制「自动打标」按钮显示
+    const autoTagBtn = document.getElementById("autoTagFromPreviewBtn");
+    if (autoTagBtn && res.data && res.data.meta) {
+      autoTagBtn.style.display = "";
+      autoTagBtn.onclick = () => {
+        // 将 fileId 填入标签中心的自动打标输入框
+        const atf = document.getElementById("autoTagFileId");
+        if (atf) { atf.value = fileId; }
+        // 如果有 meta 中的 tagName，也填入
+        const atn = document.getElementById("autoTagName");
+        if (atn && res.data.meta.tagName) { atn.value = res.data.meta.tagName; }
+        // 滚动到标签中心
+        const tagSection = document.querySelector("section.card h2");
+        if (tagSection) tagSection.scrollIntoView({ behavior: "smooth" });
+      };
+    } else if (autoTagBtn) {
+      autoTagBtn.style.display = "none";
+    }
     // 若为表格格式（columns/rows），展示可编辑表格（整表可编辑）
     const editable = document.getElementById("editablePreview");
     const wrapper = document.getElementById("editableTableWrapper");
@@ -393,18 +427,22 @@ async function previewFile(fileId) {
       });
       table.appendChild(tbody);
       wrapper.appendChild(table);
-      // add '新增字段' handler: create new column at end
+      // add '新增字段' handler: 仅允许新增 tag 列，且最多新增 1 列
       const addFieldBtn = document.getElementById('addFieldBtn');
       if (addFieldBtn) {
-        addFieldBtn.disabled = false;
+        // 如果已有 tag 列，禁用新增字段
+        const hasTagColumn = state.previewColumns.includes("tag");
+        addFieldBtn.disabled = hasTagColumn;
         addFieldBtn.onclick = () => {
-          const newColName = `new_field_${Date.now()}`;
+          if (state.previewColumns.includes("tag")) {
+            return; // 已有 tag 列，不允许再新增
+          }
+          const newColName = "tag";
           // update state and header
           state.previewColumns.push(newColName);
           const newTh = document.createElement('th');
           newTh.contentEditable = true;
           newTh.className = 'editable-header';
-          // Keep the generated name as original so rename logic can remap cell column keys on save.
           newTh.dataset.original = newColName;
           newTh.dataset.colIndex = String(headRow.children.length);
           newTh.textContent = newColName;
@@ -423,6 +461,7 @@ async function previewFile(fileId) {
               tr.appendChild(td);
             });
           }
+          addFieldBtn.disabled = true; // 禁止再新增
         };
       }
     } else {
@@ -561,15 +600,94 @@ async function loadTagRules() {
   renderTagRules();
 }
 
+function collectTagRuleFromUI() {
+  const ruleName = (document.getElementById("autoTagRuleName")?.value || "").trim();
+  const inputsStr = (document.getElementById("autoTagInputs")?.value || "").trim();
+  const defaultTag = (document.getElementById("autoTagDefault")?.value || "未知").trim();
+  const inputs = inputsStr ? inputsStr.split(",").map(s => s.trim()).filter(Boolean) : [];
+  const mapping = [];
+  const rows = document.querySelectorAll("#tagRuleMappingContainer .tag-rule-row");
+  rows.forEach(row => {
+    const whenInputs = row.querySelectorAll(".rule-when-input");
+    const tagInput = row.querySelector(".rule-tag-input");
+    const when = {};
+    whenInputs.forEach(wi => {
+      const col = wi.dataset.column || "";
+      const val = wi.value.trim();
+      if (col && val) when[col] = val;
+    });
+    const tag = tagInput ? tagInput.value.trim() : "";
+    if (Object.keys(when).length > 0 && tag) {
+      mapping.push({ when, tag });
+    }
+  });
+  if (!ruleName || inputs.length === 0 || mapping.length === 0) return null;
+  return { ruleName, inputs, mapping, defaultTag };
+}
+
+function addTagRuleConditionRow() {
+  const container = document.getElementById("tagRuleMappingContainer");
+  if (!container) return;
+  const inputsStr = (document.getElementById("autoTagInputs")?.value || "").trim();
+  const inputs = inputsStr ? inputsStr.split(",").map(s => s.trim()).filter(Boolean) : [];
+  if (inputs.length === 0) {
+    // 提示先填写参与打标的列
+    const tagResult = document.getElementById("tagResult");
+    if (tagResult) tagResult.textContent = "请先填写「参与打标的列」";
+    return;
+  }
+  const row = document.createElement("div");
+  row.className = "row tag-rule-row";
+  row.style.cssText = "margin-top:4px; align-items:center;";
+  inputs.forEach(col => {
+    const label = document.createElement("label");
+    label.textContent = col;
+    label.style.cssText = "font-size:0.85em;";
+    row.appendChild(label);
+    const input = document.createElement("input");
+    input.type = "text";
+    input.className = "rule-when-input";
+    input.dataset.column = col;
+    input.placeholder = `当 ${col} = ?`;
+    input.style.cssText = "width:100px;";
+    row.appendChild(input);
+  });
+  const tagLabel = document.createElement("label");
+  tagLabel.textContent = "→ 标签";
+  tagLabel.style.cssText = "font-size:0.85em; margin-left:8px;";
+  row.appendChild(tagLabel);
+  const tagInput = document.createElement("input");
+  tagInput.type = "text";
+  tagInput.className = "rule-tag-input";
+  tagInput.placeholder = "如 故障";
+  tagInput.style.cssText = "width:80px;";
+  row.appendChild(tagInput);
+  const delBtn = document.createElement("button");
+  delBtn.textContent = "×";
+  delBtn.className = "secondary";
+  delBtn.type = "button";
+  delBtn.style.cssText = "margin-left:4px; padding:2px 6px; font-size:0.85em;";
+  delBtn.onclick = () => row.remove();
+  row.appendChild(delBtn);
+  container.appendChild(row);
+}
+
 async function triggerAutoTag() {
   const fileId = document.getElementById("autoTagFileId").value.trim();
-  const ruleId = document.getElementById("tagRuleSelect").value;
   const msg = document.getElementById("tagResult");
   if (!fileId) {
     msg.textContent = "请先输入 fileId";
     return;
   }
-  const payload = { fileId, ruleId, outputFormat: "CSV", operator: (state.currentUser && state.currentUser.username) || "user-001" };
+  const tagRule = collectTagRuleFromUI();
+  const tagName = (document.getElementById("autoTagName")?.value || "").trim();
+  const payload = {
+    fileId,
+    outputFormat: "CSV",
+    operator: (state.currentUser && state.currentUser.username) || "user-001",
+  };
+  if (tagRule) payload.tagRule = tagRule;
+  if (tagName) payload.tagName = tagName;
   const res = await api("/tags/auto", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -581,7 +699,7 @@ async function triggerAutoTag() {
   }
   const data = res.data || {};
   if (data.file) {
-    msg.textContent = `自动标签完成: ${data.file.fileName}，路径: ${data.file.storagePath}，fileId: ${data.file.fileId}`;
+    msg.textContent = `自动标签完成: ${data.file.fileName}，fileId: ${data.file.fileId}`;
   } else {
     msg.textContent = `自动标签任务已创建: ${data.jobId || "-"}`;
   }
@@ -610,7 +728,7 @@ function collectDbConfigForSchedule() {
   DEFAULT_PORTS.hdfs = 9870;
   const conf = {
     db_type: db_type,
-    host: document.getElementById("dbHost")?.value.trim() || "127.0.0.1",
+    host: document.getElementById("dbHost")?.value.trim() || "202.113.76.55",
     port: Number(document.getElementById("dbPort")?.value || DEFAULT_PORTS[db_type] || 3306),
     user: document.getElementById("dbUser")?.value.trim() || "root",
     password: document.getElementById("dbPassword")?.value || "",
@@ -626,15 +744,15 @@ function collectDbConfigForSchedule() {
 }
 
 const DB_TYPE_DEFAULTS = {
-  mysql: { host: '127.0.0.1', port: '3306', user: 'root', database: 'nifi', password: 'root' },
-  postgres: { host: '127.0.0.1', port: '5432', user: 'postgres', database: 'postgres', password: 'difyai123456' },
-  postgresql: { host: '127.0.0.1', port: '5432', user: 'postgres', database: 'postgres', password: 'difyai123456' },
-  sqlserver: { host: '127.0.0.1', port: '1433', user: 'sa', database: 'master', password: 'Your_password123' },
-  oracle: { host: '127.0.0.1', port: '1521', user: 'system', database: 'FREEPDB1', password: 'Oracle123456' },
+  mysql: { host: '202.113.76.55', port: '3306', user: 'root', database: 'nifi', password: 'root' },
+  postgres: { host: '202.113.76.55', port: '5432', user: 'postgres', database: 'postgres', password: 'difyai123456' },
+  postgresql: { host: '202.113.76.55', port: '5432', user: 'postgres', database: 'postgres', password: 'difyai123456' },
+  sqlserver: { host: '202.113.76.55', port: '1433', user: 'sa', database: 'master', password: 'Your_password123' },
+  oracle: { host: '202.113.76.55', port: '1521', user: 'system', database: 'FREEPDB1', password: 'Oracle123456' },
   sqlite: { host: '', port: '', user: '', database: '', password: '' },
-  hive: { host: 'localhost', port: '10000', user: 'hive', database: 'default', password: '' },
-  hdfs: { host: 'localhost', port: '9870', user: 'hadoop', database: '/', password: '', path: '/' },
-  hbase: { host: 'localhost', port: '19090', user: 'root', database: 'default', password: '' },
+  hive: { host: '202.113.76.55', port: '10000', user: 'hive', database: 'default', password: '' },
+  hdfs: { host: '202.113.76.55', port: '9870', user: 'hadoop', database: '/', password: '', path: '/' },
+  hbase: { host: '202.113.76.55', port: '19090', user: 'root', database: 'default', password: '' },
 };
 
 function applyDbTypeDefaults() {
@@ -696,7 +814,7 @@ function renderDbFields() {
       const hostEl = document.getElementById('dbHost');
       const portEl = document.getElementById('dbPort');
       const userEl = document.getElementById('dbUser');
-      if (hostEl && (!hostEl.value || ['127.0.0.1', 'localhost'].includes(String(hostEl.value).trim()))) hostEl.value = 'localhost';
+      if (hostEl && (!hostEl.value || ['202.113.76.55', '127.0.0.1', 'localhost'].includes(String(hostEl.value).trim()))) hostEl.value = '202.113.76.55';
       if (portEl && (!portEl.value || ['3306', '5432', '1433', '1521', '10000', '9090', '9870', '19090'].includes(String(portEl.value).trim()))) portEl.value = '9870';
       if (userEl && (!userEl.value || ['root', 'hive', 'admin'].includes(String(userEl.value).trim()))) userEl.value = 'hadoop';
       // HDFS 通常不需要密码字段，隐藏 password input 与其 label（仅隐藏，不移除 DOM）
@@ -852,6 +970,33 @@ function buildSchedulePayload() {
   if (!spec) {
     throw new Error("请选择频率或填写 cron 表达式");
   }
+  const payload = { table };
+  // 添加标签配置参数
+  const hasTag = document.getElementById("dbHasTag")?.value;
+  if (hasTag) {
+    payload.hasTag = hasTag === "true";
+    if (hasTag === "true") {
+      const tc = (document.getElementById("dbTagColumn")?.value || "").trim();
+      const tn = (document.getElementById("dbTagName")?.value || "").trim();
+      const tr = (document.getElementById("dbTagRangeWithLabel")?.value || "").trim();
+      const ft = (document.getElementById("dbFailedTagWithLabel")?.value || "").trim();
+      if (tc) payload.tagColumn = tc;
+      if (tn) payload.tagName = tn;
+      if (tr) payload.tagRange = tr;
+      if (ft) payload.failedTag = ft;
+    } else {
+      const tr = (document.getElementById("dbTagRange")?.value || "").trim();
+      const ft = (document.getElementById("dbFailedTag")?.value || "").trim();
+      if (tr) payload.tagRange = tr;
+      if (ft) payload.failedTag = ft;
+    }
+  }
+  const cid = (document.getElementById("dbCategoryId")?.value || "").trim();
+  const cname = (document.getElementById("dbCategoryName")?.value || "").trim();
+  const desc = (document.getElementById("dbDescription")?.value || "").trim();
+  if (cid) payload.categoryId = cid;
+  if (cname) payload.categoryName = cname;
+  if (desc) payload.description = desc;
   return {
     job_name: `db_export_${table}_${Date.now()}`,
     factory_id: DEFAULT_FACTORY_ID,
@@ -862,7 +1007,7 @@ function buildSchedulePayload() {
     mode: "visible",
     destination: { type: "local", path: "" },
     db_config: collectDbConfigForSchedule(),
-    payload: { table },
+    payload,
   };
 }
 
@@ -1008,6 +1153,8 @@ function bindEvents() {
   document.getElementById("loadFilesBtn").addEventListener("click", loadFiles);
   document.getElementById("loadRulesBtn").addEventListener("click", loadTagRules);
   document.getElementById("autoTagBtn").addEventListener("click", triggerAutoTag);
+  const addTagRuleBtn = document.getElementById("addTagRuleBtn");
+  if (addTagRuleBtn) addTagRuleBtn.addEventListener("click", addTagRuleConditionRow);
   const backendLocalBtn = document.getElementById("backendLocalBtn");
   const backendNifiBtn = document.getElementById("backendNifiBtn");
   if (backendLocalBtn) backendLocalBtn.addEventListener("click", () => setBackendMode("local"));
@@ -1032,6 +1179,41 @@ function bindEvents() {
   if (scheduleRefreshBtn) scheduleRefreshBtn.addEventListener("click", () => {
     loadExportJobsForModal().catch(() => {});
   });
+
+  // 标签配置 UI 联动
+  const dbHasTag = document.getElementById("dbHasTag");
+  if (dbHasTag) {
+    dbHasTag.addEventListener("change", () => {
+      const val = dbHasTag.value;
+      const withLabel = document.getElementById("dbTagWithLabel");
+      const withoutLabel = document.getElementById("dbTagWithoutLabel");
+      if (withLabel) withLabel.style.display = val === "true" ? "" : "none";
+      if (withoutLabel) withoutLabel.style.display = val === "false" ? "" : "none";
+    });
+  }
+  const dbTagRange = document.getElementById("dbTagRange");
+  if (dbTagRange) {
+    dbTagRange.addEventListener("input", () => {
+      // 故障标签改为手动输入，不再自动填充选项
+    });
+  }
+
+  const uploadHasTag = document.getElementById("uploadHasTag");
+  if (uploadHasTag) {
+    uploadHasTag.addEventListener("change", () => {
+      const val = uploadHasTag.value;
+      const withLabel = document.getElementById("uploadTagWithLabel");
+      const withoutLabel = document.getElementById("uploadTagWithoutLabel");
+      if (withLabel) withLabel.style.display = val === "true" ? "" : "none";
+      if (withoutLabel) withoutLabel.style.display = val === "false" ? "" : "none";
+    });
+  }
+  const uploadTagRange = document.getElementById("uploadTagRange");
+  if (uploadTagRange) {
+    uploadTagRange.addEventListener("input", () => {
+      // 故障标签改为手动输入，不再自动填充选项
+    });
+  }
 }
 
 async function init() {
@@ -1172,6 +1354,35 @@ async function exportFromDb() {
         owner_id: (state.currentUser && state.currentUser.username) || "user-001",
       where: where,
     };
+
+    // 添加标签配置参数
+    const hasTag = document.getElementById("dbHasTag")?.value;
+    if (hasTag) {
+      payload.hasTag = hasTag === "true";
+      if (hasTag === "true") {
+        const tc = (document.getElementById("dbTagColumn")?.value || "").trim();
+        const tn = (document.getElementById("dbTagName")?.value || "").trim();
+        const tr = (document.getElementById("dbTagRangeWithLabel")?.value || "").trim();
+        const ft = (document.getElementById("dbFailedTagWithLabel")?.value || "").trim();
+        if (tc) payload.tagColumn = tc;
+        if (tn) payload.tagName = tn;
+        if (tr) payload.tagRange = tr;
+        if (ft) payload.failedTag = ft;
+      } else {
+        const tr = (document.getElementById("dbTagRange")?.value || "").trim();
+        const ft = (document.getElementById("dbFailedTag")?.value || "").trim();
+        if (tr) payload.tagRange = tr;
+        if (ft) payload.failedTag = ft;
+      }
+    }
+    // 补充信息
+    const cid = (document.getElementById("dbCategoryId")?.value || "").trim();
+    const cname = (document.getElementById("dbCategoryName")?.value || "").trim();
+    const desc = (document.getElementById("dbDescription")?.value || "").trim();
+    if (cid) payload.categoryId = cid;
+    if (cname) payload.categoryName = cname;
+    if (desc) payload.description = desc;
+
     const res = await api(`/export`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -1207,7 +1418,6 @@ init();
 // 文件上传逻辑
 const fileInput = document.getElementById("fileInput");
 const uploadFormat = document.getElementById("uploadFormat");
-const uploadUserName = document.getElementById("uploadUserName");
 const uploadColumns = document.getElementById("uploadColumns");
 const uploadBtn = document.getElementById("uploadBtn");
 const uploadResult = document.getElementById("uploadResult");
@@ -1221,7 +1431,7 @@ if (fileInput && uploadBtn && uploadResult) {
     const formData = new FormData();
     formData.append("file", file);
     const sourceType = uploadFormat ? uploadFormat.value : "CSV";
-    const username = uploadUserName ? uploadUserName.value.trim() || "user" : "user";
+    const username = (state.currentUser && state.currentUser.username) || "user";
     const columns = uploadColumns ? uploadColumns.value.trim() : "";
     const uploadMapping = {
       CSV: { endpoint: "/upload/inbox_csv", convertType: "csv_to_json" },
@@ -1253,6 +1463,35 @@ if (fileInput && uploadBtn && uploadResult) {
       if (columns) {
         query.set("columns", columns);
       }
+
+      // 添加标签配置参数
+      const upHasTag = (document.getElementById("uploadHasTag")?.value || "").trim();
+      if (upHasTag) {
+        query.set("hasTag", upHasTag);
+        if (upHasTag === "true") {
+          const tc = (document.getElementById("uploadTagColumn")?.value || "").trim();
+          const tn = (document.getElementById("uploadTagName")?.value || "").trim();
+          const tr = (document.getElementById("uploadTagRangeWithLabel")?.value || "").trim();
+          const ft = (document.getElementById("uploadFailedTagWithLabel")?.value || "").trim();
+          if (tc) query.set("tagColumn", tc);
+          if (tn) query.set("tagName", tn);
+          if (tr) query.set("tagRange", tr);
+          if (ft) query.set("failedTag", ft);
+        } else {
+          const tr = (document.getElementById("uploadTagRange")?.value || "").trim();
+          const ft = (document.getElementById("uploadFailedTag")?.value || "").trim();
+          if (tr) query.set("tagRange", tr);
+          if (ft) query.set("failedTag", ft);
+        }
+      }
+      // 补充信息
+      const upCid = (document.getElementById("uploadCategoryId")?.value || "").trim();
+      const upCname = (document.getElementById("uploadCategoryName")?.value || "").trim();
+      const upDesc = (document.getElementById("uploadDescription")?.value || "").trim();
+      if (upCid) query.set("categoryId", upCid);
+      if (upCname) query.set("categoryName", upCname);
+      if (upDesc) query.set("description", upDesc);
+
       const data = await requestJson(`${selected.endpoint}?${query.toString()}`, {
         method: "POST",
         body: formData,

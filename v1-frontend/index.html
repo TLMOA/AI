@@ -50,7 +50,7 @@
       </div>
       <div class="row">
         <label>Host</label>
-        <input id="dbHost" type="text" value="127.0.0.1" />
+        <input id="dbHost" type="text" value="202.113.76.55" />
         <label>Port</label>
         <input id="dbPort" type="number" value="3306" />
       </div>
@@ -84,6 +84,40 @@
         <label>追加到 latest</label>
         <input id="dbAppendLatest" type="checkbox" />
         <button id="dbExportBtn">立即导出</button>
+      </div>
+      <div class="row" style="margin-top:8px; padding-top:8px; border-top:1px dashed #ccc;">
+        <strong style="margin-right:12px; color:#555;">标签配置</strong>
+        <label>是否含标签</label>
+        <select id="dbHasTag">
+          <option value="">-- 请选择 --</option>
+          <option value="true">是（已有标签列）</option>
+          <option value="false">否（无标签，需设置候选范围）</option>
+        </select>
+        <span id="dbTagWithLabel" style="display:none;">
+          <label>标签列</label>
+          <input id="dbTagColumn" type="text" placeholder="列名，如 tag" />
+          <label>标签名字</label>
+          <input id="dbTagName" type="text" placeholder="如 设备状态" />
+          <label>候选标签范围</label>
+          <input id="dbTagRangeWithLabel" type="text" placeholder="逗号分隔，如 故障,预警,正常" />
+          <label>故障标签</label>
+          <input id="dbFailedTagWithLabel" type="text" placeholder="如 故障" />
+        </span>
+        <span id="dbTagWithoutLabel" style="display:none;">
+          <label>候选标签范围</label>
+          <input id="dbTagRange" type="text" placeholder="逗号分隔，如 故障,预警,正常" />
+          <label>故障标签</label>
+          <input id="dbFailedTag" type="text" placeholder="逗号分隔，如 故障,预警" />
+        </span>
+      </div>
+      <div class="row" style="margin-top:4px; padding-top:4px; border-top:1px dashed #ccc;">
+        <strong style="margin-right:8px; color:#555; font-size:0.9em;">补充信息</strong>
+        <label>类别ID</label>
+        <input id="dbCategoryId" type="text" placeholder="如 dev_ops" />
+        <label>类别名称</label>
+        <input id="dbCategoryName" type="text" placeholder="如 设备运维" />
+        <label>描述</label>
+        <input id="dbDescription" type="text" placeholder="可选说明" />
       </div>
       <div class="row" style="margin-top:8px; padding-top:12px; border-top:1px dashed #ccc;">
         <strong style="margin-right:12px; color:#555;">定时导出</strong>
@@ -166,6 +200,10 @@
         <button id="previewReloadBtn">刷新预览</button>
         <button id="openEditorModalBtn" class="secondary">弹窗编辑</button>
       </div>
+      <div id="metaInfoBar" style="display:none; margin-bottom:8px; padding:8px; background:#f0f6ff; border:1px solid #c0d6f0; border-radius:4px; font-size:0.9em;">
+        <strong>标签元数据:</strong>
+        <span id="metaInfoContent"></span>
+      </div>
       <div id="filePreviewContainer">
         <div class="row" id="editorModalBar" style="display:none;justify-content:space-between;">
           <strong>标签编辑弹窗</strong>
@@ -178,6 +216,7 @@
           <div class="row">
             <button id="addFieldBtn" class="secondary">新增字段</button>
             <button id="saveTagsBtn">保存标签</button>
+            <button id="autoTagFromPreviewBtn" class="secondary" style="display:none;">自动打标</button>
             <span id="saveTagsResult"></span>
           </div>
         </div>
@@ -199,20 +238,37 @@
     <section class="card">
       <h2>标签中心（本地打标模式）</h2>
       <p>本地打标模式：自动标签和文件中心编辑结果都会在后端本地生成新文件，统一落到 <code>/home/yhz/nifi-data/tagged_output/</code>。</p>
-      <div class="row">
-        <label>规则（自动标签用）</label>
-        <select id="tagRuleSelect"></select>
-        <button id="loadRulesBtn">刷新规则</button>
-      </div>
 
       <h3>自动标签</h3>
-      <p>输入 fileId 后点击“触发自动标签”，系统会按规则生成带 auto_tag 字段的本地结果文件。</p>
       <div class="row">
         <label>fileId</label>
         <input id="autoTagFileId" type="text" placeholder="输入 fileId" />
-        <button id="autoTagBtn">触发自动标签</button>
+        <label>标签名字</label>
+        <input id="autoTagName" type="text" placeholder="如 设备状态" />
       </div>
-      <p>手动编辑请在文件中心进行，已不再单独提供“手动标签”表单入口。</p>
+      <div class="row" style="margin-top:8px; padding-top:8px; border-top:1px dashed #ccc;">
+        <strong style="color:#555;">多列规则配置</strong>
+      </div>
+      <div class="row">
+        <label>规则名称</label>
+        <input id="autoTagRuleName" type="text" placeholder="如 按设备类型和状态打标" />
+        <label>参与打标的列</label>
+        <input id="autoTagInputs" type="text" placeholder="逗号分隔，如 device_type,status" />
+        <label>默认标签</label>
+        <input id="autoTagDefault" type="text" value="未知" />
+      </div>
+      <div class="row">
+        <strong style="color:#555; font-size:0.9em;">条件映射规则</strong>
+        <button id="addTagRuleBtn" class="secondary" type="button">+ 添加条件</button>
+      </div>
+      <div id="tagRuleMappingContainer" style="margin-bottom:8px;">
+        <!-- 动态生成 -->
+      </div>
+      <div class="row">
+        <button id="autoTagBtn">触发自动标签</button>
+        <button id="loadRulesBtn" class="secondary">刷新规则</button>
+      </div>
+      <p>手动编辑请在文件中心进行，已不再单独提供"手动标签"表单入口。</p>
       <p id="tagResult"></p>
     </section>
 
@@ -228,12 +284,45 @@
           <option value="JSON_TO_TSV">JSON -> TSV</option>
           <option value="TSV_TO_JSON">TSV -> JSON</option>
         </select>
-        <label>用户名/会话</label>
-        <input id="uploadUserName" type="text" value="user" />
+        
       </div>
       <div class="row">
         <label>无表头时列名</label>
         <input id="uploadColumns" type="text" placeholder="可选，逗号分隔，例如 id,name,value" />
+      </div>
+      <div class="row" style="margin-top:4px; padding-top:8px; border-top:1px dashed #ccc;">
+        <strong style="margin-right:8px; color:#555; font-size:0.9em;">标签配置</strong>
+        <label>是否含标签</label>
+        <select id="uploadHasTag">
+          <option value="">-- 请选择 --</option>
+          <option value="true">是（已有标签列）</option>
+          <option value="false">否（无标签）</option>
+        </select>
+        <span id="uploadTagWithLabel" style="display:none;">
+          <label>标签列</label>
+          <input id="uploadTagColumn" type="text" placeholder="列名，如 tag" />
+          <label>标签名字</label>
+          <input id="uploadTagName" type="text" placeholder="如 设备状态" />
+          <label>候选标签范围</label>
+          <input id="uploadTagRangeWithLabel" type="text" placeholder="逗号分隔，如 故障,预警,正常" />
+          <label>故障标签</label>
+          <input id="uploadFailedTagWithLabel" type="text" placeholder="如 故障" />
+        </span>
+        <span id="uploadTagWithoutLabel" style="display:none;">
+          <label>候选标签范围</label>
+          <input id="uploadTagRange" type="text" placeholder="逗号分隔，如 故障,预警,正常" />
+          <label>故障标签</label>
+          <input id="uploadFailedTag" type="text" placeholder="逗号分隔，如 故障,预警" />
+        </span>
+      </div>
+      <div class="row" style="margin-top:4px; padding-top:4px; border-top:1px dashed #ccc;">
+        <strong style="margin-right:8px; color:#555; font-size:0.9em;">补充信息</strong>
+        <label>类别ID</label>
+        <input id="uploadCategoryId" type="text" placeholder="如 dev_ops" />
+        <label>类别名称</label>
+        <input id="uploadCategoryName" type="text" placeholder="如 设备运维" />
+        <label>描述</label>
+        <input id="uploadDescription" type="text" placeholder="可选说明" />
       </div>
       <input type="file" id="fileInput" />
       <button id="uploadBtn">上传并自动转换</button>

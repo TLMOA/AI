@@ -23,6 +23,7 @@ from .admin_routes import router as admin_router
 from .auth import _get_current_user_from_token
 from . import db_models
 from .export_worker import run_export_job
+from . import meta_json
 
 def _get_nifi_status() -> Dict[str, Any]:
     return {"ok": True, "mode": "manual", "message": "v2-nifi flow manually deployed"}
@@ -341,6 +342,11 @@ def _scan_nifi_export_results() -> Dict[str, Any]:
                     storage_path = str(p.resolve())
                     meta["storagePath"] = storage_path
                     meta["storageType"] = "NIFI_OUTPUT"
+                    # 写入配套的 meta.json 文件，确保 tagRange 和 failedTag 字段被写入
+                    try:
+                        _write_meta_file(meta)
+                    except Exception:
+                        pass
                     if str(meta.get("fileId") or "") in files:
                         files[str(meta["fileId"])] = meta
                     registered += 1
@@ -386,7 +392,43 @@ def _scan_nifi_export_results() -> Dict[str, Any]:
 def _run_export_job_by_mode(job: Dict[str, Any]) -> Dict[str, Any]:
     if _current_backend_mode() == "nifi":
         return _submit_nifi_export_task(job)
-    return run_export_job(job)
+    res = run_export_job(job)
+    # Write meta file with tag parameters for scheduled/triggered exports
+    if res.get("status") in ("ok", "demo_written") and res.get("path"):
+        try:
+            from pathlib import Path
+            out_path = Path(res["path"])
+            if out_path.exists():
+                payload = job.get("payload") or {}
+                meta = _register_and_return_meta(out_path, (job.get("file_format") or "csv").lower())
+                extra = {"sourceType": "db_export"}
+                if payload.get("hasTag") is not None:
+                    extra["hasTag"] = bool(payload.get("hasTag"))
+                if payload.get("tagColumn"):
+                    extra["tagColumn"] = payload.get("tagColumn")
+                if payload.get("tagName"):
+                    extra["tagName"] = payload.get("tagName")
+                if payload.get("tagRange"):
+                    tr = payload.get("tagRange")
+                    if isinstance(tr, str):
+                        try:
+                            extra["tagRange"] = json.loads(tr)
+                        except Exception:
+                            extra["tagRange"] = [t.strip() for t in tr.split(",") if t.strip()]
+                    else:
+                        extra["tagRange"] = tr
+                if payload.get("failedTag") is not None:
+                    extra["failedTag"] = _coerce_tag_list(payload.get("failedTag"))
+                if payload.get("categoryId"):
+                    extra["categoryId"] = payload.get("categoryId")
+                if payload.get("categoryName"):
+                    extra["categoryName"] = payload.get("categoryName")
+                if payload.get("description"):
+                    extra["description"] = payload.get("description")
+                _write_meta_file(meta, extra)
+        except Exception:
+            pass
+    return res
 
 
 def _operation_from_path(path: str) -> str:
@@ -546,6 +588,8 @@ class AutoTagReq(BaseModel):
     ruleId: str = "NIFI_RULE_ID_V5"
     outputFormat: str = "CSV"
     operator: str
+    tagRule: Optional[Dict[str, Any]] = None
+    tagName: Optional[str] = None
 
 
 class ScheduleReq(BaseModel):
@@ -660,8 +704,23 @@ def _sanitize_filename_component(value: Optional[str]) -> str:
 def _safe_relative_to(path: Path, root: Path) -> Optional[Path]:
     try:
         return path.resolve().relative_to(root.resolve())
-    except Exception:
+    except (ValueError, OSError):
         return None
+
+
+def _resolve_upload_username(request: Request, username_query: Optional[str] = None) -> str:
+    """Resolve the effective username for file upload naming.
+    Priority: auth cookie > query parameter > 'user'"""
+    try:
+        cookie = request.cookies.get("access_token")
+        auth_user = _get_current_user_from_token(cookie)
+        if auth_user and auth_user.get("username"):
+            return _sanitize_filename_component(auth_user["username"])
+    except Exception:
+        pass
+    if username_query and username_query != "user":
+        return _sanitize_filename_component(username_query)
+    return "user"
 
 
 def _mirror_to_in_data(file_path: Path, factory_id: str = DEFAULT_FACTORY_ID) -> Optional[Path]:
@@ -943,8 +1002,10 @@ def _startup():
                 if not r.enabled or not r.schedule:
                     continue
                 payload = {}
-                if isinstance(r.db_config, dict) and r.db_config.get("table"):
-                    payload = {"table": r.db_config.get("table")}
+                if isinstance(r.payload, dict):
+                    payload = r.payload
+                if not payload.get("table") and isinstance(r.db_config, dict) and r.db_config.get("table"):
+                    payload["table"] = r.db_config.get("table")
                 schedule_job(str(r.id), r.schedule, _run_export_job_by_mode, args=[{
                     "id": r.id,
                     "job_name": r.job_name,
@@ -991,7 +1052,7 @@ def api_trigger_export(job: Dict[str, Any], request: Request):
             "taskPath": submitted.get("taskPath"),
             "task": task,
         }, trace_id)
-    res = run_export_job(job)
+    res = _run_export_job_by_mode(job)
     if res.get("status") == "error":
         raise HTTPException(status_code=500, detail=res.get("error"))
     return ok(res, trace_id)
@@ -1012,6 +1073,7 @@ def api_create_export(job: Dict[str, Any], request: Request):
             mode=job.get("mode", "visible"),
             enabled=1 if job.get("enabled") else 0,
             db_config=job.get("db_config", {}),
+            payload=job.get("payload", {}),
         )
         session.add(ej)
         session.commit()
@@ -1042,7 +1104,7 @@ def api_create_export(job: Dict[str, Any], request: Request):
                     "payload": job.get("payload", {}),
                     "scheduled": True,
                 }
-                target_fn = _submit_nifi_export_task if _current_backend_mode() == "nifi" else run_export_job
+                target_fn = _submit_nifi_export_task if _current_backend_mode() == "nifi" else _run_export_job_by_mode
                 threading.Thread(target=target_fn, args=(thread_args,), daemon=True).start()
             except Exception:
                 pass
@@ -1075,6 +1137,7 @@ def api_list_exports(request: Request, factory_id: Optional[str] = Query(default
                 "file_format": r.file_format,
                 "mode": r.mode,
                 "enabled": bool(r.enabled),
+                "payload": r.payload,
                 "created_at": r.created_at.isoformat() if r.created_at else None,
             })
         return ok(out, trace_id)
@@ -1101,6 +1164,7 @@ def api_get_export(job_id: int, request: Request):
             "mode": r.mode,
             "enabled": bool(r.enabled),
             "db_config": r.db_config,
+            "payload": r.payload,
             "last_run": r.last_run.isoformat() if r.last_run else None,
         }, trace_id)
     finally:
@@ -1116,7 +1180,7 @@ def api_patch_export(job_id: int, patch: Dict[str, Any], request: Request):
         if not r:
             raise HTTPException(status_code=404, detail="not found")
         # simple fields
-        for k in ("job_name", "schedule", "file_format", "mode", "destination", "db_config", "factory_id"):
+        for k in ("job_name", "schedule", "file_format", "mode", "destination", "db_config", "factory_id", "payload"):
             if k in patch:
                 if k == "factory_id":
                     setattr(r, k, _normalize_factory_id(patch[k]))
@@ -1127,9 +1191,9 @@ def api_patch_export(job_id: int, patch: Dict[str, Any], request: Request):
         session.commit()
         # manage scheduling
         if r.enabled and r.schedule:
-            payload = patch.get("payload", {})
-            if (not payload) and isinstance(r.db_config, dict) and r.db_config.get("table"):
-                payload = {"table": r.db_config.get("table")}
+            payload = patch.get("payload") or (r.payload if isinstance(r.payload, dict) else {})
+            if not payload.get("table") and isinstance(r.db_config, dict) and r.db_config.get("table"):
+                payload["table"] = r.db_config.get("table")
             schedule_job(str(r.id), r.schedule, _run_export_job_by_mode, args=[{
                 "id": r.id,
                 "job_name": r.job_name,
@@ -1154,7 +1218,7 @@ def api_patch_export(job_id: int, patch: Dict[str, Any], request: Request):
                     "payload": payload,
                     "scheduled": True,
                 }
-                threading.Thread(target=run_export_job, args=(thread_args,), daemon=True).start()
+                threading.Thread(target=_run_export_job_by_mode, args=(thread_args,), daemon=True).start()
             except Exception:
                 pass
         else:
@@ -1602,11 +1666,44 @@ def _compute_auto_tag(row: Dict[str, Any], index: int) -> str:
         return "ROW_EVEN" if (index + 1) % 2 == 0 else "ROW_ODD"
 
 
+def _build_auto_tagged_rows_with_rule(rows: List[Dict[str, Any]], tag_rule: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """根据 tagRule 中的多列条件规则进行自动打标。
+
+    tagRule 格式:
+    {
+        "ruleName": "按设备类型和状态打标",
+        "inputs": ["device_type", "status"],
+        "mapping": [
+            {"when": {"device_type": "A", "status": "bad"}, "tag": "故障"},
+            {"when": {"device_type": "B", "status": "good"}, "tag": "正常"}
+        ],
+        "defaultTag": "未知"
+    }
+    """
+    mappings = tag_rule.get("mapping", [])
+    default_tag = tag_rule.get("defaultTag", "未知")
+    tagged_rows: List[Dict[str, Any]] = []
+    for row in rows:
+        tagged = dict(row)
+        matched = False
+        for m in mappings:
+            when = m.get("when", {})
+            tag = m.get("tag", "")
+            if all(str(row.get(k, "")) == str(v) for k, v in when.items()):
+                tagged["tag"] = tag
+                matched = True
+                break
+        if not matched:
+            tagged["tag"] = default_tag
+        tagged_rows.append(tagged)
+    return tagged_rows
+
+
 def _build_auto_tagged_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     tagged_rows: List[Dict[str, Any]] = []
     for idx, row in enumerate(rows):
         tagged = dict(row)
-        tagged["auto_tag"] = _compute_auto_tag(row, idx)
+        tagged["tag"] = _compute_auto_tag(row, idx)
         tagged_rows.append(tagged)
     return tagged_rows
 
@@ -1617,7 +1714,7 @@ def _build_manual_tagged_rows(rows: List[Dict[str, Any]], records: List[Dict[str
     for idx, row in enumerate(rows):
         tagged = dict(row)
         row_id = str(row.get("rowId", row.get("id", idx + 1)))
-        tagged["label"] = label_map.get(row_id, "")
+        tagged["tag"] = label_map.get(row_id, "")
         tagged_rows.append(tagged)
     return tagged_rows
 
@@ -1768,6 +1865,29 @@ def register_existing_file(file_path: Path, file_format: str) -> Dict[str, Any]:
     return file_meta
 
 
+def _coerce_tag_list(value: Any) -> List[str]:
+    """将 tagRange/failedTag 输入统一转为字符串列表，支持 JSON 数组、逗号、分号、换行分隔。"""
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return [str(x).strip() for x in value if str(x).strip()]
+    if isinstance(value, (tuple, set)):
+        return [str(x).strip() for x in value if str(x).strip()]
+    s = str(value).strip()
+    if not s:
+        return []
+    if s.startswith("[") and s.endswith("]"):
+        try:
+            parsed = json.loads(s)
+            if isinstance(parsed, list):
+                return [str(x).strip() for x in parsed if str(x).strip()]
+        except Exception:
+            pass
+    import re
+    parts = re.split(r"[,;\n|]", s)
+    return [p.strip() for p in parts if p and p.strip()]
+
+
 def _write_meta_file(meta: Dict[str, Any], extra: Optional[Dict[str, Any]] = None) -> Path:
     """Write a companion <file>.meta.json next to the file described by meta.
     Merges existing meta file if present. Returns the Path written.
@@ -1778,38 +1898,60 @@ def _write_meta_file(meta: Dict[str, Any], extra: Optional[Dict[str, Any]] = Non
     p = Path(storage_path)
     while p.name.endswith(".meta.json"):
         p = Path(str(p)[: -len(".meta.json")])
-    meta_path = p.with_suffix('.meta.json')
 
-    # base structure following meta.schema.json
-    base = {
-        "fileId": meta.get("fileId"),
-        "fileName": meta.get("fileName", p.name),
-        "sourceType": meta.get("sourceType", "upload"),
-        "storageType": "tagged" if str(TAGGED_OUTPUT_DIR) in str(p) or "tagged" in str(p) else "plain",
-        "storagePath": str(p),
-        "hasTag": bool(meta.get("tagColumn") or meta.get("hasTag", False)),
-        "tagColumn": meta.get("tagColumn"),
-        "tagName": meta.get("tagName"),
-        "tagRange": meta.get("tagRange"),
-        "tagStrategy": meta.get("tagStrategy", "none"),
-        "tagRule": meta.get("tagRule"),
-        "createdAt": meta.get("createdAt", now_iso()),
-        "updatedAt": now_iso(),
-    }
+    # 使用 meta_json 模块构建和写入
+    extra = extra or {}
+    has_tag = bool(extra.get("hasTag") or meta.get("tagColumn") or meta.get("hasTag", False))
+    tag_column = extra.get("tagColumn") or meta.get("tagColumn")
+    tag_name = extra.get("tagName") or meta.get("tagName")
+    # tagRange / failedTag 统一以列表形式存储
+    tag_range_src = extra.get("tagRange") if "tagRange" in extra else meta.get("tagRange")
+    failed_tag_src = extra.get("failedTag") if "failedTag" in extra else meta.get("failedTag")
+    tag_range = _coerce_tag_list(tag_range_src)
+    failed_tag = _coerce_tag_list(failed_tag_src)
+    tag_strategy = extra.get("tagStrategy") or meta.get("tagStrategy", "none")
+    tag_rule = extra.get("tagRule") or meta.get("tagRule")
 
-    # if existing meta file exists, merge
-    if meta_path.exists():
+    new_meta = meta_json.build_meta(
+        file_path=str(p),
+        source_type=extra.get("sourceType") or meta.get("sourceType", "upload"),
+        has_tag=has_tag,
+        tag_column=tag_column,
+        tag_name=tag_name,
+        tag_range=tag_range,
+        failed_tag=failed_tag,
+        tag_strategy=tag_strategy,
+        tag_rule=tag_rule,
+    )
+
+    # 保留已有 meta 中有实际值的字段，跳过标签相关字段（由 extra 提供）和空值
+    if meta_json.has_meta(str(p)):
         try:
-            existing = json.loads(meta_path.read_text(encoding="utf-8"))
-            base.update({k: v for k, v in existing.items() if v is not None})
+            existing = meta_json.read_meta(str(p))
+            for k, v in existing.items():
+                # 跳过标签配置字段，这些字段始终由 extra 参数决定
+                if k in ("fileId", "fileName", "storagePath", "createdAt", "updatedAt",
+                         "sourceType", "storageType", "hasTag",
+                         "tagColumn", "tagName", "tagRange", "failedTag", "tagStrategy"):
+                    continue
+                # 跳过空字符串和空列表 - 它们来自 register_existing_file 的初始写入，代表"未设置"
+                if isinstance(v, str) and v == "":
+                    continue
+                if isinstance(v, list) and len(v) == 0:
+                    continue
+                if v is not None:
+                    new_meta[k] = v
         except Exception:
             pass
 
-    if extra:
-        base.update(extra)
+    # 合并 extra 中的其他字段
+    for k, v in extra.items():
+        if v is not None and k not in ("hasTag", "tagColumn", "tagName", "tagRange", "failedTag", "tagStrategy", "tagRule", "sourceType"):
+            new_meta[k] = v
 
-    meta_path.write_text(json.dumps(base, ensure_ascii=False, indent=2), encoding="utf-8")
-    return meta_path
+    new_meta["updatedAt"] = now_iso()
+    meta_path = meta_json.write_meta(str(p), new_meta)
+    return Path(meta_json.meta_path(str(p)))
 
 
 def _guess_file_format(file_path: Path) -> Optional[str]:
@@ -2150,6 +2292,15 @@ def preview_file(file_id: str, offset: int = 0, limit: int = 100, x_trace_id: Op
     file_path = Path(file_meta["storagePath"])
     fmt = file_meta["fileFormat"].upper()
 
+    # 读取配套 .meta.json 获取标签元数据摘要
+    meta_summary = {}
+    try:
+        if meta_json.has_meta(str(file_path)):
+            full_meta = meta_json.read_meta(str(file_path))
+            meta_summary = meta_json.meta_summary(full_meta)
+    except Exception:
+        pass
+
     if fmt == "JSON":
         text = file_path.read_text(encoding="utf-8")
         try:
@@ -2183,22 +2334,22 @@ def preview_file(file_id: str, offset: int = 0, limit: int = 100, x_trace_id: Op
                     columns.append(key)
         rows = [[str(item.get(col, "")) for col in columns] for item in records]
         sliced = rows[offset : offset + limit]
-        return ok({"columns": columns, "rows": sliced, "total": len(rows)}, trace_id)
+        return ok({"columns": columns, "rows": sliced, "total": len(rows), "meta": meta_summary}, trace_id)
 
     if fmt == "TSV":
         lines = file_path.read_text(encoding="utf-8").splitlines()
         parsed = [line.split("\t") for line in lines if line != ""]
         if not parsed:
-            return ok({"columns": [], "rows": [], "total": 0}, trace_id)
+            return ok({"columns": [], "rows": [], "total": 0, "meta": meta_summary}, trace_id)
         columns = parsed[0]
         data_rows = parsed[1:]
         sliced = data_rows[offset : offset + limit]
-        return ok({"columns": columns, "rows": sliced, "total": len(data_rows)}, trace_id)
+        return ok({"columns": columns, "rows": sliced, "total": len(data_rows), "meta": meta_summary}, trace_id)
 
     if fmt != "CSV":
         text = file_path.read_text(encoding="utf-8")
         lines = text.splitlines()
-        return ok({"columns": ["content"], "rows": [[line] for line in lines[offset : offset + limit]], "total": len(lines)}, trace_id)
+        return ok({"columns": ["content"], "rows": [[line] for line in lines[offset : offset + limit]], "total": len(lines), "meta": meta_summary}, trace_id)
 
     rows: List[List[str]] = []
     with file_path.open("r", encoding="utf-8") as f:
@@ -2207,7 +2358,7 @@ def preview_file(file_id: str, offset: int = 0, limit: int = 100, x_trace_id: Op
     data_rows = reader[1:]
     sliced = data_rows[offset : offset + limit]
     rows.extend(sliced)
-    return ok({"columns": columns, "rows": rows, "total": len(data_rows)}, trace_id)
+    return ok({"columns": columns, "rows": rows, "total": len(data_rows), "meta": meta_summary}, trace_id)
 
 
 @app.get("/api/v1/files")
@@ -2248,6 +2399,33 @@ def manual_tag(req: ManualTagReq, x_trace_id: Optional[str] = Header(default=Non
     source_path = Path(source_meta["storagePath"])
     source_fmt = source_meta.get("fileFormat", "CSV")
 
+    # 读取配套 meta 获取 tagRange 用于校验（hasTag=true/false 都校验标签值是否在 tagRange 内）
+    tag_range = None
+    tag_name = None
+    has_tag_in_meta = False
+    try:
+        if meta_json.has_meta(str(source_path)):
+            full_meta = meta_json.read_meta(str(source_path))
+            tag_range = full_meta.get("tagRange")
+            tag_name = full_meta.get("tagName")
+            has_tag_in_meta = bool(full_meta.get("hasTag", False))
+    except Exception:
+        pass
+
+    # 如果文件有 tagRange，校验标签值必须在 tagRange 内（hasTag=true 时校验标签列、false 时校验 label 字段）
+    if tag_range and isinstance(tag_range, list) and len(tag_range) > 0:
+        for r in req.records:
+            label = r.get("label", "")
+            if not label:
+                continue
+            if has_tag_in_meta:
+                # hasTag=true 时允许保留原标签列值，但若 records 显式给出新 label 也应落在 tagRange 内
+                if label not in tag_range:
+                    return err(1002401, f"标签值 '{label}' 不在允许的标签范围 {tag_range} 中", trace_id)
+            else:
+                if label not in tag_range:
+                    return err(1002401, f"标签值 '{label}' 不在允许的标签范围 {tag_range} 中", trace_id)
+
     try:
         columns, rows = _read_file_records(source_path, source_fmt)
     except Exception as e:
@@ -2266,7 +2444,28 @@ def manual_tag(req: ManualTagReq, x_trace_id: Optional[str] = Header(default=Non
     except Exception:
         pass
 
-    out_meta = _write_tagged_output(source_meta, tagged_rows, "label", columns, req.operator)
+    out_meta = _write_tagged_output(source_meta, tagged_rows, "tag", columns, req.operator)
+
+    # 写入新文件的配套 meta
+    out_path = Path(out_meta["storagePath"])
+    try:
+        new_meta = meta_json.build_meta(
+            file_path=str(out_path),
+            source_type="manual_tag",
+            has_tag=True,
+            tag_column="tag",
+            tag_name=tag_name or req.operator,
+            tag_strategy="manual_range",
+            columns=columns,
+            row_count=len(tagged_rows),
+            file_size=out_path.stat().st_size if out_path.exists() else 0,
+        )
+        if tag_range:
+            new_meta["tagRange"] = tag_range
+        meta_json.write_meta(str(out_path), new_meta)
+    except Exception:
+        pass
+
     return ok({"updated": updated, "operator": req.operator, "fileId": req.fileId, "file": out_meta}, trace_id)
 
 
@@ -2288,6 +2487,15 @@ def manual_table_edit(req: ManualTableEditReq, request: Request, x_trace_id: Opt
     source_meta = files[req.fileId]
     source_path = Path(source_meta["storagePath"])
     source_fmt = source_meta.get("fileFormat", "CSV")
+
+    # 读取配套 meta 获取 tagRange，用于校验编辑后的标签列值
+    tag_range = None
+    try:
+        if meta_json.has_meta(str(source_path)):
+            full_meta = meta_json.read_meta(str(source_path))
+            tag_range = full_meta.get("tagRange")
+    except Exception:
+        pass
 
     try:
         columns, rows = _read_file_records(source_path, source_fmt)
@@ -2331,11 +2539,16 @@ def manual_table_edit(req: ManualTableEditReq, request: Request, x_trace_id: Opt
         if not column:
             continue
         value = str(change.get("value", ""))
+        # 标签相关列（label / tag / 自动识别为 tagColumn）编辑时校验值是否在 tagRange 内
+        is_tag_col = column in ("label", "tag") or (tag_name and column == tag_name)
+        if is_tag_col and value and tag_range and isinstance(tag_range, list) and len(tag_range) > 0:
+            if value not in tag_range:
+                return err(1002401, f"标签值 '{value}' 不在允许的标签范围 {tag_range} 中", trace_id)
         rows[row_index][column] = value
         if column not in columns:
             columns.append(column)
         changed_cells += 1
-        if column == "label" and value:
+        if is_tag_col and value:
             db_tag_rows.append({"rowId": str(row_index + 1), "label": value})
 
     if changed_cells == 0:
@@ -2381,17 +2594,24 @@ def manual_table_edit(req: ManualTableEditReq, request: Request, x_trace_id: Opt
 
 
 @app.post("/api/v1/files/upload")
-async def upload_file(file: UploadFile = UploadFileField(...),
+async def upload_file(request: Request,
+                      file: UploadFile = UploadFileField(...),
                       hasTag: Optional[bool] = Query(default=None),
                       tagColumn: Optional[str] = Query(default=None),
                       tagName: Optional[str] = Query(default=None),
                       tagRange: Optional[str] = Query(default=None),
+                      failedTag: Optional[str] = Query(default=None),
+                      categoryId: Optional[str] = Query(default=None),
+                      categoryName: Optional[str] = Query(default=None),
+                      description: Optional[str] = Query(default=None),
                       username: Optional[str] = Query(default="user")):
     # Compatibility endpoint: route CSV/JSON/TSV uploads to inbox dirs, others to GENERATED_DIR.
     ts = now_ts()
-    filename = f"raw_{username}_{ts}_{file.filename}"
+    owner_id = _resolve_upload_username(request, username)
+    stem = _sanitize_filename_component(Path(file.filename).stem)
     content = await file.read()
     suffix = Path(file.filename or "").suffix.lower()
+    filename = f"raw_{owner_id}_{stem}_{ts}.{suffix.lstrip('.')}"
 
     if suffix == ".csv":
         dest = INBOX_CSV_DIR / filename
@@ -2410,6 +2630,14 @@ async def upload_file(file: UploadFile = UploadFileField(...),
                     extra["tagRange"] = json.loads(tagRange)
                 except Exception:
                     extra["tagRange"] = [t.strip() for t in str(tagRange).split(",") if t.strip()]
+            if failedTag:
+                extra["failedTag"] = _coerce_tag_list(failedTag)
+            if categoryId:
+                extra["categoryId"] = categoryId
+            if categoryName:
+                extra["categoryName"] = categoryName
+            if description:
+                extra["description"] = description
             _write_meta_file(meta, extra)
         except Exception:
             pass
@@ -2420,7 +2648,7 @@ async def upload_file(file: UploadFile = UploadFileField(...),
             for r in reader:
                 rows.append(r)
                 if rows:
-                    out_name = f"xform_{username}_{now_ts()}_csv2json.json"
+                    out_name = f"xform_{owner_id}_{stem}_{now_ts()}_csv2json.json"
                     out_path = CSV_TO_JSON_DIR / out_name
                     _write_ndjson(out_path, list(rows[0].keys()), rows)
                     meta2 = _register_and_return_meta(out_path, "json")
@@ -2428,7 +2656,7 @@ async def upload_file(file: UploadFile = UploadFileField(...),
                         _write_meta_file(meta2, extra)
                     except Exception:
                         pass
-                    out_tsv_name = f"xform_{username}_{now_ts()}_csv2tsv.tsv"
+                    out_tsv_name = f"xform_{owner_id}_{stem}_{now_ts()}_csv2tsv.tsv"
                     out_tsv_path = CSV_TO_TSV_DIR / out_tsv_name
                     _write_tsv(out_tsv_path, list(rows[0].keys()), rows)
                     meta3 = _register_and_return_meta(out_tsv_path, "tsv")
@@ -2457,6 +2685,14 @@ async def upload_file(file: UploadFile = UploadFileField(...),
                     extra["tagRange"] = json.loads(tagRange)
                 except Exception:
                     extra["tagRange"] = [t.strip() for t in str(tagRange).split(",") if t.strip()]
+            if failedTag:
+                extra["failedTag"] = _coerce_tag_list(failedTag)
+            if categoryId:
+                extra["categoryId"] = categoryId
+            if categoryName:
+                extra["categoryName"] = categoryName
+            if description:
+                extra["description"] = description
             _write_meta_file(meta, extra)
         except Exception:
             pass
@@ -2477,7 +2713,7 @@ async def upload_file(file: UploadFile = UploadFileField(...),
                             objs.append(json.loads(ln))
             if objs:
                 cols = sorted({k for o in objs for k in o.keys()})
-                out_name = f"xform_{username}_{now_ts()}_json2csv.csv"
+                out_name = f"xform_{owner_id}_{stem}_{now_ts()}_json2csv.csv"
                 out_path = JSON_TO_CSV_DIR / out_name
                 _write_csv(out_path, cols, objs)
                 meta2 = _register_and_return_meta(out_path, "csv")
@@ -2485,7 +2721,7 @@ async def upload_file(file: UploadFile = UploadFileField(...),
                     _write_meta_file(meta2, extra)
                 except Exception:
                     pass
-                out_tsv_name = f"xform_{username}_{now_ts()}_json2tsv.tsv"
+                out_tsv_name = f"xform_{owner_id}_{stem}_{now_ts()}_json2tsv.tsv"
                 out_tsv_path = JSON_TO_TSV_DIR / out_tsv_name
                 _write_tsv(out_tsv_path, cols, objs)
                 meta3 = _register_and_return_meta(out_tsv_path, "tsv")
@@ -2514,6 +2750,14 @@ async def upload_file(file: UploadFile = UploadFileField(...),
                     extra["tagRange"] = json.loads(tagRange)
                 except Exception:
                     extra["tagRange"] = [t.strip() for t in str(tagRange).split(",") if t.strip()]
+            if failedTag:
+                extra["failedTag"] = _coerce_tag_list(failedTag)
+            if categoryId:
+                extra["categoryId"] = categoryId
+            if categoryName:
+                extra["categoryName"] = categoryName
+            if description:
+                extra["description"] = description
             _write_meta_file(meta, extra)
         except Exception:
             pass
@@ -2526,7 +2770,7 @@ async def upload_file(file: UploadFile = UploadFileField(...),
                     vals = ln.split("\t")
                     rows.append({header[i]: (vals[i] if i < len(vals) else "") for i in range(len(header))})
                 if rows:
-                    out_json_name = f"xform_{username}_{now_ts()}_tsv2json.json"
+                    out_json_name = f"xform_{owner_id}_{stem}_{now_ts()}_tsv2json.json"
                     out_json_path = TSV_TO_JSON_DIR / out_json_name
                     _write_ndjson(out_json_path, header, rows)
                     meta2 = _register_and_return_meta(out_json_path, "json")
@@ -2534,7 +2778,7 @@ async def upload_file(file: UploadFile = UploadFileField(...),
                         _write_meta_file(meta2, extra)
                     except Exception:
                         pass
-                    out_csv_name = f"xform_{username}_{now_ts()}_tsv2csv.csv"
+                    out_csv_name = f"xform_{owner_id}_{stem}_{now_ts()}_tsv2csv.csv"
                     out_csv_path = TSV_TO_CSV_DIR / out_csv_name
                     _write_csv(out_csv_path, header, rows)
                     meta3 = _register_and_return_meta(out_csv_path, "csv")
@@ -2598,9 +2842,11 @@ async def upload_with_mode(request: Request,
 
     # save uploaded file to a temp location
     ts = now_ts()
-    filename = f"raw_{username}_{ts}_{file.filename}"
+    owner_id = _resolve_upload_username(request, username)
+    stem = _sanitize_filename_component(Path(file.filename).stem)
     content = await file.read()
     suffix = Path(file.filename or "").suffix.lower()
+    filename = f"raw_{owner_id}_{stem}_{ts}.{suffix.lstrip('.')}"
     saved_path = GENERATED_DIR / filename
     saved_path.write_bytes(content)
     meta_saved = register_existing_file(saved_path, suffix.lstrip('.') or 'file')
@@ -2617,6 +2863,7 @@ async def upload_with_mode(request: Request,
                 extra["tagRange"] = json.loads(tagRange)
             except Exception:
                 extra["tagRange"] = [t.strip() for t in str(tagRange).split(",") if t.strip()]
+        # 兼容前端未传 failedTag 时也能继续
         _write_meta_file(meta_saved, extra)
     except Exception:
         pass
@@ -2715,15 +2962,22 @@ async def upload_inbox_csv(
     tagColumn: Optional[str] = Query(default=None),
     tagName: Optional[str] = Query(default=None),
     tagRange: Optional[str] = Query(default=None),
+    failedTag: Optional[str] = Query(default=None),
+    categoryId: Optional[str] = Query(default=None),
+    categoryName: Optional[str] = Query(default=None),
+    description: Optional[str] = Query(default=None),
 ):
     trace_id = request.state.trace_id
     ts = now_ts()
-    filename = f"raw_{username}_{ts}_{file.filename}"
+    owner_id = _resolve_upload_username(request, username)
+    stem = _sanitize_filename_component(Path(file.filename).stem)
+    content_raw = await file.read()
+    suffix = Path(file.filename or "").suffix.lower()
+    filename = f"raw_{owner_id}_{stem}_{ts}.{suffix.lstrip('.')}"
     if _current_backend_mode() == "nifi":
         dest = _export_output_root("nifi") / "inbox_csv" / filename
         dest.parent.mkdir(parents=True, exist_ok=True)
-        content = await file.read()
-        dest.write_bytes(content)
+        dest.write_bytes(content_raw)
         target_formats = ["JSON"]
         if convertType == "csv_to_tsv":
             target_formats = ["TSV"]
@@ -2732,7 +2986,7 @@ async def upload_inbox_csv(
             source_format="CSV",
             target_formats=target_formats,
             file_name=filename,
-            owner_id=username,
+            owner_id=owner_id,
         )
         meta = register_existing_file(dest, "csv")
         return ok({
@@ -2745,10 +2999,34 @@ async def upload_inbox_csv(
             "targetFormats": target_formats,
         }, trace_id)
     dest = INBOX_CSV_DIR / filename
-    content = await file.read()
-    dest.write_bytes(content)
+    dest.write_bytes(content_raw)
     # register in file index
     meta = register_existing_file(dest, "csv")
+    # 始终为源上传文件写入 meta，确保标签等配置信息落到 inbox_csv 文件的 .meta.json
+    extra_source = {"sourceType": "upload"}
+    if hasTag is not None:
+        extra_source["hasTag"] = bool(hasTag)
+    if tagColumn:
+        extra_source["tagColumn"] = tagColumn
+    if tagName:
+        extra_source["tagName"] = tagName
+    if tagRange:
+        try:
+            extra_source["tagRange"] = json.loads(tagRange)
+        except Exception:
+            extra_source["tagRange"] = [t.strip() for t in str(tagRange).split(",") if t.strip()]
+    if failedTag:
+        extra_source["failedTag"] = _coerce_tag_list(failedTag)
+    if categoryId:
+        extra_source["categoryId"] = categoryId
+    if categoryName:
+        extra_source["categoryName"] = categoryName
+    if description:
+        extra_source["description"] = description
+    try:
+        _write_meta_file(meta, extra_source)
+    except Exception:
+        pass
     # single conversion route: csv_to_json or csv_to_tsv
     target_path = ""
     try:
@@ -2795,9 +3073,17 @@ async def upload_inbox_csv(
                     extra["tagRange"] = json.loads(tagRange)
                 except Exception:
                     extra["tagRange"] = [t.strip() for t in str(tagRange).split(",") if t.strip()]
+            if failedTag:
+                extra["failedTag"] = _coerce_tag_list(failedTag)
+            if categoryId:
+                extra["categoryId"] = categoryId
+            if categoryName:
+                extra["categoryName"] = categoryName
+            if description:
+                extra["description"] = description
 
             if convert == "csv_to_tsv":
-                out_name = f"xform_{username}_{now_ts()}_csv2tsv.tsv"
+                out_name = f"xform_{owner_id}_{stem}_{now_ts()}_csv2tsv.tsv"
                 out_path = CSV_TO_TSV_DIR / out_name
                 _write_tsv(out_path, cols, rows)
                 meta2 = _register_and_return_meta(out_path, "tsv")
@@ -2807,7 +3093,7 @@ async def upload_inbox_csv(
                     pass
                 target_path = str(out_path)
             else:
-                out_name = f"xform_{username}_{now_ts()}_csv2json.json"
+                out_name = f"xform_{owner_id}_{stem}_{now_ts()}_csv2json.json"
                 out_path = CSV_TO_JSON_DIR / out_name
                 _write_ndjson(out_path, cols, rows)
                 meta2 = _register_and_return_meta(out_path, "json")
@@ -2857,15 +3143,22 @@ async def upload_inbox_json(
     tagColumn: Optional[str] = Query(default=None),
     tagName: Optional[str] = Query(default=None),
     tagRange: Optional[str] = Query(default=None),
+    failedTag: Optional[str] = Query(default=None),
+    categoryId: Optional[str] = Query(default=None),
+    categoryName: Optional[str] = Query(default=None),
+    description: Optional[str] = Query(default=None),
 ):
     trace_id = request.state.trace_id
     ts = now_ts()
-    filename = f"raw_{username}_{ts}_{file.filename}"
+    owner_id = _resolve_upload_username(request, username)
+    stem = _sanitize_filename_component(Path(file.filename).stem)
+    content_raw = await file.read()
+    suffix = Path(file.filename or "").suffix.lower()
+    filename = f"raw_{owner_id}_{stem}_{ts}.{suffix.lstrip('.')}"
     if _current_backend_mode() == "nifi":
         dest = _export_output_root("nifi") / "inbox_json" / filename
         dest.parent.mkdir(parents=True, exist_ok=True)
-        content = await file.read()
-        dest.write_bytes(content)
+        dest.write_bytes(content_raw)
         target_formats = ["CSV"]
         if convertType == "json_to_tsv":
             target_formats = ["TSV"]
@@ -2874,7 +3167,7 @@ async def upload_inbox_json(
             source_format="JSON",
             target_formats=target_formats,
             file_name=filename,
-            owner_id=username,
+            owner_id=owner_id,
         )
         meta = register_existing_file(dest, "json")
         return ok({
@@ -2887,9 +3180,33 @@ async def upload_inbox_json(
             "targetFormats": target_formats,
         }, trace_id)
     dest = INBOX_JSON_DIR / filename
-    content = await file.read()
-    dest.write_bytes(content)
+    dest.write_bytes(content_raw)
     meta = register_existing_file(dest, "json")
+    # 始终为源上传文件写入 meta，确保标签等配置信息落到 inbox_json 文件的 .meta.json
+    extra_source = {"sourceType": "upload"}
+    if hasTag is not None:
+        extra_source["hasTag"] = bool(hasTag)
+    if tagColumn:
+        extra_source["tagColumn"] = tagColumn
+    if tagName:
+        extra_source["tagName"] = tagName
+    if tagRange:
+        try:
+            extra_source["tagRange"] = json.loads(tagRange)
+        except Exception:
+            extra_source["tagRange"] = [t.strip() for t in str(tagRange).split(",") if t.strip()]
+    if failedTag:
+        extra_source["failedTag"] = _coerce_tag_list(failedTag)
+    if categoryId:
+        extra_source["categoryId"] = categoryId
+    if categoryName:
+        extra_source["categoryName"] = categoryName
+    if description:
+        extra_source["description"] = description
+    try:
+        _write_meta_file(meta, extra_source)
+    except Exception:
+        pass
     # single conversion route: json_to_csv or json_to_tsv
     target_path = ""
     try:
@@ -2923,9 +3240,17 @@ async def upload_inbox_json(
                     extra["tagRange"] = json.loads(tagRange)
                 except Exception:
                     extra["tagRange"] = [t.strip() for t in str(tagRange).split(",") if t.strip()]
+            if failedTag:
+                extra["failedTag"] = _coerce_tag_list(failedTag)
+            if categoryId:
+                extra["categoryId"] = categoryId
+            if categoryName:
+                extra["categoryName"] = categoryName
+            if description:
+                extra["description"] = description
 
             if convert == "json_to_tsv":
-                out_name = f"xform_{username}_{now_ts()}_json2tsv.tsv"
+                out_name = f"xform_{owner_id}_{stem}_{now_ts()}_json2tsv.tsv"
                 out_path = JSON_TO_TSV_DIR / out_name
                 _write_tsv(out_path, cols, objs)
                 meta2 = _register_and_return_meta(out_path, "tsv")
@@ -2935,7 +3260,7 @@ async def upload_inbox_json(
                     pass
                 target_path = str(out_path)
             else:
-                out_name = f"xform_{username}_{now_ts()}_json2csv.csv"
+                out_name = f"xform_{owner_id}_{stem}_{now_ts()}_json2csv.csv"
                 out_path = JSON_TO_CSV_DIR / out_name
                 _write_csv(out_path, cols, objs)
                 meta2 = _register_and_return_meta(out_path, "csv")
@@ -2986,15 +3311,22 @@ async def upload_inbox_tsv(
     tagColumn: Optional[str] = Query(default=None),
     tagName: Optional[str] = Query(default=None),
     tagRange: Optional[str] = Query(default=None),
+    failedTag: Optional[str] = Query(default=None),
+    categoryId: Optional[str] = Query(default=None),
+    categoryName: Optional[str] = Query(default=None),
+    description: Optional[str] = Query(default=None),
 ):
     trace_id = request.state.trace_id
     ts = now_ts()
-    filename = f"raw_{username}_{ts}_{file.filename}"
+    owner_id = _resolve_upload_username(request, username)
+    stem = _sanitize_filename_component(Path(file.filename).stem)
+    content_raw = await file.read()
+    suffix = Path(file.filename or "").suffix.lower()
+    filename = f"raw_{owner_id}_{stem}_{ts}.{suffix.lstrip('.')}"
     if _current_backend_mode() == "nifi":
         dest = _export_output_root("nifi") / "inbox_tsv" / filename
         dest.parent.mkdir(parents=True, exist_ok=True)
-        content = await file.read()
-        dest.write_bytes(content)
+        dest.write_bytes(content_raw)
         target_formats = ["JSON"]
         if convertType == "tsv_to_csv":
             target_formats = ["CSV"]
@@ -3003,7 +3335,7 @@ async def upload_inbox_tsv(
             source_format="TSV",
             target_formats=target_formats,
             file_name=filename,
-            owner_id=username,
+            owner_id=owner_id,
         )
         meta = register_existing_file(dest, "tsv")
         return ok({
@@ -3016,9 +3348,33 @@ async def upload_inbox_tsv(
             "targetFormats": target_formats,
         }, trace_id)
     dest = INBOX_TSV_DIR / filename
-    content = await file.read()
-    dest.write_bytes(content)
+    dest.write_bytes(content_raw)
     meta = register_existing_file(dest, "tsv")
+    # 始终为源上传文件写入 meta，确保标签等配置信息落到 inbox_tsv 文件的 .meta.json
+    extra_source = {"sourceType": "upload"}
+    if hasTag is not None:
+        extra_source["hasTag"] = bool(hasTag)
+    if tagColumn:
+        extra_source["tagColumn"] = tagColumn
+    if tagName:
+        extra_source["tagName"] = tagName
+    if tagRange:
+        try:
+            extra_source["tagRange"] = json.loads(tagRange)
+        except Exception:
+            extra_source["tagRange"] = [t.strip() for t in str(tagRange).split(",") if t.strip()]
+    if failedTag:
+        extra_source["failedTag"] = _coerce_tag_list(failedTag)
+    if categoryId:
+        extra_source["categoryId"] = categoryId
+    if categoryName:
+        extra_source["categoryName"] = categoryName
+    if description:
+        extra_source["description"] = description
+    try:
+        _write_meta_file(meta, extra_source)
+    except Exception:
+        pass
     # single conversion route: tsv_to_json or tsv_to_csv
     target_path = ""
     try:
@@ -3059,9 +3415,17 @@ async def upload_inbox_tsv(
                     extra["tagRange"] = json.loads(tagRange)
                 except Exception:
                     extra["tagRange"] = [t.strip() for t in str(tagRange).split(",") if t.strip()]
+            if failedTag:
+                extra["failedTag"] = _coerce_tag_list(failedTag)
+            if categoryId:
+                extra["categoryId"] = categoryId
+            if categoryName:
+                extra["categoryName"] = categoryName
+            if description:
+                extra["description"] = description
 
             if convert == "tsv_to_csv":
-                out_name = f"xform_{username}_{now_ts()}_tsv2csv.csv"
+                out_name = f"xform_{owner_id}_{stem}_{now_ts()}_tsv2csv.csv"
                 out_path = TSV_TO_CSV_DIR / out_name
                 _write_csv(out_path, header, rows)
                 meta2 = _register_and_return_meta(out_path, "csv")
@@ -3071,7 +3435,7 @@ async def upload_inbox_tsv(
                     pass
                 target_path = str(out_path)
             else:
-                out_name = f"xform_{username}_{now_ts()}_tsv2json.json"
+                out_name = f"xform_{owner_id}_{stem}_{now_ts()}_tsv2json.json"
                 out_path = TSV_TO_JSON_DIR / out_name
                 _write_ndjson(out_path, header, rows)
                 meta2 = _register_and_return_meta(out_path, "json")
@@ -3444,6 +3808,14 @@ def export_generic(body: Dict[str, Any], request: Request):
                                 extra["tagRange"] = [t.strip() for t in tr.split(",") if t.strip()]
                         else:
                             extra["tagRange"] = tr
+                    if body.get("failedTag") is not None:
+                        extra["failedTag"] = _coerce_tag_list(body.get("failedTag"))
+                    if body.get("categoryId"):
+                        extra["categoryId"] = body.get("categoryId")
+                    if body.get("categoryName"):
+                        extra["categoryName"] = body.get("categoryName")
+                    if body.get("description"):
+                        extra["description"] = body.get("description")
                     _write_meta_file(meta, extra)
                 except Exception:
                     pass
@@ -3475,14 +3847,64 @@ async def auto_tag(req: AutoTagReq, x_trace_id: Optional[str] = Header(default=N
     source_path = Path(source_meta["storagePath"])
     source_fmt = source_meta.get("fileFormat", "CSV")
 
+    # 读取 tagRule：优先使用请求中的 tagRule，否则从 meta 读取
+    tag_rule = req.tagRule
+    tag_name = req.tagName
+    tag_range = None
+    failed_tag = None
+    try:
+        if meta_json.has_meta(str(source_path)):
+            full_meta = meta_json.read_meta(str(source_path))
+            if not tag_rule:
+                tag_rule = full_meta.get("tagRule")
+            if not tag_name:
+                tag_name = full_meta.get("tagName")
+            tag_range = full_meta.get("tagRange")
+            failed_tag = full_meta.get("failedTag")
+    except Exception:
+        pass
+
     try:
         columns, rows = _read_file_records(source_path, source_fmt)
     except Exception as e:
         return err(1002402, f"read source file failed: {e}", trace_id)
 
-    tagged_rows = _build_auto_tagged_rows(rows)
-    out_meta = _write_tagged_output(source_meta, tagged_rows, "auto_tag", columns, req.operator)
+    # 使用 tagRule 或默认规则进行自动打标
+    if tag_rule and isinstance(tag_rule, dict) and tag_rule.get("mapping"):
+        tagged_rows = _build_auto_tagged_rows_with_rule(rows, tag_rule)
+    else:
+        tagged_rows = _build_auto_tagged_rows(rows)
+
+    # 自动打标校验：标签值必须落在 tagRange 内（与无标签模式一致）
+    if tag_range and isinstance(tag_range, list) and len(tag_range) > 0:
+        for r in tagged_rows:
+            v = r.get("tag", "")
+            if v and v not in tag_range:
+                return err(1002401, f"自动打标结果 '{v}' 不在允许的标签范围 {tag_range} 中", trace_id)
+
+    out_meta = _write_tagged_output(source_meta, tagged_rows, "tag", columns, req.operator)
     out_fmt = req.outputFormat.upper()
+
+    # 写入新文件的配套 meta（同时携带 tagRange / failedTag）
+    out_path = Path(out_meta["storagePath"])
+    try:
+        new_meta = meta_json.build_meta(
+            file_path=str(out_path),
+            source_type="auto_tag",
+            has_tag=True,
+            tag_column="tag",
+            tag_name=tag_name or "自动打标结果",
+            tag_strategy="auto_rule",
+            tag_rule=tag_rule,
+            tag_range=tag_range,
+            failed_tag=failed_tag,
+            columns=columns,
+            row_count=len(tagged_rows),
+            file_size=out_path.stat().st_size if out_path.exists() else 0,
+        )
+        meta_json.write_meta(str(out_path), new_meta)
+    except Exception:
+        pass
 
     job_id = f"job_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:4]}"
     job = {
@@ -3552,3 +3974,208 @@ def delete_schedule(schedule_id: str, x_trace_id: Optional[str] = Header(default
         return err(1003404, "schedule not found", trace_id)
     del schedules[schedule_id]
     return ok({"deleted": True, "scheduleId": schedule_id}, trace_id)
+
+
+# ── 训练文件 API ──
+
+training_tasks: Dict[str, Dict[str, Any]] = {}
+
+# 训练任务涉及的目录
+TRAINING_SCAN_DIRS = [
+    INBOX_CSV_DIR,
+    INBOX_JSON_DIR,
+    INBOX_TSV_DIR,
+    CSV_TO_JSON_DIR,
+    JSON_TO_CSV_DIR,
+    CSV_TO_TSV_DIR,
+    TSV_TO_CSV_DIR,
+    JSON_TO_TSV_DIR,
+    TSV_TO_JSON_DIR,
+    TAGGED_OUTPUT_DIR,
+    _export_output_root("nifi") / "output_csv",
+    _export_output_root("nifi") / "output_json",
+    _export_output_root("nifi") / "output_tsv",
+]
+
+
+def _iter_training_files() -> List[Dict[str, Any]]:
+    """遍历训练目录，读取所有有 .meta.json 的文件。"""
+    results: List[Dict[str, Any]] = []
+    seen: set = set()
+    for base_dir in TRAINING_SCAN_DIRS:
+        if not base_dir.exists():
+            continue
+        for file_path in base_dir.rglob("*"):
+            if not file_path.is_file():
+                continue
+            if str(file_path).endswith(".meta.json"):
+                continue
+            if not meta_json.has_meta(str(file_path)):
+                continue
+            try:
+                meta = meta_json.read_meta(str(file_path))
+            except Exception:
+                continue
+            fid = meta.get("fileId")
+            if not fid or fid in seen:
+                continue
+            seen.add(fid)
+            results.append(meta)
+    return results
+
+
+@app.get("/api/v1/training/files")
+def list_training_files(
+    categoryId: Optional[str] = Query(default=None),
+    tag: Optional[str] = Query(default=None),
+    hasLabel: Optional[bool] = Query(default=None),
+    keyword: Optional[str] = Query(default=None),
+    page: int = Query(default=1, ge=1),
+    size: int = Query(default=20, ge=1, le=100),
+    sortBy: str = Query(default="updatedAt"),
+    sortOrder: str = Query(default="desc"),
+    x_trace_id: Optional[str] = Header(default=None),
+):
+    trace_id = make_trace_id(x_trace_id)
+    all_files = _iter_training_files()
+
+    # 筛选
+    if categoryId:
+        all_files = [f for f in all_files if f.get("categoryId") == categoryId]
+    if tag:
+        all_files = [f for f in all_files if f.get("tagName") == tag]
+    if hasLabel is not None:
+        all_files = [f for f in all_files if f.get("hasTag") == hasLabel]
+    if keyword:
+        kw = keyword.lower()
+        all_files = [f for f in all_files if kw in (f.get("fileName") or "").lower() or kw in (f.get("description") or "").lower()]
+
+    # 排序
+    reverse = sortOrder == "desc"
+    try:
+        all_files.sort(key=lambda f: f.get(sortBy) or "", reverse=reverse)
+    except Exception:
+        pass
+
+    # 分页
+    total = len(all_files)
+    start = (page - 1) * size
+    page_files = all_files[start:start + size]
+
+    # 构建分类汇总
+    cat_map: Dict[str, Dict[str, Any]] = {}
+    for f in all_files:
+        cid = f.get("categoryId") or "uncategorized"
+        if cid not in cat_map:
+            cat_map[cid] = {"categoryId": cid, "categoryName": f.get("categoryName") or cid, "fileCount": 0}
+        cat_map[cid]["fileCount"] += 1
+
+    # 构建响应（不含 storagePath）
+    files_out = []
+    for m in page_files:
+        fmt = m.get("fileFormat", "csv") or "csv"
+        size_bytes = m.get("fileSize") or 0
+        size_human = f"{size_bytes / 1024:.1f} KB" if size_bytes < 1024 * 1024 else f"{size_bytes / (1024 * 1024):.1f} MB"
+        files_out.append({
+            "fileId": m.get("fileId"),
+            "fileName": m.get("fileName"),
+            "fileType": fmt.lower(),
+            "fileSize": size_bytes,
+            "fileSizeHuman": size_human,
+            "categoryId": m.get("categoryId"),
+            "categoryName": m.get("categoryName"),
+            "tags": [m.get("tagName")] if m.get("tagName") else [],
+            "hasLabel": m.get("hasTag", False),
+            "labelColumn": m.get("tagColumn"),
+            "labelCount": m.get("rowCount") or 0,
+            "description": m.get("description"),
+            "updatedAt": m.get("updatedAt"),
+        })
+
+    return ok({
+        "total": total,
+        "page": page,
+        "size": size,
+        "categories": list(cat_map.values()),
+        "files": files_out,
+    }, trace_id)
+
+
+@app.post("/api/v1/training/submit")
+def submit_training(body: Dict[str, Any], x_trace_id: Optional[str] = Header(default=None)):
+    trace_id = make_trace_id(x_trace_id)
+    selected_ids = body.get("selectedFileIds") or []
+    train_config = body.get("trainingConfig") or {}
+
+    if not selected_ids:
+        return err(1004001, "selectedFileIds must not be empty", trace_id)
+
+    all_files = _iter_training_files()
+    meta_map = {f.get("fileId"): f for f in all_files if f.get("fileId")}
+
+    accepted = []
+    rejected = []
+    for fid in selected_ids:
+        m = meta_map.get(fid)
+        if m:
+            accepted.append({"fileId": fid, "fileName": m.get("fileName")})
+        else:
+            rejected.append({"fileId": fid, "reason": "file not found or no meta"})
+
+    task_id = f"task_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:4]}"
+    task = {
+        "taskId": task_id,
+        "status": "accepted",
+        "progress": 0,
+        "totalFiles": len(accepted),
+        "processedFiles": 0,
+        "trainingConfig": train_config,
+        "acceptedFiles": accepted,
+        "rejectedFiles": rejected,
+        "errors": [],
+        "createdAt": now_iso(),
+        "updatedAt": now_iso(),
+    }
+    training_tasks[task_id] = task
+
+    return ok({
+        "taskId": task_id,
+        "totalFiles": len(selected_ids),
+        "acceptedFiles": accepted,
+        "rejectedFiles": rejected,
+    }, trace_id)
+
+
+@app.get("/api/v1/training/tasks/{task_id}")
+def get_training_task(task_id: str, x_trace_id: Optional[str] = Header(default=None)):
+    trace_id = make_trace_id(x_trace_id)
+    task = training_tasks.get(task_id)
+    if not task:
+        return err(1004404, "training task not found", trace_id)
+    return ok({
+        "taskId": task.get("taskId"),
+        "status": task.get("status"),
+        "progress": task.get("progress"),
+        "totalFiles": task.get("totalFiles"),
+        "processedFiles": task.get("processedFiles"),
+        "errors": task.get("errors"),
+    }, trace_id)
+
+
+@app.post("/api/v1/admin/migrate-meta")
+def migrate_meta(
+    dry_run: bool = Query(default=False),
+    x_trace_id: Optional[str] = Header(default=None),
+):
+    """批量迁移：为所有数据文件生成 .meta.json。"""
+    trace_id = make_trace_id(x_trace_id)
+    result = meta_json.migrate_all(dry_run=dry_run)
+    return ok(result, trace_id)
+
+
+@app.get("/api/v1/admin/check-integrity")
+def check_integrity(x_trace_id: Optional[str] = Header(default=None)):
+    """校验数据文件与 .meta.json 的完整性。"""
+    trace_id = make_trace_id(x_trace_id)
+    result = meta_json.check_integrity()
+    return ok(result, trace_id)

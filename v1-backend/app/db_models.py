@@ -54,6 +54,7 @@ class ExportJobModel(BASE):
     last_run = Column(DateTime, nullable=True)
     status = Column(String(64), nullable=True)
     db_config = Column(JSON, nullable=True)
+    payload = Column(JSON, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
 
@@ -82,6 +83,8 @@ def init_db(db_path: Path):
         col_names = {row[1] for row in cols}
         if "factory_id" not in col_names:
             conn.execute(text("ALTER TABLE export_jobs ADD COLUMN factory_id VARCHAR(64)"))
+        if "payload" not in col_names:
+            conn.execute(text("ALTER TABLE export_jobs ADD COLUMN payload JSON"))
 
         # Ensure iot_users table exists and a default admin user is present
         try:
