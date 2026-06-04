@@ -1,0 +1,19 @@
+{
+  "tenant": "factory-001",
+  "db_key": "mysql_127.0.0.1_3306_nifi",
+  "table": "sensor_data",
+  "traceId": "silent-1780577299",
+  "jobId": "silent-factory-001-mysql_127.0.0.1_3306_nifi-sensor_data",
+  "operator": "scheduler",
+  "triggerReason": "initial_full_export",
+  "last_export_marker": null,
+  "rows_exported": 4,
+  "timestamp": "2026-06-04T20:48:19+08:00",
+  "schema_hash": "67a603de290d5ff5",
+  "schema_changed": false,
+  "source_file": "/home/yhz/iot/v1-backend/nifi-data/silent_exports/factory-001/mysql_127.0.0.1_3306_nifi/export_system_sensor_data_20260604_204819.csv",
+  "output_dir": "/home/yhz/iot/v1-backend/nifi-data/silent_exports/factory-001/mysql_127.0.0.1_3306_nifi",
+  "last_export_marker_by_table": {
+    "sensor_data": null
+  }
+}
