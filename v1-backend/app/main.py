@@ -1377,6 +1377,8 @@ def api_list_factory_assets(
 ):
     trace_id = make_trace_id(request.headers.get("x-trace-id"))
     resolved_factory = _normalize_factory_id(factory_id)
+    # 懒清理：移除磁盘上已不存在的文件索引（用户在 OS 删文件后也能从前端消失）
+    _purge_missing_files()
 
     def _infer_in_data_source_type(file_path: Path) -> str:
         try:
@@ -1666,6 +1668,62 @@ def _compute_auto_tag(row: Dict[str, Any], index: int) -> str:
         return "ROW_EVEN" if (index + 1) % 2 == 0 else "ROW_ODD"
 
 
+def _compare_when_value(actual: Any, expected: Any, op: Optional[str]) -> bool:
+    """单个 when 条件比较。op 缺省/==/= 时按字符串相等比较，否则按数值或集合比较。
+
+    支持的操作符:
+      == / = / eq  : 字符串相等
+      != / neq      : 不等于
+      > / gt
+      < / lt
+      >= / gte
+      <= / lte
+      in            : expected 支持逗号分隔多值
+      contains      : 字符串子串包含（大小写敏感）
+    """
+    if not op or op in ("==", "=", "eq"):
+        return str(actual if actual is not None else "") == str(expected if expected is not None else "")
+    op_norm = op.strip().lower()
+    if op_norm == "in":
+        candidates = [str(x).strip() for x in str(expected).split(",") if str(x).strip()]
+        return str(actual if actual is not None else "") in candidates
+    if op_norm == "contains":
+        return str(expected if expected is not None else "") in str(actual if actual is not None else "")
+    if op_norm in ("!=", "neq"):
+        return str(actual if actual is not None else "") != str(expected if expected is not None else "")
+    # 数值比较：尝试把两边都转成数字
+    def _to_num(v: Any) -> Optional[float]:
+        try:
+            if isinstance(v, bool):
+                return None
+            return float(v)
+        except (TypeError, ValueError):
+            return None
+    a = _to_num(actual)
+    b = _to_num(expected)
+    if a is None or b is None:
+        # 转不成数字：降级成字符串比较
+        sa = str(actual if actual is not None else "")
+        sb = str(expected if expected is not None else "")
+        try:
+            return {
+                ">": sa > sb, "<": sa < sb,
+                ">=": sa >= sb, "<=": sa <= sb,
+            }[op_norm]
+        except KeyError:
+            return False
+    return {
+        ">": a > b,
+        "<": a < b,
+        ">=": a >= b,
+        "<=": a <= b,
+        "gt": a > b,
+        "lt": a < b,
+        "gte": a >= b,
+        "lte": a <= b,
+    }.get(op_norm, False)
+
+
 def _build_auto_tagged_rows_with_rule(rows: List[Dict[str, Any]], tag_rule: Dict[str, Any]) -> List[Dict[str, Any]]:
     """根据 tagRule 中的多列条件规则进行自动打标。
 
@@ -1674,8 +1732,11 @@ def _build_auto_tagged_rows_with_rule(rows: List[Dict[str, Any]], tag_rule: Dict
         "ruleName": "按设备类型和状态打标",
         "inputs": ["device_type", "status"],
         "mapping": [
+            // 简单相等（向后兼容）:
             {"when": {"device_type": "A", "status": "bad"}, "tag": "故障"},
-            {"when": {"device_type": "B", "status": "good"}, "tag": "正常"}
+            // 带操作符:
+            {"when": {"value": 15}, "op": ">", "tag": "故障"},
+            {"when": {"status": "200,201,204"}, "op": "in", "tag": "正常"}
         ],
         "defaultTag": "未知"
     }
@@ -1688,8 +1749,21 @@ def _build_auto_tagged_rows_with_rule(rows: List[Dict[str, Any]], tag_rule: Dict
         matched = False
         for m in mappings:
             when = m.get("when", {})
+            op = m.get("op")  # 整条规则一个 op，或写在 when 项里 {column, op, value}
             tag = m.get("tag", "")
-            if all(str(row.get(k, "")) == str(v) for k, v in when.items()):
+            ok = True
+            for k, v in when.items():
+                # 旧格式: {column: value}；新格式: {column: {op, value}}
+                if isinstance(v, dict) and ("value" in v or "op" in v):
+                    sub_op = v.get("op") or op
+                    sub_val = v.get("value", "")
+                else:
+                    sub_op = op
+                    sub_val = v
+                if not _compare_when_value(row.get(k), sub_val, sub_op):
+                    ok = False
+                    break
+            if ok:
                 tagged["tag"] = tag
                 matched = True
                 break
@@ -2361,6 +2435,47 @@ def preview_file(file_id: str, offset: int = 0, limit: int = 100, x_trace_id: Op
     return ok({"columns": columns, "rows": rows, "total": len(data_rows), "meta": meta_summary}, trace_id)
 
 
+def _purge_missing_files() -> int:
+    """懒清理：files 字典 + DB 中 storagePath 指向的文件已不存在的记录，统一移除。
+
+    返回被清理的条目数量。任意文件中心 / 内部管理页的列表接口都应在返回前调用一次，
+    这样用户在 OS 层面删除文件后，前端不再看到残留条目。
+    """
+    removed = 0
+    try:
+        # 优先用 list() 拷贝以避免遍历时改 dict
+        snapshot = list(files.items())
+    except Exception:
+        return 0
+    for fid, meta in snapshot:
+        sp = meta.get("storagePath", "") if isinstance(meta, dict) else ""
+        if not sp:
+            continue
+        try:
+            if Path(sp).exists():
+                continue
+        except Exception:
+            pass
+        try:
+            del files[fid]
+        except Exception:
+            pass
+        # 同步从数据库删除
+        try:
+            db = SessionLocal()
+            try:
+                row = db.query(db_models.FileModel).filter(db_models.FileModel.file_id == fid).first()
+                if row is not None:
+                    db.delete(row)
+                    db.commit()
+            finally:
+                db.close()
+        except Exception:
+            pass
+        removed += 1
+    return removed
+
+
 @app.get("/api/v1/files")
 def list_files(
     fileFormat: Optional[str] = Query(default=None),
@@ -2375,6 +2490,8 @@ def list_files(
         scan = _scan_nifi_export_results()
     except Exception:
         scan = {"done": 0, "error": 0, "registered": 0, "jobs": []}
+    # 懒清理：移除磁盘上已不存在的文件索引
+    _purge_missing_files()
     data = list(files.values())
     if nifiOnly:
         roots = [str(_export_output_root("nifi")), str(_export_output_root("local"))]
@@ -3209,22 +3326,33 @@ async def upload_inbox_json(
         pass
     # single conversion route: json_to_csv or json_to_tsv
     target_path = ""
+    converted_file_id = ""
     try:
-        text = dest.read_text(encoding="utf-8")
+        raw = dest.read_bytes()
+        # 去 BOM
+        if raw.startswith(b"\xef\xbb\xbf"):
+            raw = raw[3:]
+        text = raw.decode("utf-8", errors="replace")
         lines = text.splitlines()
         objs = []
-        # support NDJSON or JSON array
-        if lines and (lines[0].strip().startswith("{") or lines[0].strip().startswith("[")):
-            try:
-                # try parse as array
-                data = json.loads(text)
-                if isinstance(data, list):
-                    objs = data
-            except Exception:
-                # fallback to ndjson
-                for ln in lines:
-                    if ln.strip():
-                        objs.append(json.loads(ln))
+        if lines:
+            first = lines[0].lstrip()
+            if first.startswith("{") or first.startswith("["):
+                try:
+                    data = json.loads(text)
+                    if isinstance(data, list):
+                        objs = data
+                    elif isinstance(data, dict):
+                        # 单对象：包成数组处理
+                        objs = [data]
+                except Exception:
+                    # fallback to ndjson
+                    for ln in lines:
+                        if ln.strip():
+                            try:
+                                objs.append(json.loads(ln))
+                            except Exception:
+                                pass
         if objs:
             cols = sorted({k for o in objs for k in o.keys()})
             convert = (convertType or "json_to_csv").lower()
@@ -3259,6 +3387,7 @@ async def upload_inbox_json(
                 except Exception:
                     pass
                 target_path = str(out_path)
+                converted_file_id = meta2.get("fileId", "")
             else:
                 out_name = f"xform_{owner_id}_{stem}_{now_ts()}_json2csv.csv"
                 out_path = JSON_TO_CSV_DIR / out_name
@@ -3269,6 +3398,20 @@ async def upload_inbox_json(
                 except Exception:
                     pass
                 target_path = str(out_path)
+                converted_file_id = meta2.get("fileId", "")
+        else:
+            # JSON 解析失败时也写一个空 CSV，方便用户在文件中心看到
+            try:
+                out_name = f"xform_{owner_id}_{stem}_{now_ts()}_json2csv.empty.csv"
+                out_path = JSON_TO_CSV_DIR / out_name
+                if (convertType or "").lower() == "json_to_tsv":
+                    out_name = f"xform_{owner_id}_{stem}_{now_ts()}_json2tsv.empty.tsv"
+                    out_path = JSON_TO_TSV_DIR / out_name
+                out_path.parent.mkdir(parents=True, exist_ok=True)
+                out_path.write_text("", encoding="utf-8")
+                target_path = str(out_path)
+            except Exception:
+                pass
     except Exception as ex:
         request.state.observation = {
             "operation": f"upload_{(convertType or 'json_to_csv').lower()}",
@@ -3297,6 +3440,8 @@ async def upload_inbox_json(
         status="SUCCEEDED",
         duration_ms=0,
     )
+    if converted_file_id:
+        payload["convertedFileId"] = converted_file_id
     return ok(payload, trace_id)
 
 

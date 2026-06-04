@@ -196,9 +196,11 @@
         <label>offset</label>
         <input id="previewOffset" type="number" min="0" value="0" />
         <label>limit</label>
-        <input id="previewLimit" type="number" min="1" value="20" />
+        <input id="previewLimit" type="number" min="1" value="100" />
         <button id="previewReloadBtn">刷新预览</button>
         <button id="openEditorModalBtn" class="secondary">弹窗编辑</button>
+        <button id="loadMorePreviewBtn" class="secondary" style="display:none;">下一批</button>
+        <span id="previewProgress" class="muted"></span>
       </div>
       <div id="metaInfoBar" style="display:none; margin-bottom:8px; padding:8px; background:#f0f6ff; border:1px solid #c0d6f0; border-radius:4px; font-size:0.9em;">
         <strong>标签元数据:</strong>
@@ -236,7 +238,7 @@
     </section>
 
     <section class="card">
-      <h2>标签中心（本地打标模式）</h2>
+      <h2 id="tagCenterTitle">标签中心（本地打标模式）</h2>
       <p>本地打标模式：自动标签和文件中心编辑结果都会在后端本地生成新文件，统一落到 <code>/home/yhz/nifi-data/tagged_output/</code>。</p>
 
       <h3>自动标签</h3>

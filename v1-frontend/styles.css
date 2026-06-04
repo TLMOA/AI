@@ -258,6 +258,52 @@ body.modal-open {
   overflow: auto;
 }
 
+/* 文件预览滚动容器：与内部管理页 .preview-table-wrap 行为一致，max-height 触发上下滚动 */
+#editableTableWrapper,
+.file-preview-scroll {
+  max-height: 360px;
+  overflow-x: auto;
+  overflow-y: auto;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  margin-top: 8px;
+}
+
+#editableTableWrapper > table,
+.file-preview-scroll > table {
+  width: max-content;
+  min-width: 100%;
+  table-layout: auto;
+}
+
+#editableTableWrapper th,
+#editableTableWrapper td,
+.file-preview-scroll th,
+.file-preview-scroll td {
+  white-space: nowrap;
+  overflow: visible;
+  text-overflow: clip;
+  max-width: none;
+}
+
+/* 表格表头随滚动条吸顶 */
+#editableTableWrapper table thead th,
+.file-preview-scroll table thead th {
+  position: sticky;
+  top: 0;
+  background: #fff;
+  z-index: 2;
+}
+
+/* 文本预览（JSON dump）也启用上下滚动 */
+#filePreview {
+  max-height: 360px;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-width: 100%;
+}
+
 .schedule-modal-shell {
   position: fixed;
   inset: 0;

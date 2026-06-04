@@ -128,9 +128,11 @@
         <span class="muted silent-label">Silent Export</span>
         <input type="checkbox" id="silentExportToggle" />
         <button id="silentExportTrigger" class="secondary">立即触发一次</button>
-        <span class="muted" style="margin-left:8px;">（静默导出：当定时任务未按预期运行时自动补做导出）</span>
+        <button id="silentExportListBtn" class="secondary">查看已注册表</button>
+        <span class="muted" style="margin-left:8px;">（静默导出：当定时任务未按预期运行时自动补做导出；先在「数据库导出」中成功导出过表才会被注册）</span>
         <span id="silentExportStatus" class="muted" style="margin-left:12px;"></span>
       </div>
+      <div id="silentExportManifestPanel" class="muted" style="margin-top:6px; display:none;"></div>
     </section>
 
     <section class="card internal-grid">
@@ -168,8 +170,10 @@
           <label>offset</label>
           <input id="previewOffset" type="number" min="0" value="0" />
           <label>limit</label>
-          <input id="previewLimit" type="number" min="1" value="20" />
+          <input id="previewLimit" type="number" min="1" value="100" />
           <button id="reloadPreviewBtn" class="secondary">刷新预览</button>
+          <button id="loadMorePreviewBtn" class="secondary" style="display:none;">下一批</button>
+          <span id="previewProgress" class="muted"></span>
         </div>
         <div class="preview-table-wrap">
           <table class="preview-table">

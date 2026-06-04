@@ -6,7 +6,7 @@ import json
 from datetime import datetime
 import threading
 
-from .silent_export_worker import process_once
+from .silent_export_worker import process_once, _load_manifest
 
 router = APIRouter()
 
@@ -90,6 +90,43 @@ def set_silent_export(tenant: str, req: SilentExportConfig, request: Request = N
     return {"code": 0, "message": "OK", "data": tenants[tenant], "traceId": ""}
 
 
+@router.get("/internal/tenants/{tenant}/silent-export/manifest")
+def get_silent_export_manifest(tenant: str, request: Request = None):
+    """查看该租户当前已注册到静默导出清单的表。
+
+    静默导出只会处理 manifest 中已存在的表；表由「数据库导出」成功执行后自动注册。
+    """
+    _require_admin(request)
+    manifest = {}
+    try:
+        manifest = _load_manifest() or {}
+    except Exception:
+        manifest = {}
+    tenant_entries = [
+        entry for entry in manifest.values()
+        if isinstance(entry, dict) and entry.get("tenant") == tenant
+    ]
+    db_tables = [
+        {
+            "db": (e.get("db") or {}).get("database") or (e.get("db") or {}).get("host", "?"),
+            "table": e.get("table"),
+            "registered_at": e.get("registered_at"),
+        }
+        for e in tenant_entries
+    ]
+    return {
+        "code": 0,
+        "message": "OK",
+        "data": {
+            "tenant": tenant,
+            "registered_count": len(db_tables),
+            "registered_tables": db_tables,
+            "output_dir": f"/home/yhz/nifi-data/silent_exports/{tenant}/",
+        },
+        "traceId": "",
+    }
+
+
 @router.post("/internal/tenants/{tenant}/silent-export/trigger")
 def trigger_silent_export(tenant: str, payload: Optional[Dict[str, Any]] = None, request: Request = None):
     user = _require_admin(request)
@@ -105,9 +142,41 @@ def trigger_silent_export(tenant: str, payload: Optional[Dict[str, Any]] = None,
     with p.open("a", encoding="utf-8") as fh:
         fh.write(json.dumps(job, ensure_ascii=False) + "\n")
     _get_silent_export_dir().mkdir(parents=True, exist_ok=True)
+
+    # 先统计当前 manifest 状态，便于前端告知用户"没表可处理"
+    manifest = {}
+    try:
+        manifest = _load_manifest() or {}
+    except Exception:
+        manifest = {}
+    tenant_entries = [
+        entry for entry in manifest.values()
+        if isinstance(entry, dict) and entry.get("tenant") == tenant
+    ]
+    db_tables = [
+        {"db": (e.get("db") or {}).get("database") or (e.get("db") or {}).get("host", "?"),
+         "table": e.get("table"),
+         "registered_at": e.get("registered_at")}
+        for e in tenant_entries
+    ]
+    hint = ""
+    if not tenant_entries:
+        hint = ("该租户暂无已注册的表。请先在「数据库导出」中成功导出一张表，"
+                "系统会自动注册到静默导出清单；之后本按钮才会真正写文件。")
+
     try:
         t = threading.Thread(target=process_once, kwargs={"tenant_filter": tenant}, daemon=True)
         t.start()
-    except Exception:
-        pass
-    return {"code": 0, "message": "enqueued", "data": job, "traceId": ""}
+    except Exception as exc:
+        return {"code": 0, "message": f"enqueue failed: {exc}", "data": {
+            "job": job,
+            "registered_tables": db_tables,
+            "registered_count": len(db_tables),
+            "hint": hint,
+        }, "traceId": ""}
+    return {"code": 0, "message": "enqueued", "data": {
+        "job": job,
+        "registered_tables": db_tables,
+        "registered_count": len(db_tables),
+        "hint": hint,
+    }, "traceId": ""}

@@ -190,7 +190,7 @@ function renderFiles() {
       tr.classList.add("file-row-selected");
     }
     tr.innerHTML = `
-      <td>${file.fileId}</td>
+      <td data-file-id="${file.fileId}">${file.fileId}</td>
       <td>${file.fileName}</td>
       <td>${file.fileFormat}</td>
       <td>${file.fileSize}</td>
@@ -340,9 +340,21 @@ async function loadFiles() {
 }
 
 async function previewFile(fileId) {
+  return _loadPreview(fileId, { append: false });
+}
+
+async function loadMorePreview() {
+  if (!state.selectedFileId) return;
+  return _loadPreview(state.selectedFileId, { append: true });
+}
+
+async function _loadPreview(fileId, { append = false } = {}) {
   state.selectedFileId = fileId;
-  const offset = Number(document.getElementById("previewOffset").value || "0");
-  const limit = Number(document.getElementById("previewLimit").value || "20");
+  const limit = Number(document.getElementById("previewLimit").value || "100");
+  // 追加模式从 state.previewOffset 推进，否则按用户输入的 offset（默认 0）
+  const offset = append
+    ? (state.previewOffset || 0) + limit
+    : Number(document.getElementById("previewOffset").value || "0");
   state.previewOffset = offset;
   const res = await api(`/files/${fileId}/preview?offset=${offset}&limit=${limit}`);
   const preview = document.getElementById("filePreview");
@@ -350,54 +362,82 @@ async function previewFile(fileId) {
     preview.textContent = `预览失败: ${res.message}`;
     return;
   }
-    preview.textContent = JSON.stringify(res.data, null, 2);
-    // 显示元数据摘要
-    const metaInfoBar = document.getElementById("metaInfoBar");
-    const metaInfoContent = document.getElementById("metaInfoContent");
-    if (metaInfoBar && metaInfoContent && res.data && res.data.meta) {
-      const m = res.data.meta;
-      const hasTag = m.hasTag ? "是" : "否";
-      const parts = [`hasTag: ${hasTag}`];
-      if (m.tagColumn) parts.push(`tagColumn: ${m.tagColumn}`);
-      if (m.tagName) parts.push(`tagName: ${m.tagName}`);
-      if (m.tagRange && Array.isArray(m.tagRange)) parts.push(`tagRange: [${m.tagRange.join(", ")}]`);
-      if (m.failedTag) parts.push(`failedTag: ${m.failedTag}`);
-      metaInfoContent.textContent = parts.join(" | ");
-      metaInfoBar.style.display = "";
-    } else if (metaInfoBar) {
-      metaInfoBar.style.display = "none";
-    }
-    // 控制「自动打标」按钮显示
-    const autoTagBtn = document.getElementById("autoTagFromPreviewBtn");
-    if (autoTagBtn && res.data && res.data.meta) {
-      autoTagBtn.style.display = "";
-      autoTagBtn.onclick = () => {
-        // 将 fileId 填入标签中心的自动打标输入框
-        const atf = document.getElementById("autoTagFileId");
-        if (atf) { atf.value = fileId; }
-        // 如果有 meta 中的 tagName，也填入
-        const atn = document.getElementById("autoTagName");
-        if (atn && res.data.meta.tagName) { atn.value = res.data.meta.tagName; }
-        // 滚动到标签中心
-        const tagSection = document.querySelector("section.card h2");
-        if (tagSection) tagSection.scrollIntoView({ behavior: "smooth" });
+  if (!append) {
+    // 表格数据：仅在 <pre> 中展示前 20 条 JSON 行（避免下方表格内容重复展示全量）
+    // 非表格数据：直接 JSON 预览整段内容
+    const PREVIEW_JSON_LIMIT = 20;
+    const isTabular = res.data && res.data.columns && Array.isArray(res.data.rows);
+    if (isTabular) {
+      const sliced = {
+        columns: res.data.columns,
+        rows: res.data.rows.slice(0, PREVIEW_JSON_LIMIT),
+        total: (typeof res.data.total === "number") ? res.data.total : res.data.rows.length,
+        meta: res.data.meta,
+        _previewNote: `（仅展示前 ${PREVIEW_JSON_LIMIT} 条；下方表格可编辑，点 "下一批" 加载更多）`,
       };
-    } else if (autoTagBtn) {
-      autoTagBtn.style.display = "none";
+      preview.textContent = JSON.stringify(sliced, null, 2);
+    } else {
+      preview.textContent = JSON.stringify(res.data, null, 2);
     }
-    // 若为表格格式（columns/rows），展示可编辑表格（整表可编辑）
-    const editable = document.getElementById("editablePreview");
-    const wrapper = document.getElementById("editableTableWrapper");
+  }
+  // 显示元数据摘要
+  const metaInfoBar = document.getElementById("metaInfoBar");
+  const metaInfoContent = document.getElementById("metaInfoContent");
+  if (metaInfoBar && metaInfoContent && res.data && res.data.meta) {
+    const m = res.data.meta;
+    const hasTag = m.hasTag ? "是" : "否";
+    const parts = [`hasTag: ${hasTag}`];
+    if (m.tagColumn) parts.push(`tagColumn: ${m.tagColumn}`);
+    if (m.tagName) parts.push(`tagName: ${m.tagName}`);
+    if (m.tagRange && Array.isArray(m.tagRange)) parts.push(`tagRange: [${m.tagRange.join(", ")}]`);
+    if (m.failedTag) parts.push(`failedTag: ${m.failedTag}`);
+    metaInfoContent.textContent = parts.join(" | ");
+    metaInfoBar.style.display = "";
+  } else if (metaInfoBar) {
+    metaInfoBar.style.display = "none";
+  }
+  // 控制「自动打标」按钮显示
+  const autoTagBtn = document.getElementById("autoTagFromPreviewBtn");
+  if (autoTagBtn && res.data && res.data.meta) {
+    autoTagBtn.style.display = "";
+    autoTagBtn.onclick = () => {
+      const atf = document.getElementById("autoTagFileId");
+      if (atf) { atf.value = fileId; }
+      const atn = document.getElementById("autoTagName");
+      if (atn && res.data.meta.tagName) { atn.value = res.data.meta.tagName; }
+      const tagSection = document.getElementById("tagCenterTitle");
+      if (tagSection) {
+        tagSection.scrollIntoView({ behavior: "smooth", block: "start" });
+        // 短暂高亮标签中心标题，提示用户已跳转
+        tagSection.style.transition = "background 0.2s";
+        const original = tagSection.style.background;
+        tagSection.style.background = "#fff3bf";
+        setTimeout(() => { tagSection.style.background = original || ""; }, 1200);
+      }
+    };
+  } else if (autoTagBtn) {
+    autoTagBtn.style.display = "none";
+  }
+  // 若为表格格式（columns/rows），展示可编辑表格
+  const editable = document.getElementById("editablePreview");
+  const wrapper = document.getElementById("editableTableWrapper");
+  const progressEl = document.getElementById("previewProgress");
+  const loadMoreBtn = document.getElementById("loadMorePreviewBtn");
+  if (!append) {
     wrapper.innerHTML = "";
+    state.previewColumns = [];
+    state.previewRows = [];
     document.getElementById("saveTagsResult").textContent = "";
-    if (res.data && res.data.columns && Array.isArray(res.data.rows)) {
-      state.previewColumns = [...res.data.columns];
-      state.previewRows = res.data.rows.map((r) => [...r]);
+  }
+  if (res.data && res.data.columns && Array.isArray(res.data.rows)) {
+    let table = wrapper.querySelector("table.editable");
+    let thead, headRow, tbody;
+    if (!append || !table) {
       editable.style.display = "block";
-      const table = document.createElement("table");
+      table = document.createElement("table");
       table.className = "editable";
-      const thead = document.createElement("thead");
-      const headRow = document.createElement("tr");
+      thead = document.createElement("thead");
+      headRow = document.createElement("tr");
       res.data.columns.forEach((c, colIdx) => {
         const th = document.createElement("th");
         th.contentEditable = true;
@@ -409,72 +449,97 @@ async function previewFile(fileId) {
       });
       thead.appendChild(headRow);
       table.appendChild(thead);
-
-      const tbody = document.createElement("tbody");
-      res.data.rows.forEach((r, idx) => {
-        const tr = document.createElement("tr");
-        r.forEach((cell, colIdx) => {
-          const td = document.createElement("td");
-          td.contentEditable = true;
-          td.className = "editable-cell";
-          td.dataset.rowId = String(offset + idx + 1);
-          td.dataset.column = res.data.columns[colIdx] || `col_${colIdx + 1}`;
-          td.dataset.original = String(cell ?? "");
-          td.textContent = cell;
-          tr.appendChild(td);
-        });
-        tbody.appendChild(tr);
-      });
+      tbody = document.createElement("tbody");
       table.appendChild(tbody);
       wrapper.appendChild(table);
-      // add '新增字段' handler: 仅允许新增 tag 列，且最多新增 1 列
-      const addFieldBtn = document.getElementById('addFieldBtn');
-      if (addFieldBtn) {
-        // 如果已有 tag 列，禁用新增字段
-        const hasTagColumn = state.previewColumns.includes("tag");
-        addFieldBtn.disabled = hasTagColumn;
-        addFieldBtn.onclick = () => {
-          if (state.previewColumns.includes("tag")) {
-            return; // 已有 tag 列，不允许再新增
-          }
-          const newColName = "tag";
-          // update state and header
-          state.previewColumns.push(newColName);
-          const newTh = document.createElement('th');
-          newTh.contentEditable = true;
-          newTh.className = 'editable-header';
-          newTh.dataset.original = newColName;
-          newTh.dataset.colIndex = String(headRow.children.length);
-          newTh.textContent = newColName;
-          headRow.appendChild(newTh);
-          // add empty cells to each existing row
-          const tbody = table.querySelector('tbody');
-          if (tbody) {
-            Array.from(tbody.querySelectorAll('tr')).forEach((tr, rowIdx) => {
-              const td = document.createElement('td');
-              td.contentEditable = true;
-              td.className = 'editable-cell';
-              td.dataset.rowId = String(offset + rowIdx + 1);
-              td.dataset.column = newColName;
-              td.dataset.original = '';
-              td.textContent = '';
-              tr.appendChild(td);
-            });
-          }
-          addFieldBtn.disabled = true; // 禁止再新增
-        };
-      }
+      // 重新初始化 state 列
+      state.previewColumns = [...res.data.columns];
+      state.previewRows = [];
     } else {
+      thead = table.querySelector("thead");
+      headRow = thead ? thead.querySelector("tr") : null;
+      tbody = table.querySelector("tbody");
+    }
+
+    res.data.rows.forEach((r, idx) => {
+      const tr = document.createElement("tr");
+      r.forEach((cell, colIdx) => {
+        const td = document.createElement("td");
+        td.contentEditable = true;
+        td.className = "editable-cell";
+        td.dataset.rowId = String(offset + idx + 1);
+        td.dataset.column = res.data.columns[colIdx] || `col_${colIdx + 1}`;
+        td.dataset.original = String(cell ?? "");
+        td.textContent = cell;
+        tr.appendChild(td);
+      });
+      tbody.appendChild(tr);
+      state.previewRows.push([...r]);
+    });
+
+    // 「已加载 X / Y」进度
+    const total = (typeof res.data.total === "number") ? res.data.total : (offset + res.data.rows.length);
+    const loaded = offset + res.data.rows.length;
+    if (progressEl) progressEl.textContent = `已加载 ${loaded} / ${total}`;
+    if (loadMoreBtn) loadMoreBtn.style.display = (loaded < total) ? "" : "none";
+
+    // 「新增字段」按钮（仅在首次加载时挂接）
+    const addFieldBtn = document.getElementById("addFieldBtn");
+    if (addFieldBtn && !append) {
+      const hasTagColumn = state.previewColumns.includes("tag");
+      addFieldBtn.disabled = hasTagColumn;
+      addFieldBtn.onclick = () => {
+        if (state.previewColumns.includes("tag")) {
+          return;
+        }
+        const newColName = "tag";
+        state.previewColumns.push(newColName);
+        const newTh = document.createElement("th");
+        newTh.contentEditable = true;
+        newTh.className = "editable-header";
+        newTh.dataset.original = newColName;
+        newTh.dataset.colIndex = String(headRow.children.length);
+        newTh.textContent = newColName;
+        headRow.appendChild(newTh);
+        if (tbody) {
+          Array.from(tbody.querySelectorAll("tr")).forEach((tr, rowIdx) => {
+            const td = document.createElement("td");
+            td.contentEditable = true;
+            td.className = "editable-cell";
+            td.dataset.rowId = String(state.previewOffset + rowIdx + 1);
+            td.dataset.column = newColName;
+            td.dataset.original = "";
+            td.textContent = "";
+            tr.appendChild(td);
+          });
+        }
+        addFieldBtn.disabled = true;
+      };
+    }
+  } else {
+    if (!append) {
       editable.style.display = "none";
       state.previewColumns = [];
       state.previewRows = [];
+      if (progressEl) progressEl.textContent = "";
+      if (loadMoreBtn) loadMoreBtn.style.display = "none";
     }
+  }
 }
 
   // 刷新当前预览
   document.getElementById("previewReloadBtn").addEventListener("click", () => {
     if (state.selectedFileId) previewFile(state.selectedFileId);
   });
+
+  // 下一批：基于当前 offset 继续追加
+  const loadMoreBtn = document.getElementById("loadMorePreviewBtn");
+  if (loadMoreBtn) {
+    loadMoreBtn.addEventListener("click", () => {
+      if (!state.selectedFileId) return;
+      loadMorePreview();
+    });
+  }
 
   const openModalBtn = document.getElementById("openEditorModalBtn");
   const closeModalBtn = document.getElementById("closeEditorModalBtn");
@@ -613,8 +678,16 @@ function collectTagRuleFromUI() {
     const when = {};
     whenInputs.forEach(wi => {
       const col = wi.dataset.column || "";
-      const val = wi.value.trim();
-      if (col && val) when[col] = val;
+      const raw = wi.value.trim();
+      if (!col || !raw) return;
+      // 支持速记: "value>15" / "status==200" / "code in 200,201,204"
+      const m = raw.match(/^\s*([a-zA-Z_][\w]*)\s*(==|!=|>=|<=|>|=|<)\s*(.+)$/);
+      if (m && m[1] === col) {
+        when[col] = { op: m[2], value: m[3].trim() };
+      } else {
+        // 回退为相等
+        when[col] = raw;
+      }
     });
     const tag = tagInput ? tagInput.value.trim() : "";
     if (Object.keys(when).length > 0 && tag) {
@@ -648,7 +721,7 @@ function addTagRuleConditionRow() {
     input.type = "text";
     input.className = "rule-when-input";
     input.dataset.column = col;
-    input.placeholder = `当 ${col} = ?`;
+    input.placeholder = `值 / 表达式: 5 或 ${col}>15`;
     input.style.cssText = "width:100px;";
     row.appendChild(input);
   });
@@ -699,7 +772,52 @@ async function triggerAutoTag() {
   }
   const data = res.data || {};
   if (data.file) {
-    msg.textContent = `自动标签完成: ${data.file.fileName}，fileId: ${data.file.fileId}`;
+    const newFile = data.file;
+    const newFileId = newFile.fileId || "";
+    const newFileName = newFile.fileName || "";
+    // 重要：自动打标会在 tagged_output/ 下生成新文件（新的 fileId），原文件不会被就地修改
+    msg.innerHTML = "";
+    msg.appendChild(document.createTextNode("自动标签完成（已生成新文件，原文件未修改）："));
+    const wrap = document.createElement("div");
+    wrap.style.cssText = "margin-top:6px; padding:8px 10px; background:#ecfdf5; border:1px solid #6ee7b7; border-radius:6px; display:inline-block;";
+    const nameEl = document.createElement("div");
+    nameEl.innerHTML = `<strong>${newFileName}</strong> <span class="muted">fileId:</span> <code>${newFileId}</code>`;
+    wrap.appendChild(nameEl);
+    const btnRow = document.createElement("div");
+    btnRow.style.cssText = "margin-top:6px; display:flex; gap:6px;";
+    const previewBtn = document.createElement("button");
+    previewBtn.textContent = "预览新文件";
+    previewBtn.className = "secondary";
+    previewBtn.onclick = async () => {
+      // 先确保文件列表已包含新文件
+      try { await loadFiles(); } catch (_) {}
+      // 搜索/定位文件中心新行
+      const fileIdCell = document.querySelector(`[data-file-id="${newFileId}"]`);
+      if (fileIdCell) {
+        fileIdCell.scrollIntoView({ behavior: "smooth", block: "center" });
+        const row = fileIdCell.closest("tr");
+        if (row) {
+          row.style.transition = "background 0.2s";
+          const original = row.style.background;
+          row.style.background = "#fef08a";
+          setTimeout(() => { row.style.background = original || ""; }, 1500);
+        }
+      }
+      if (typeof previewFile === "function") {
+        await previewFile(newFileId);
+      }
+    };
+    const fillBtn = document.createElement("button");
+    fillBtn.textContent = "把 fileId 填回上方（再次打标）";
+    fillBtn.className = "secondary";
+    fillBtn.onclick = () => {
+      const inp = document.getElementById("autoTagFileId");
+      if (inp) inp.value = newFileId;
+    };
+    btnRow.appendChild(previewBtn);
+    btnRow.appendChild(fillBtn);
+    wrap.appendChild(btnRow);
+    msg.appendChild(wrap);
   } else {
     msg.textContent = `自动标签任务已创建: ${data.jobId || "-"}`;
   }
@@ -1499,10 +1617,15 @@ if (fileInput && uploadBtn && uploadResult) {
       if (data.code === 0) {
         const sourcePath = data?.data?.sourcePath || data?.data?.storagePath || "";
         const targetPath = data?.data?.targetPath || "";
+        const convertedFileId = data?.data?.convertedFileId || "";
         const msgLines = [
           `上传成功，已执行 ${selected.convertType}，原文件 fileId: ${data.data.fileId}`,
           sourcePath ? `上传文件路径: ${sourcePath}` : "上传文件路径: （后端未返回）",
-          targetPath ? `转换文件路径: ${targetPath}` : "转换文件路径: （后端未返回）",
+          targetPath
+            ? `转换文件路径: ${targetPath}${convertedFileId ? ` ｜ 新 fileId: ${convertedFileId}` : ""}`
+            : (sourcePath
+                ? "转换文件路径: （转换未生成目标文件，请检查源 JSON 是否为空/格式错误；后端日志：grep json_to_csv /home/yhz/iot-backend/iot-backend.log）"
+                : "转换文件路径: （后端未返回）"),
         ];
         uploadResult.innerHTML = msgLines.join("<br>");
         await loadFiles();

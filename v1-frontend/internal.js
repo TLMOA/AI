@@ -332,28 +332,50 @@
     });
   }
 
-  function renderPreviewTable(data) {
+  function renderPreviewTable(data, { append = false } = {}) {
     const head = document.getElementById("previewHead");
     const body = document.getElementById("previewBody");
     const raw = document.getElementById("previewRaw");
-    head.innerHTML = "";
-    body.innerHTML = "";
+    if (!append) {
+      head.innerHTML = "";
+      body.innerHTML = "";
+    }
 
     if (!data || !Array.isArray(data.columns) || !Array.isArray(data.rows)) {
-      document.getElementById("previewHead").innerHTML = "";
-      document.getElementById("previewBody").innerHTML = "";
-      raw.style.display = "block";
-      raw.textContent = JSON.stringify(data || {}, null, 2);
+      if (!append) {
+        head.innerHTML = "";
+        body.innerHTML = "";
+        raw.style.display = "block";
+        raw.textContent = JSON.stringify(data || {}, null, 2);
+      }
       return;
     }
 
-    const trh = document.createElement("tr");
-    data.columns.forEach((c) => {
-      const th = document.createElement("th");
-      th.textContent = c;
-      trh.appendChild(th);
-    });
-    head.appendChild(trh);
+    // 表格数据：<pre> 仅展示前 20 条 JSON 行；下方表格完整渲染并支持 "下一批"
+    const PREVIEW_JSON_LIMIT = 20;
+    if (!append) {
+      raw.style.display = "block";
+      const sliced = {
+        columns: data.columns,
+        rows: data.rows.slice(0, PREVIEW_JSON_LIMIT),
+        total: (typeof data.total === "number") ? data.total : data.rows.length,
+        meta: data.meta,
+        _previewNote: `（仅展示前 ${PREVIEW_JSON_LIMIT} 条；下方表格为完整预览，点 "下一批" 加载更多）`,
+      };
+      raw.textContent = JSON.stringify(sliced, null, 2);
+    } else {
+      raw.style.display = "none";
+    }
+
+    if (!append || head.children.length === 0) {
+      const trh = document.createElement("tr");
+      data.columns.forEach((c) => {
+        const th = document.createElement("th");
+        th.textContent = c;
+        trh.appendChild(th);
+      });
+      head.appendChild(trh);
+    }
 
     data.rows.forEach((row) => {
       const tr = document.createElement("tr");
@@ -364,9 +386,6 @@
       });
       body.appendChild(tr);
     });
-
-    raw.style.display = "none";
-    raw.textContent = JSON.stringify({ total: data.total || data.rows.length }, null, 2);
   }
 
   async function manualSync() {
@@ -448,6 +467,33 @@
     return true;
   }
 
+  async function listSilentExportManifest() {
+    const tenant = inferFactoryId();
+    const panel = document.getElementById('silentExportManifestPanel');
+    if (panel) panel.style.display = 'block';
+    setStatus('正在查询已注册表...', false);
+    const res = await callApi(`/internal/tenants/${encodeURIComponent(tenant)}/silent-export/manifest`);
+    if (!res || res.code !== 0) {
+      setStatus(`查询失败: ${res && res.message ? res.message : 'unknown'}`, true);
+      if (panel) panel.textContent = '查询失败';
+      return;
+    }
+    const data = res.data || {};
+    const list = Array.isArray(data.registered_tables) ? data.registered_tables : [];
+    if (panel) {
+      if (list.length === 0) {
+        panel.innerHTML = `<div style="color:#b91c1c;">该租户 <code>${tenant}</code> 暂无已注册表。` +
+          `请先在「数据库导出」中成功导出一次，系统会自动把表注册到静默导出清单中，之后立即触发才能真正生成文件。</div>`;
+      } else {
+        panel.innerHTML = `<div>租户 <code>${tenant}</code> 已注册 ${list.length} 张表，落盘目录：<code>${data.output_dir}</code></div>` +
+          '<ul style="margin:6px 0 0 18px;">' +
+          list.map(t => `<li><code>${t.db}.${t.table}</code> <span class="muted">注册于 ${t.registered_at || '-'}</span></li>`).join('') +
+          '</ul>';
+      }
+    }
+    setStatus(`已注册表: ${list.length} 张`, list.length === 0);
+  }
+
   async function triggerSilentExport() {
     const confirmOk = window.confirm('确认要对当前工厂立即触发一次静默导出吗？此操作仅限管理员用途。');
     if (!confirmOk) return;
@@ -462,7 +508,17 @@
       setStatus(`触发失败: ${res && res.message ? res.message : 'unknown'}`, true);
       return;
     }
-    setStatus('静默导出已触发（后台执行）', false);
+    const data = res.data || {};
+    const regCount = data.registered_count || 0;
+    const regList = Array.isArray(data.registered_tables) ? data.registered_tables : [];
+    let msg = `静默导出已触发（后台执行）。已注册表: ${regCount} 张`;
+    if (regList.length > 0) {
+      msg += `（${regList.map(x => `${x.db}.${x.table}`).join(', ')}）`;
+    }
+    if (data.hint) msg += ` ｜ ${data.hint}`;
+    setStatus(msg, regCount === 0);
+    // 静默导出落盘目录提示
+    setStatus(`${msg} | 落盘目录: /home/yhz/nifi-data/silent_exports/${tenant}/<db_key>/`, regCount === 0);
   }
 
   async function loadTree() {
@@ -522,21 +578,52 @@
   }
 
   async function previewFile(fileId) {
-    const offset = Number(document.getElementById("previewOffset").value || "0");
-    const limit = Number(document.getElementById("previewLimit").value || "20");
+    return _loadPreview(fileId, { append: false });
+  }
+
+  async function loadMorePreview() {
+    if (!state.selectedFileId) return;
+    return _loadPreview(state.selectedFileId, { append: true });
+  }
+
+  async function _loadPreview(fileId, { append = false } = {}) {
+    const limit = Number(document.getElementById("previewLimit").value || "100");
+    const offset = append
+      ? (state.previewOffset || 0) + limit
+      : Number(document.getElementById("previewOffset").value || "0");
+    state.previewOffset = offset;
     const delimiter = encodeURIComponent(document.getElementById('delimiterSelect').value || ',');
     const encoding = encodeURIComponent(document.getElementById('encodingSelect').value || 'utf-8');
     const formatHint = (state.selectedFileMeta && state.selectedFileMeta.fileFormat) ? state.selectedFileMeta.fileFormat : '';
     const qs = `offset=${offset}&limit=${limit}&delimiter=${delimiter}&encoding=${encoding}&format=${encodeURIComponent(formatHint)}`;
     const res = await callApi(`/files/${fileId}/preview?${qs}`);
+    const head = document.getElementById("previewHead");
+    const body = document.getElementById("previewBody");
+    const raw = document.getElementById("previewRaw");
+    const progressEl = document.getElementById("previewProgress");
+    const loadMoreBtn = document.getElementById("loadMorePreviewBtn");
     if (res.code !== 0) {
-      document.getElementById("previewRaw").textContent = `预览失败: ${res.message || "unknown"}`;
-      document.getElementById("previewHead").innerHTML = "";
-      document.getElementById("previewBody").innerHTML = "";
-      document.getElementById('previewRaw').style.display = 'block';
+      raw.textContent = `预览失败: ${res.message || "unknown"}`;
+      head.innerHTML = "";
+      body.innerHTML = "";
+      raw.style.display = "block";
+      if (progressEl) progressEl.textContent = "";
+      if (loadMoreBtn) loadMoreBtn.style.display = "none";
       return;
     }
-    renderPreviewTable(res.data || {});
+    renderPreviewTable(res.data || {}, { append });
+    // 更新进度
+    const data = res.data || {};
+    const isTabular = Array.isArray(data.columns) && Array.isArray(data.rows);
+    if (isTabular) {
+      const total = (typeof data.total === "number") ? data.total : 0;
+      const loaded = offset + data.rows.length;
+      if (progressEl) progressEl.textContent = `已加载 ${loaded} / ${total}`;
+      if (loadMoreBtn) loadMoreBtn.style.display = (total > 0 && loaded < total) ? "" : "none";
+    } else {
+      if (progressEl) progressEl.textContent = "";
+      if (loadMoreBtn) loadMoreBtn.style.display = "none";
+    }
   }
 
   function bindEvents() {
@@ -583,9 +670,23 @@
       });
     }
 
+    const listBtn = document.getElementById('silentExportListBtn');
+    if (listBtn) {
+      listBtn.addEventListener('click', async () => {
+        await listSilentExportManifest();
+      });
+    }
+
     reloadPreviewBtn.addEventListener("click", () => {
       if (state.selectedFileId) previewFile(state.selectedFileId);
     });
+
+    const loadMorePreviewBtn = document.getElementById("loadMorePreviewBtn");
+    if (loadMorePreviewBtn) {
+      loadMorePreviewBtn.addEventListener("click", () => {
+        if (state.selectedFileId) loadMorePreview();
+      });
+    }
 
     if (prevPage) {
       prevPage.addEventListener('click', async () => {
