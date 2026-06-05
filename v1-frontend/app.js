@@ -846,7 +846,7 @@ function collectDbConfigForSchedule() {
   DEFAULT_PORTS.hdfs = 9870;
   const conf = {
     db_type: db_type,
-    host: document.getElementById("dbHost")?.value.trim() || "202.113.76.55",
+    host: document.getElementById("dbHost")?.value.trim() || "192.168.1.181",
     port: Number(document.getElementById("dbPort")?.value || DEFAULT_PORTS[db_type] || 3306),
     user: document.getElementById("dbUser")?.value.trim() || "root",
     password: document.getElementById("dbPassword")?.value || "",
@@ -862,15 +862,15 @@ function collectDbConfigForSchedule() {
 }
 
 const DB_TYPE_DEFAULTS = {
-  mysql: { host: '202.113.76.55', port: '3306', user: 'root', database: 'nifi', password: 'root' },
-  postgres: { host: '202.113.76.55', port: '5432', user: 'postgres', database: 'postgres', password: 'difyai123456' },
-  postgresql: { host: '202.113.76.55', port: '5432', user: 'postgres', database: 'postgres', password: 'difyai123456' },
-  sqlserver: { host: '202.113.76.55', port: '1433', user: 'sa', database: 'master', password: 'Your_password123' },
-  oracle: { host: '202.113.76.55', port: '1521', user: 'system', database: 'FREEPDB1', password: 'Oracle123456' },
+  mysql: { host: '192.168.1.181', port: '3306', user: 'root', database: 'nifi', password: 'root' },
+  postgres: { host: '192.168.1.181', port: '5432', user: 'postgres', database: 'postgres', password: 'difyai123456' },
+  postgresql: { host: '192.168.1.181', port: '5432', user: 'postgres', database: 'postgres', password: 'difyai123456' },
+  sqlserver: { host: '192.168.1.181', port: '1433', user: 'sa', database: 'master', password: 'Your_password123' },
+  oracle: { host: '192.168.1.181', port: '1521', user: 'system', database: 'FREEPDB1', password: 'Oracle123456' },
   sqlite: { host: '', port: '', user: '', database: '', password: '' },
-  hive: { host: '202.113.76.55', port: '10000', user: 'hive', database: 'default', password: '' },
-  hdfs: { host: '202.113.76.55', port: '9870', user: 'hadoop', database: '/', password: '', path: '/' },
-  hbase: { host: '202.113.76.55', port: '19090', user: 'root', database: 'default', password: '' },
+  hive: { host: '192.168.1.181', port: '10000', user: 'hive', database: 'default', password: '' },
+  hdfs: { host: '192.168.1.181', port: '9870', user: 'hadoop', database: '/', password: '', path: '/' },
+  hbase: { host: '192.168.1.181', port: '19090', user: 'root', database: 'default', password: '' },
 };
 
 function applyDbTypeDefaults() {
@@ -932,7 +932,7 @@ function renderDbFields() {
       const hostEl = document.getElementById('dbHost');
       const portEl = document.getElementById('dbPort');
       const userEl = document.getElementById('dbUser');
-      if (hostEl && (!hostEl.value || ['202.113.76.55', '127.0.0.1', 'localhost'].includes(String(hostEl.value).trim()))) hostEl.value = '202.113.76.55';
+      if (hostEl && (!hostEl.value || ['192.168.1.181', '127.0.0.1', 'localhost'].includes(String(hostEl.value).trim()))) hostEl.value = '192.168.1.181';
       if (portEl && (!portEl.value || ['3306', '5432', '1433', '1521', '10000', '9090', '9870', '19090'].includes(String(portEl.value).trim()))) portEl.value = '9870';
       if (userEl && (!userEl.value || ['root', 'hive', 'admin'].includes(String(userEl.value).trim()))) userEl.value = 'hadoop';
       // HDFS 通常不需要密码字段，隐藏 password input 与其 label（仅隐藏，不移除 DOM）

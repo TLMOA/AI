@@ -2,6 +2,11 @@ from sqlalchemy import create_engine
 from typing import Dict
 import warnings
 
+try:
+    from .local_ip import _resolve_local_host
+except ImportError:
+    from local_ip import _resolve_local_host
+
 warnings.filterwarnings(
     "ignore",
     message=r"pkg_resources is deprecated as an API.*",
@@ -33,7 +38,7 @@ def engine_from_config(db_conf: Dict) -> any:
     db_type = db_conf.get("db_type", "mysql").lower()
     user = db_conf.get("user")
     password = db_conf.get("password")
-    host = db_conf.get("host", "127.0.0.1")
+    host = _resolve_local_host(db_conf.get("host", "127.0.0.1"))
     port = db_conf.get("port")
     database = db_conf.get("database")
 
@@ -67,7 +72,7 @@ def engine_from_config(db_conf: Dict) -> any:
         url = f"oracle+{driver}://{user}:{password}@{host}:{port}/?service_name={database}"
     elif db_type == "hive":
         if pyhive is None:
-            raise ImportError("pyhive is required for Hive connections. Please install it with: pip install pyhive")
+            raise ImportError("pyhive is required for Hive connections. Please install it with: pip install happybase")
         # Connect to Hive using PyHive
         port = port or 10000
         auth = db_conf.get("auth", "NOSASL")  # Default to no authentication

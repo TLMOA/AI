@@ -1839,7 +1839,8 @@ def _write_edited_output(source_meta: Dict[str, Any], rows: List[Dict[str, Any]]
 
 
 def _connect_mysql(host: str, port: int, user: str, password: str, db: str):
-    return pymysql.connect(host=host, port=port, user=user, password=password, db=db, charset="utf8mb4", cursorclass=pymysql.cursors.DictCursor)
+    # 本机 IP 自动走 127.0.0.1，避免 MySQL 对客户端 IP 反向 DNS 解析卡 10s
+    return pymysql.connect(host=_resolve_local_host(host), port=port, user=user, password=password, db=db, charset="utf8mb4", cursorclass=pymysql.cursors.DictCursor)
 
 
 def _export_table_to_rows(conn, table: str, where: str = "") -> Tuple[List[str], List[Dict[str, Any]]]:

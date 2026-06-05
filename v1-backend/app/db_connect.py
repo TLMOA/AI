@@ -5,9 +5,13 @@ import sqlalchemy
 import concurrent.futures
 import subprocess
 import shutil
+from .local_ip import _collect_local_ips, _resolve_local_host
 
 # Import our Hadoop connection functions
 from .engine_factory import engine_from_config
+
+# Note: _collect_local_ips / _resolve_local_host moved to .local_ip
+# to avoid circular import with engine_factory.
 
 router = APIRouter()
 
@@ -47,7 +51,11 @@ def test_db_connection(req: DBConnectReq, x_trace_id: Optional[str] = Header(def
             return DBConnectResp(code=1001, message="参数缺失，请检查 SQLite 文件路径是否填写完整")
     elif not req.host or not req.port or not req.username or (dbt not in {"hdfs", "hbase"} and not req.database):
         return DBConnectResp(code=1001, message="参数缺失，请检查主机、端口、用户名、数据库名是否填写完整")
-    
+
+    # 如果请求的 host 是本机任意接口 IP，自动改用 127.0.0.1 直连，
+    # 避免 MySQL 等服务对客户端 IP 进行反向 DNS 解析导致 10s 级别的卡顿。
+    effective_host = _resolve_local_host(req.host)
+
     # 构建连接字符串
     try:
         # Handle Hadoop service types
@@ -55,7 +63,7 @@ def test_db_connection(req: DBConnectReq, x_trace_id: Optional[str] = Header(def
             # Prefer JDBC/Beeline validation because Hive 4.x + PyHive can be unstable.
             beeline = shutil.which("beeline")
             docker = shutil.which("docker")
-            jdbc_url = f"jdbc:hive2://{req.host}:{req.port}/{req.database or 'default'}"
+            jdbc_url = f"jdbc:hive2://{effective_host}:{req.port}/{req.database or 'default'}"
             if beeline:
                 cmd = [beeline, "-u", jdbc_url]
                 if req.username:
@@ -170,19 +178,19 @@ def test_db_connection(req: DBConnectReq, x_trace_id: Optional[str] = Header(def
             except Exception as e:
                 return DBConnectResp(code=2001, message="HDFS连接失败", detail=str(e))
         elif dbt in ("mysql", "mariadb"):
-            url = f"mysql+pymysql://{req.username}:{req.password}@{req.host}:{req.port}/{req.database}"
+            url = f"mysql+pymysql://{req.username}:{req.password}@{effective_host}:{req.port}/{req.database}"
         elif dbt in ("postgres", "postgresql"):
             # prefer explicit psycopg2 driver
-            url = f"postgresql+psycopg2://{req.username}:{req.password}@{req.host}:{req.port}/{req.database}"
+            url = f"postgresql+psycopg2://{req.username}:{req.password}@{effective_host}:{req.port}/{req.database}"
         elif dbt == "sqlite":
             url = f"sqlite:///{req.database}"
         elif dbt in ("mssql", "sqlserver"):
             # simple pyodbc template; requires system ODBC driver and pyodbc installed
             # user may need to URL-encode driver parameter in real deployments
-            url = f"mssql+pyodbc://{req.username}:{req.password}@{req.host}:{req.port}/{req.database}?driver=ODBC+Driver+17+for+SQL+Server"
+            url = f"mssql+pyodbc://{req.username}:{req.password}@{effective_host}:{req.port}/{req.database}?driver=ODBC+Driver+17+for+SQL+Server"
         elif dbt == "oracle":
             # prefer oracledb Python package (thin mode possible)
-            url = f"oracle+oracledb://{req.username}:{req.password}@{req.host}:{req.port}/?service_name={req.database}"
+            url = f"oracle+oracledb://{req.username}:{req.password}@{effective_host}:{req.port}/?service_name={req.database}"
         else:
             return DBConnectResp(code=1002, message=f"暂不支持的数据库类型: {req.db_type}")
 
@@ -216,13 +224,14 @@ def list_tables(req: DBConnectReq, x_trace_id: Optional[str] = Header(default=No
     """返回指定数据库下的表名列表（简易实现，支持 mysql/postgres/sqlite/hive/hbase）。"""
     try:
         dbt = (req.db_type or "").strip().lower()
-        
+        effective_host = _resolve_local_host(req.host)
+
         # Handle Hadoop service types for table listing
         if dbt == "hive":
             # Prefer Beeline/JDBC for Hive 4.x compatibility.
             beeline = shutil.which("beeline")
             docker = shutil.which("docker")
-            jdbc_url = f"jdbc:hive2://{req.host}:{req.port}/{req.database or 'default'}"
+            jdbc_url = f"jdbc:hive2://{effective_host}:{req.port}/{req.database or 'default'}"
             cmd = None
             if beeline:
                 cmd = [beeline, "-u", jdbc_url, "-e", "SHOW TABLES"]
@@ -302,7 +311,7 @@ def list_tables(req: DBConnectReq, x_trace_id: Optional[str] = Header(default=No
 
             db_conf = {
                 "db_type": "hbase",
-                "host": req.host,
+                "host": effective_host,
                 "port": req.port,
                 "user": req.username
             }
@@ -319,7 +328,7 @@ def list_tables(req: DBConnectReq, x_trace_id: Optional[str] = Header(default=No
         elif dbt == "hdfs":
             db_conf = {
                 "db_type": "hdfs",
-                "host": req.host,
+                "host": effective_host,
                 "port": req.port,
                 "user": req.username
             }
@@ -340,15 +349,15 @@ def list_tables(req: DBConnectReq, x_trace_id: Optional[str] = Header(default=No
             except Exception as e:
                 return TableListResp(code=9999, message="查询目录失败", detail=str(e))
         elif dbt in ("mysql", "mariadb"):
-            url = f"mysql+pymysql://{req.username}:{req.password}@{req.host}:{req.port}/{req.database}"
+            url = f"mysql+pymysql://{req.username}:{req.password}@{effective_host}:{req.port}/{req.database}"
         elif dbt in ("postgres", "postgresql"):
-            url = f"postgresql+psycopg2://{req.username}:{req.password}@{req.host}:{req.port}/{req.database}"
+            url = f"postgresql+psycopg2://{req.username}:{req.password}@{effective_host}:{req.port}/{req.database}"
         elif dbt == "sqlite":
             url = f"sqlite:///{req.database}"
         elif dbt in ("mssql", "sqlserver"):
-            url = f"mssql+pyodbc://{req.username}:{req.password}@{req.host}:{req.port}/{req.database}?driver=ODBC+Driver+17+for+SQL+Server"
+            url = f"mssql+pyodbc://{req.username}:{req.password}@{effective_host}:{req.port}/{req.database}?driver=ODBC+Driver+17+for+SQL+Server"
         elif dbt == "oracle":
-            url = f"oracle+oracledb://{req.username}:{req.password}@{req.host}:{req.port}/?service_name={req.database}"
+            url = f"oracle+oracledb://{req.username}:{req.password}@{effective_host}:{req.port}/?service_name={req.database}"
         else:
             return TableListResp(code=1002, message=f"暂不支持的数据库类型: {req.db_type}")
 
