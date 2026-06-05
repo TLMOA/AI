@@ -339,6 +339,41 @@ async function loadFiles() {
   filterFilesByCurrentDir();
 }
 
+async function purgeMissingFiles() {
+  const btn = document.getElementById("purgeMissingBtn");
+  if (btn) btn.disabled = true;
+  setFilesMessage("正在清理失效文件…");
+  try {
+    const res = await api("/files/purge-missing", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({}),
+    });
+    if (res.code !== 0) {
+      setFilesMessage(`清理失败：${res.message || res.code}`);
+      return;
+    }
+    const removed = (res.data && res.data.removed) || 0;
+    const removedMeta = (res.data && res.data.removedMeta) || 0;
+    setFilesMessage(`清理完成：移除失效文件 ${removed} 条，孤儿 meta ${removedMeta} 个`);
+    // 立即重新加载文件列表，让前端看到最新状态
+    await loadFiles();
+  } catch (e) {
+    setFilesMessage(`清理异常：${e && e.message ? e.message : e}`);
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
+function setFilesMessage(text) {
+  // 复用现有 setScheduleMessage 提示容器（无副作用，仅显示）
+  if (typeof setScheduleMessage === "function") {
+    setScheduleMessage(text);
+  } else {
+    console.log("[file-center]", text);
+  }
+}
+
 async function previewFile(fileId) {
   return _loadPreview(fileId, { append: false });
 }
@@ -1269,6 +1304,8 @@ async function triggerExportJob(id) {
 
 function bindEvents() {
   document.getElementById("loadFilesBtn").addEventListener("click", loadFiles);
+  const purgeMissingBtn = document.getElementById("purgeMissingBtn");
+  if (purgeMissingBtn) purgeMissingBtn.addEventListener("click", purgeMissingFiles);
   document.getElementById("loadRulesBtn").addEventListener("click", loadTagRules);
   document.getElementById("autoTagBtn").addEventListener("click", triggerAutoTag);
   const addTagRuleBtn = document.getElementById("addTagRuleBtn");

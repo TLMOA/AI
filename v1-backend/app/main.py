@@ -2505,6 +2505,46 @@ def list_files(
     return ok({"total": total, "pageNo": pageNo, "pageSize": pageSize, "rows": rows, "scan": scan}, trace_id)
 
 
+@app.post("/api/v1/files/purge-missing")
+def purge_missing_files(x_trace_id: Optional[str] = Header(default=None)):
+    """主动清理"磁盘上已不存在的"文件索引（含孤儿 meta.json）。
+
+    适用场景：用户在文件管理器直接删了文件，或老路径的旧数据不再需要。
+    每次 /files 接口调用时也会自动跑一次懒清理；该接口用于让前端能显式触发并立即看到清理数量。
+    """
+    trace_id = make_trace_id(x_trace_id)
+    removed_files = _purge_missing_files()
+    # 同步清理孤儿 meta.json（在 TAGGED_OUTPUT_DIR / 任何 data 根目录下，配套 .meta.json 无对应 .csv/.tsv/.json 的）
+    removed_meta = 0
+    try:
+        roots = [
+            str(TAGGED_OUTPUT_DIR),
+            "/home/yhz/nifi-data/output_csv",
+            "/home/yhz/nifi-data/output_tsv",
+            "/home/yhz/nifi-data/output_json",
+        ]
+        seen = set()
+        for root in roots:
+            r = Path(root)
+            if not r.exists():
+                continue
+            for p in r.rglob("*.meta.json"):
+                key = str(p.resolve())
+                if key in seen:
+                    continue
+                seen.add(key)
+                if p.exists() and not p.with_suffix("").with_suffix("").exists() and not p.with_name(p.stem).exists():
+                    # 配套数据文件不存在，删除孤儿 meta
+                    try:
+                        p.unlink()
+                        removed_meta += 1
+                    except Exception:
+                        pass
+    except Exception:
+        pass
+    return ok({"removed": removed_files, "removedMeta": removed_meta}, trace_id)
+
+
 @app.post("/api/v1/tags/manual")
 def manual_tag(req: ManualTagReq, x_trace_id: Optional[str] = Header(default=None)):
     trace_id = make_trace_id(x_trace_id)
