@@ -44,7 +44,8 @@ class ExportJobModel(BASE):
     __tablename__ = "export_jobs"
     id = Column(Integer, primary_key=True, autoincrement=True)
     job_name = Column(String(128), nullable=False)
-    factory_id = Column(String(64), nullable=True)
+    factory_id = Column(String(64), nullable=True)       # deprecated — 保留兼容历史数据
+    username = Column(String(128), nullable=True)         # v4: 统一用户标识
     owner_id = Column(String(64), nullable=True)
     schedule = Column(String(64), nullable=True)
     file_format = Column(String(32), default="csv")
@@ -64,7 +65,11 @@ class IotUser(BASE):
     username = Column(String(128), unique=True, index=True, nullable=False)
     password_hash = Column(String(256), nullable=False)
     is_admin = Column(Integer, default=0)
+    deployment_mode = Column(String(32), default="public")
+    ceph_endpoint = Column(String(512), default="")
     created_at = Column(DateTime, default=datetime.utcnow)
+    failed_attempts = Column(Integer, default=0)
+    locked_until = Column(DateTime, nullable=True)
 
 
 def get_engine(db_path: Path):
@@ -85,13 +90,37 @@ def init_db(db_path: Path):
             conn.execute(text("ALTER TABLE export_jobs ADD COLUMN factory_id VARCHAR(64)"))
         if "payload" not in col_names:
             conn.execute(text("ALTER TABLE export_jobs ADD COLUMN payload JSON"))
+        if "username" not in col_names:
+            conn.execute(text("ALTER TABLE export_jobs ADD COLUMN username VARCHAR(128)"))
+            # 迁移历史数据：factory-001 → 首个非 admin 用户名或 admin
+            try:
+                admin_row = conn.execute(text("SELECT username FROM iot_users WHERE is_admin=1 LIMIT 1")).fetchone()
+                fallback = admin_row[0] if admin_row else "admin"
+                conn.execute(text("UPDATE export_jobs SET username = :u WHERE username IS NULL AND factory_id='factory-001'"), {"u": fallback})
+            except Exception:
+                pass
 
         # Ensure iot_users table exists and a default admin user is present
         try:
             users = conn.execute(text("SELECT name FROM sqlite_master WHERE type='table' AND name='iot_users'" )).fetchone()
             if not users:
                 # create table via metadata (already called create_all), but ensure minimal init
-                conn.execute(text("CREATE TABLE IF NOT EXISTS iot_users (id INTEGER PRIMARY KEY AUTOINCREMENT, username VARCHAR(128) UNIQUE NOT NULL, password_hash VARCHAR(256) NOT NULL, is_admin INTEGER DEFAULT 0, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)"))
+                conn.execute(text("CREATE TABLE IF NOT EXISTS iot_users (id INTEGER PRIMARY KEY AUTOINCREMENT, username VARCHAR(128) UNIQUE NOT NULL, password_hash VARCHAR(256) NOT NULL, is_admin INTEGER DEFAULT 0, deployment_mode VARCHAR(32) DEFAULT 'public', ceph_endpoint VARCHAR(512) DEFAULT '', created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)"))
+        except Exception:
+            pass
+
+        # Lightweight migration: add new columns for deployment mode and ceph endpoint
+        try:
+            cols = conn.execute(text("PRAGMA table_info(iot_users)")).fetchall()
+            col_names = {row[1] for row in cols}
+            if "deployment_mode" not in col_names:
+                conn.execute(text("ALTER TABLE iot_users ADD COLUMN deployment_mode VARCHAR(32) DEFAULT 'public'"))
+            if "ceph_endpoint" not in col_names:
+                conn.execute(text("ALTER TABLE iot_users ADD COLUMN ceph_endpoint VARCHAR(512) DEFAULT ''"))
+            if "failed_attempts" not in col_names:
+                conn.execute(text("ALTER TABLE iot_users ADD COLUMN failed_attempts INTEGER DEFAULT 0"))
+            if "locked_until" not in col_names:
+                conn.execute(text("ALTER TABLE iot_users ADD COLUMN locked_until TIMESTAMP"))
         except Exception:
             pass
 
@@ -107,7 +136,10 @@ def init_db(db_path: Path):
                     ph = _bcrypt.hashpw(pwd.encode('utf-8'), _bcrypt.gensalt()).decode('utf-8')
                 except Exception:
                     ph = pwd
-                conn.execute(text("INSERT INTO iot_users (username, password_hash, is_admin) VALUES ('admin', :ph, 1)"), {"ph": ph})
+                conn.execute(text("INSERT INTO iot_users (username, password_hash, is_admin, deployment_mode) VALUES ('admin', :ph, 1, 'public')"), {"ph": ph})
+            else:
+                # Ensure admin has deployment_mode set (migrate existing admin)
+                conn.execute(text("UPDATE iot_users SET deployment_mode = 'public' WHERE deployment_mode IS NULL OR deployment_mode = ''"))
         except Exception:
             pass
 

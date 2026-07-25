@@ -14,6 +14,10 @@ LISTEN_HOST = os.getenv("V1_FRONTEND_HOST", "0.0.0.0")
 LISTEN_PORT = int(os.getenv("V1_FRONTEND_PORT", "5174"))
 
 
+class ReusableThreadingHTTPServer(ThreadingHTTPServer):
+    allow_reuse_address = True
+
+
 class FrontendHandler(SimpleHTTPRequestHandler):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, directory=str(ROOT), **kwargs)
@@ -23,18 +27,11 @@ class FrontendHandler(SimpleHTTPRequestHandler):
             self._proxy()
             return
 
-        # require auth for main pages (index and internal)
+        # 移除服务器端认证检查，让前端处理认证逻辑
+        # 这样可以避免重复调用 /auth/me 导致的闪烁问题
         req_path = self.path
         if req_path == "/":
             req_path = "/index.html"
-
-        if req_path in ("/index.html", "/internal.html"):
-            if not self._check_authenticated():
-                # redirect to login page
-                self.send_response(302)
-                self.send_header("Location", "/login.html")
-                self.end_headers()
-                return
 
         self.path = req_path
         return super().do_GET()
@@ -43,17 +40,10 @@ class FrontendHandler(SimpleHTTPRequestHandler):
         if self.path.startswith("/api/v1/") or self.path == "/api/v1":
             self._proxy(head_only=True)
             return
-        # normalize
+        # 移除服务器端认证检查，让前端处理认证逻辑
         req_path = self.path
         if req_path == "/":
             req_path = "/index.html"
-
-        if req_path in ("/index.html", "/internal.html"):
-            if not self._check_authenticated():
-                self.send_response(302)
-                self.send_header("Location", "/login.html")
-                self.end_headers()
-                return
 
         self.path = req_path
         return super().do_HEAD()
@@ -144,7 +134,7 @@ class FrontendHandler(SimpleHTTPRequestHandler):
 
 def main():
     os.chdir(ROOT)
-    server = ThreadingHTTPServer((LISTEN_HOST, LISTEN_PORT), FrontendHandler)
+    server = ReusableThreadingHTTPServer((LISTEN_HOST, LISTEN_PORT), FrontendHandler)
     print(f"Frontend listening on http://{LISTEN_HOST}:{LISTEN_PORT}")
     print(f"Proxying /api/v1 -> http://{BACKEND_HOST}:{BACKEND_PORT}")
     try:

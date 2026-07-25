@@ -1,30 +1,33 @@
 const config = window.APP_CONFIG;
-const DEFAULT_FACTORY_ID = config.FACTORY_ID || "factory-001";
+const DEFAULT_FACTORY_ID = config.FACTORY_ID || "user";  // deprecated — v4 统一使用 username
+const DEFAULT_USERNAME = config.DEFAULT_USERNAME || "admin";
 
-const KNOWN_NIFI_DIRS = [
-  "/home/yhz/nifi-data/output_csv",
-  "/home/yhz/nifi-data/output_json",
-  "/home/yhz/nifi-data/output_tsv",
-  "/home/yhz/nifi-data/inbox_csv",
-  "/home/yhz/nifi-data/inbox_json",
-  "/home/yhz/nifi-data/inbox_tsv",
-  "/home/yhz/nifi-data/csv_to_json",
-  "/home/yhz/nifi-data/json_to_csv",
-  "/home/yhz/nifi-data/tsv_to_json",
-  "/home/yhz/nifi-data/json_to_tsv",
-  "/home/yhz/nifi-data/csv_to_tsv",
-  "/home/yhz/nifi-data/tsv_to_csv",
-  "/home/yhz/nifi-data/tagged_output",
-  "/home/yhz/nifi-data/exports",
+function _currentUsername() {
+  // v4: 优先取当前登录用户
+  try {
+    const u = (state && state.currentUser && state.currentUser.username) || (window.currentUser && window.currentUser.username);
+    if (u) return u;
+  } catch (e) {}
+  return DEFAULT_USERNAME;
+}
+
+// v4: 已知子目录名（相对路径），不再硬编码绝对路径
+const KNOWN_NIFI_SUBDIRS = [
+  "output_csv", "output_json", "output_tsv",
+  "inbox_csv", "inbox_json", "inbox_tsv",
+  "csv_to_json", "json_to_csv", "tsv_to_json",
+  "json_to_tsv", "csv_to_tsv", "tsv_to_csv",
+  "tagged_output", "exports",
 ];
 
 const state = {
   allFiles: [],
   files: [],
-  rootDir: "/home/yhz/nifi-data",
-  currentDir: "/home/yhz/nifi-data",
+  rootDir: "",            // 兼容单根场景
+  rootDirs: [],           // v4: 多用户根目录列表
+  currentDir: "",
   dirChildren: {},
-  expandedDirs: { "/home/yhz/nifi-data": true },
+  expandedDirs: {},
   selectedFileId: null,
   previewColumns: [],
   previewRows: [],
@@ -32,7 +35,16 @@ const state = {
   tagRules: [],
   currentUser: null,
   backendMode: "local",
+  trainingFiles: [],
+  trainingTaskPollTimer: null,
+  currentTrainingTaskId: null,
 };
+
+function escapeHtml(text) {
+  const div = document.createElement("div");
+  div.textContent = text == null ? "" : String(text);
+  return div.innerHTML;
+}
 
 const BACKEND_MODE_STORAGE_KEY = "iot.backend.mode";
 
@@ -105,16 +117,16 @@ function updateBackendToggleUI() {
 
 async function getBackendModeState() {
   if (config.USE_MOCK_API) {
-    return { code: 0, data: { factory_id: DEFAULT_FACTORY_ID, mode: state.backendMode || config.DEFAULT_BACKEND_MODE || "local", updatedAt: new Date().toISOString(), updatedBy: "mock" } };
+    return { code: 0, data: { username: _currentUsername(), factory_id: DEFAULT_FACTORY_ID, mode: state.backendMode || config.DEFAULT_BACKEND_MODE || "local", updatedAt: new Date().toISOString(), updatedBy: "mock" } };
   }
   return await requestJson("/internal/backend-mode", {}, "local");
 }
 
 async function setBackendModeRemote(mode) {
   if (config.USE_MOCK_API) {
-    return { code: 0, data: { factory_id: DEFAULT_FACTORY_ID, mode } };
+    return { code: 0, data: { username: _currentUsername(), factory_id: DEFAULT_FACTORY_ID, mode } };
   }
-  const payload = { factory_id: DEFAULT_FACTORY_ID, mode, operator: (state.currentUser && state.currentUser.username) || "system" };
+  const payload = { username: _currentUsername(), factory_id: DEFAULT_FACTORY_ID, mode, operator: (state.currentUser && state.currentUser.username) || "system" };
   return await requestJson("/internal/backend-mode", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -151,6 +163,12 @@ async function requestJson(path, options = {}, mode = state.backendMode || confi
     body = { raw: text };
   }
   if (!r.ok) {
+    // v4: 401/403 自动跳登录（除登录/注册/登出自身外）
+    const skipPaths = ["/api/v1/auth/login", "/api/v1/auth/register", "/api/v1/auth/logout", "/api/v1/auth/me"];
+    if ((r.status === 401 || r.status === 403) && !skipPaths.some((p) => requestPath.startsWith(p))) {
+      const next = encodeURIComponent(window.location.pathname + window.location.search);
+      window.location.href = "/login.html?next=" + next;
+    }
     return { code: r.status, message: body?.detail || body?.message || body?.raw || `HTTP ${r.status}`, data: body?.data ?? null };
   }
   return body;
@@ -174,13 +192,25 @@ function mockApi(path, options = {}) {
   if (path.startsWith("/tags/rules")) {
     return Promise.resolve({ code: 0, message: "OK", traceId: "mock", data: [{ ruleId: "NIFI_RULE_ID_V5", ruleName: "Mock rule", ruleVersion: "v1", enabled: true }] });
   }
+  if (path.startsWith("/training/files")) {
+    return Promise.resolve({ code: 0, message: "OK", traceId: "mock", data: { total: 0, page: 1, size: 20, categories: [], files: [] } });
+  }
+  if (path.startsWith("/training/submit")) {
+    return Promise.resolve({ code: 0, message: "OK", traceId: "mock", data: { taskId: "task_mock_001", totalFiles: 0, acceptedFiles: [], rejectedFiles: [] } });
+  }
+  if (path.startsWith("/training/tasks/")) {
+    return Promise.resolve({ code: 0, message: "OK", traceId: "mock", data: { taskId: "task_mock_001", status: "completed", progress: 100, totalFiles: 0, processedFiles: 0, errors: [] } });
+  }
   return Promise.resolve({ code: 0, message: "OK", traceId: "mock", data: null });
 }
 
 function renderFiles() {
   const currentDirLabel = document.getElementById("currentDirLabel");
   if (currentDirLabel) {
-    currentDirLabel.textContent = `当前目录: ${state.currentDir} （文件 ${state.files.length || 0} 个）`;
+    const norm = (p) => (p || "").replace(/\\/g, "/");
+    const userDir = state.rootDirs.find((r) => norm(state.currentDir).startsWith(norm(r + "/"))) || "";
+    const displayDir = userDir ? state.currentDir.replace(userDir, userDir.split("/").pop()) : state.currentDir;
+    currentDirLabel.textContent = `当前目录: ${displayDir || state.currentDir} （文件 ${state.files.length || 0} 个）`;
   }
   const tbody = document.getElementById("fileTable");
   tbody.innerHTML = "";
@@ -211,23 +241,56 @@ function renderFiles() {
 
 function buildDirectoryState(files) {
   const children = {};
-  const dirs = new Set([state.rootDir]);
   const norm = (p) => (p || "").replace(/\\/g, "/");
 
-  KNOWN_NIFI_DIRS.forEach((dir) => {
-    if (dir.startsWith(state.rootDir)) dirs.add(norm(dir));
-  });
-
+  // v4: 从文件路径中收集所有用户根目录（nifi-data / real_nifi_data）
+  const rootDirs = new Set();
   files.forEach((f) => {
     const path = norm(f.storagePath);
-    if (!path.startsWith(state.rootDir + "/")) return;
+    const idx = path.indexOf("/nifi-data/");
+    const idx2 = path.indexOf("/real_nifi_data/");
+    if (idx >= 0) rootDirs.add(path.slice(0, idx + "/nifi-data".length));
+    if (idx2 >= 0) rootDirs.add(path.slice(0, idx2 + "/real_nifi_data".length));
+  });
+
+  // v4: 始终为当前用户兜底添加 nifi-data / real_nifi_data 两个根目录，
+  // 确保 Local/NiFi 两种模式对应的目录头都能在文件中心看到，而不仅是有文件时才出现。
+  const un = _currentUsername();
+  if (un) {
+    rootDirs.add(norm(`/home/yhz/${un}/nifi-data`));
+    rootDirs.add(norm(`/home/yhz/${un}/real_nifi_data`));
+  } else if (rootDirs.size === 0) {
+    rootDirs.add(norm("/home/yhz/admin/nifi-data"));
+    rootDirs.add(norm("/home/yhz/admin/real_nifi_data"));
+  }
+
+  const sortedRoots = Array.from(rootDirs).sort();
+  state.rootDirs = sortedRoots;
+  if (sortedRoots.length > 0) {
+    state.rootDir = sortedRoots[0];
+  }
+
+  const dirs = new Set(sortedRoots);
+
+  // 预置已知子目录（在每个根下）
+  sortedRoots.forEach((root) => {
+    KNOWN_NIFI_SUBDIRS.forEach((subdir) => {
+      dirs.add(norm(root + "/" + subdir));
+    });
+  });
+
+  // 从实际文件路径收集所有中间目录
+  files.forEach((f) => {
+    const path = norm(f.storagePath);
+    const root = sortedRoots.find((r) => path.startsWith(r + "/"));
+    if (!root) return;
     let dir = path.slice(0, path.lastIndexOf("/"));
-    while (dir.startsWith(state.rootDir)) {
+    while (dir.startsWith(root)) {
       dirs.add(dir);
-      if (dir === state.rootDir) break;
+      if (dir === root) break;
       const idx = dir.lastIndexOf("/");
-      if (idx < state.rootDir.length) {
-        dir = state.rootDir;
+      if (idx < root.length) {
+        dir = root;
       } else {
         dir = dir.slice(0, idx);
       }
@@ -238,7 +301,19 @@ function buildDirectoryState(files) {
     children[d] = [];
   });
   dirs.forEach((d) => {
-    if (d === state.rootDir) return;
+    const root = sortedRoots.find((r) => d.startsWith(r + "/") || d === r);
+    if (!root || d === root) {
+      // 根目录的父目录：用用户目录（如 /home/yhz/admin）作为父级
+      const parts = d.split("/");
+      if (parts.length >= 2) {
+        const parent = parts.slice(0, -1).join("/");
+        if (parent) {
+          if (!children[parent]) children[parent] = [];
+          children[parent].push(d);
+        }
+      }
+      return;
+    }
     const parent = d.slice(0, d.lastIndexOf("/"));
     if (children[parent]) children[parent].push(d);
   });
@@ -252,10 +327,12 @@ function renderDirectoryTree() {
   if (!root) return;
   root.innerHTML = "";
 
+  const norm = (p) => (p || "").replace(/\\/g, "/");
+
   const renderNode = (dir, depth) => {
     const row = document.createElement("div");
     row.className = "tree-row";
-    row.style.marginLeft = `${depth * 12}px`;
+    row.style.marginLeft = `${depth * 16}px`;
     const children = state.dirChildren[dir] || [];
     const hasChildren = children.length > 0;
     const isExpanded = state.expandedDirs[dir] !== false;
@@ -264,8 +341,10 @@ function renderDirectoryTree() {
     toggle.className = "tree-toggle";
     toggle.textContent = hasChildren ? (isExpanded ? "▼" : "▶") : "•";
     toggle.disabled = !hasChildren;
+    toggle.title = hasChildren ? (isExpanded ? "折叠" : "展开") : "无子目录";
     if (hasChildren) {
-      toggle.addEventListener("click", () => {
+      toggle.addEventListener("click", (ev) => {
+        ev.stopPropagation();
         state.expandedDirs[dir] = !isExpanded;
         renderDirectoryTree();
       });
@@ -273,13 +352,26 @@ function renderDirectoryTree() {
 
     const btn = document.createElement("button");
     btn.className = "tree-dir-btn";
-    const name = dir === state.rootDir ? "nifi-data" : dir.split("/").pop();
+    // 生成更友好的显示名称
+    let name = dir.split("/").pop();
+    const isRootDir = state.rootDirs.some((r) => r === dir);
+    const isUserDir = state.rootDirs.some((r) => norm(r).startsWith(norm(dir + "/")));
+    if (isRootDir) {
+      name = dir.endsWith("real_nifi_data") ? "real_nifi_data" : "nifi-data";
+    } else if (isUserDir) {
+      name = dir.split("/").pop();
+    }
     btn.textContent = name;
+    btn.title = dir;
     if (dir === state.currentDir) {
       btn.classList.add("current");
     }
     btn.addEventListener("click", () => {
       state.currentDir = dir;
+      // 点击目录名同时切换展开/折叠，方便查看细分目录
+      if (hasChildren) {
+        state.expandedDirs[dir] = !isExpanded;
+      }
       filterFilesByCurrentDir();
       renderDirectoryTree();
     });
@@ -291,7 +383,38 @@ function renderDirectoryTree() {
     }
   };
 
-  renderNode(state.rootDir, 0);
+  // v4: 主控制台是个人工作台，只展示当前用户目录。
+  // 如果 rootDirs 都属于同一个用户，直接把 nifi-data / real_nifi_data 作为顶层节点；
+  // 只有内部管理页等多用户场景才按用户名分组。
+  const userDirs = new Set();
+  state.rootDirs.forEach((r) => {
+    const parent = r.slice(0, r.lastIndexOf("/"));
+    if (parent) userDirs.add(parent);
+  });
+
+  if (userDirs.size <= 1) {
+    state.rootDirs.forEach((root) => renderNode(root, 0));
+  } else {
+    Array.from(userDirs).sort().forEach((userDir) => {
+      renderNode(userDir, 0);
+    });
+  }
+}
+
+function expandAllDirs() {
+  Object.keys(state.dirChildren).forEach((dir) => {
+    if ((state.dirChildren[dir] || []).length > 0) {
+      state.expandedDirs[dir] = true;
+    }
+  });
+  renderDirectoryTree();
+}
+
+function collapseAllDirs() {
+  Object.keys(state.dirChildren).forEach((dir) => {
+    state.expandedDirs[dir] = false;
+  });
+  renderDirectoryTree();
 }
 
 function filterFilesByCurrentDir() {
@@ -308,22 +431,22 @@ function filterFilesByCurrentDir() {
 }
 
 async function loadFiles() {
-  // Ensure backend rescans NiFi roots so deletions/additions are reflected
-  try {
-    await api("/internal/factory-tree/refresh", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ factory_id: DEFAULT_FACTORY_ID }),
-    });
-  } catch (e) {
-    // ignore refresh errors — we'll still try to load files
+  // v4: 后台触发 NiFi 根目录重扫描，不阻塞文件列表加载
+  const refreshPromise = api("/internal/factory-tree/refresh", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ username: _currentUsername(), factory_id: DEFAULT_FACTORY_ID }),
+  }).catch((e) => {
     console.warn("refresh scan failed:", e);
-  }
+  });
+
   const pageSize = 500;
   let pageNo = 1;
   const allRows = [];
   while (true) {
-    const res = await api(`/files?nifiOnly=true&pageNo=${pageNo}&pageSize=${pageSize}`);
+    const currentUsername = _currentUsername();
+    const userParam = currentUsername ? `&username=${encodeURIComponent(currentUsername)}` : "";
+    const res = await api(`/files?nifiOnly=true&pageNo=${pageNo}&pageSize=${pageSize}${userParam}`);
     if (res.code !== 0) return;
     const rows = res.data.rows || [];
     allRows.push(...rows);
@@ -333,7 +456,9 @@ async function loadFiles() {
   state.allFiles = allRows;
   buildDirectoryState(state.allFiles);
   if (!state.currentDir || !state.dirChildren[state.currentDir]) {
-    state.currentDir = state.rootDir;
+    // 默认选中第一个用户目录（包含 nifi-data / real_nifi_data）
+    const userDirs = Object.keys(state.dirChildren).filter((d) => state.rootDirs.some((r) => r.startsWith(d + "/")));
+    state.currentDir = userDirs[0] || state.rootDirs[0] || state.rootDir || "";
   }
   renderDirectoryTree();
   filterFilesByCurrentDir();
@@ -684,6 +809,7 @@ async function _loadPreview(fileId, { append = false } = {}) {
 
 function renderTagRules() {
   const select = document.getElementById("tagRuleSelect");
+  if (!select) return;
   select.innerHTML = "";
   state.tagRules.forEach((rule) => {
     const op = document.createElement("option");
@@ -810,6 +936,7 @@ async function triggerAutoTag() {
     const newFile = data.file;
     const newFileId = newFile.fileId || "";
     const newFileName = newFile.fileName || "";
+    const newStoragePath = newFile.storagePath || "";
     // 重要：自动打标会在 tagged_output/ 下生成新文件（新的 fileId），原文件不会被就地修改
     msg.innerHTML = "";
     msg.appendChild(document.createTextNode("自动标签完成（已生成新文件，原文件未修改）："));
@@ -818,6 +945,13 @@ async function triggerAutoTag() {
     const nameEl = document.createElement("div");
     nameEl.innerHTML = `<strong>${newFileName}</strong> <span class="muted">fileId:</span> <code>${newFileId}</code>`;
     wrap.appendChild(nameEl);
+    if (newStoragePath) {
+      const pathEl = document.createElement("div");
+      pathEl.className = "small";
+      pathEl.style.cssText = "margin-top:4px; color:#065f46; word-break:break-all;";
+      pathEl.innerHTML = `<span class="muted">存放路径:</span> <code>${escapeHtml(newStoragePath)}</code>`;
+      wrap.appendChild(pathEl);
+    }
     const btnRow = document.createElement("div");
     btnRow.style.cssText = "margin-top:6px; display:flex; gap:6px;";
     const previewBtn = document.createElement("button");
@@ -859,6 +993,171 @@ async function triggerAutoTag() {
   await loadFiles();
 }
 
+// ---------- 训练中心 ----------
+
+function renderTrainingCategories(categories) {
+  const select = document.getElementById("trainingCategoryFilter");
+  if (!select) return;
+  const current = select.value || "";
+  select.innerHTML = '<option value="">全部</option>';
+  (categories || []).forEach((cat) => {
+    const op = document.createElement("option");
+    op.value = cat.categoryId || "";
+    op.textContent = `${cat.categoryName || cat.categoryId || "未分类"} (${cat.fileCount || 0})`;
+    select.appendChild(op);
+  });
+  select.value = current;
+}
+
+function renderTrainingFiles(files) {
+  const tbody = document.getElementById("trainingFilesTable");
+  if (!tbody) return;
+  tbody.innerHTML = "";
+  state.trainingFiles = files || [];
+  if (!files || files.length === 0) {
+    tbody.innerHTML = '<tr><td colspan="7" class="empty">暂无训练文件，请先在文件中心上传/打标</td></tr>';
+    return;
+  }
+  files.forEach((f) => {
+    const tr = document.createElement("tr");
+    const tags = Array.isArray(f.tags) ? f.tags.join(", ") : (f.tags || "");
+    tr.innerHTML = `
+      <td><input type="checkbox" class="training-checkbox" data-file-id="${f.fileId}" /></td>
+      <td>${f.fileId}</td>
+      <td>${f.fileName}</td>
+      <td>${(f.fileType || "").toUpperCase()}</td>
+      <td>${f.fileSizeHuman || f.fileSize || "-"}</td>
+      <td>${tags}</td>
+      <td>${f.labelColumn || "-"}</td>
+    `;
+    tbody.appendChild(tr);
+  });
+}
+
+function getTrainingFilterParams() {
+  const categoryId = document.getElementById("trainingCategoryFilter")?.value || "";
+  const tag = document.getElementById("trainingTagFilter")?.value.trim() || "";
+  const keyword = document.getElementById("trainingKeywordFilter")?.value.trim() || "";
+  const params = new URLSearchParams();
+  params.set("page", "1");
+  params.set("size", "100");
+  if (categoryId) params.set("categoryId", categoryId);
+  if (tag) params.set("tag", tag);
+  if (keyword) params.set("keyword", keyword);
+  return params;
+}
+
+async function loadTrainingFiles() {
+  const status = document.getElementById("trainingStatus");
+  if (status) status.textContent = "加载中…";
+  const params = getTrainingFilterParams();
+  const res = await api(`/training/files?${params.toString()}`);
+  if (res.code !== 0) {
+    if (status) status.textContent = `加载失败：${res.message || res.code}`;
+    return;
+  }
+  renderTrainingCategories(res.data?.categories || []);
+  renderTrainingFiles(res.data?.files || []);
+  if (status) status.textContent = `共 ${res.data?.total || 0} 个文件`;
+}
+
+function getSelectedTrainingFileIds() {
+  const ids = [];
+  document.querySelectorAll("#trainingFilesTable .training-checkbox:checked").forEach((cb) => {
+    const fid = cb.dataset.fileId;
+    if (fid) ids.push(fid);
+  });
+  return ids;
+}
+
+function updateTrainingTaskPanel(task) {
+  const panel = document.getElementById("trainingTaskPanel");
+  const taskIdEl = document.getElementById("trainingTaskId");
+  const statusEl = document.getElementById("trainingTaskStatus");
+  const progressEl = document.getElementById("trainingTaskProgress");
+  const resultEl = document.getElementById("trainingTaskResult");
+  if (!panel || !taskIdEl || !statusEl || !progressEl) return;
+  panel.style.display = "block";
+  taskIdEl.textContent = task.taskId || "-";
+  statusEl.textContent = task.status || "-";
+  progressEl.textContent = task.progress || 0;
+  if (task.status === "completed" && task.result) {
+    resultEl.textContent = `模型版本: ${task.result.modelVersion || "-"}, 指标: ${JSON.stringify(task.result.metrics || {})}`;
+  } else if ((task.errors || []).length > 0) {
+    resultEl.textContent = `错误: ${task.errors.join("; ")}`;
+  } else {
+    resultEl.textContent = `已处理 ${task.processedFiles || 0} / ${task.totalFiles || 0} 个文件`;
+  }
+}
+
+async function pollTrainingTask(taskId) {
+  state.currentTrainingTaskId = taskId;
+  if (state.trainingTaskPollTimer) {
+    clearInterval(state.trainingTaskPollTimer);
+    state.trainingTaskPollTimer = null;
+  }
+  const doPoll = async () => {
+    const res = await api(`/training/tasks/${encodeURIComponent(taskId)}`);
+    if (res.code !== 0) {
+      updateTrainingTaskPanel({ taskId, status: "error", progress: 0, errors: [res.message || "查询失败"], totalFiles: 0, processedFiles: 0 });
+      stopTrainingPoll();
+      return;
+    }
+    updateTrainingTaskPanel(res.data);
+    const status = res.data?.status;
+    if (status === "completed" || status === "failed" || status === "error") {
+      stopTrainingPoll();
+    }
+  };
+  await doPoll();
+  state.trainingTaskPollTimer = setInterval(doPoll, 1000);
+}
+
+function stopTrainingPoll() {
+  if (state.trainingTaskPollTimer) {
+    clearInterval(state.trainingTaskPollTimer);
+    state.trainingTaskPollTimer = null;
+  }
+}
+
+async function submitTraining() {
+  const ids = getSelectedTrainingFileIds();
+  const status = document.getElementById("trainingStatus");
+  if (ids.length === 0) {
+    if (status) status.textContent = "请先选择训练文件";
+    return;
+  }
+  const modelName = document.getElementById("trainingModelName")?.value.trim() || "";
+  const paramsStr = document.getElementById("trainingParams")?.value.trim() || "";
+  let trainingParams = {};
+  if (paramsStr) {
+    try {
+      trainingParams = JSON.parse(paramsStr);
+    } catch (e) {
+      if (status) status.textContent = `训练参数 JSON 格式错误: ${e.message}`;
+      return;
+    }
+  }
+  if (status) status.textContent = "提交中…";
+  const payload = {
+    selectedFileIds: ids,
+    trainingConfig: Object.assign({ modelName: modelName || undefined }, trainingParams),
+  };
+  const res = await api("/training/submit", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  if (res.code !== 0) {
+    if (status) status.textContent = `提交失败：${res.message || res.code}`;
+    return;
+  }
+  if (status) status.textContent = `训练任务已创建: ${res.data?.taskId}, 接受 ${(res.data?.acceptedFiles || []).length} 个文件`;
+  if (res.data?.taskId) {
+    await pollTrainingTask(res.data.taskId);
+  }
+}
+
 function getScheduleSpecFromUi() {
   const freq = document.getElementById("dbScheduleFreq")?.value || "5m";
   const cron = document.getElementById("dbScheduleCron")?.value.trim() || "";
@@ -897,15 +1196,14 @@ function collectDbConfigForSchedule() {
 }
 
 const DB_TYPE_DEFAULTS = {
-  mysql: { host: '192.168.1.181', port: '3306', user: 'root', database: 'nifi', password: 'root' },
-  postgres: { host: '192.168.1.181', port: '5432', user: 'postgres', database: 'postgres', password: 'difyai123456' },
-  postgresql: { host: '192.168.1.181', port: '5432', user: 'postgres', database: 'postgres', password: 'difyai123456' },
-  sqlserver: { host: '192.168.1.181', port: '1433', user: 'sa', database: 'master', password: 'Your_password123' },
-  oracle: { host: '192.168.1.181', port: '1521', user: 'system', database: 'FREEPDB1', password: 'Oracle123456' },
+  mysql: { host: '202.113.76.55', port: '3306', user: 'root', database: 'nifi', password: 'root' },
+  postgresql: { host: '202.113.76.55', port: '5432', user: 'postgres', database: 'postgres', password: 'difyai123456' },
+  sqlserver: { host: '202.113.76.55', port: '1433', user: 'sa', database: 'master', password: 'Your_password123' },
+  oracle: { host: '202.113.76.55', port: '1521', user: 'system', database: 'FREEPDB1', password: 'Oracle123456' },
   sqlite: { host: '', port: '', user: '', database: '', password: '' },
-  hive: { host: '192.168.1.181', port: '10000', user: 'hive', database: 'default', password: '' },
-  hdfs: { host: '192.168.1.181', port: '9870', user: 'hadoop', database: '/', password: '', path: '/' },
-  hbase: { host: '192.168.1.181', port: '19090', user: 'root', database: 'default', password: '' },
+  hive: { host: '202.113.76.55', port: '10000', user: 'hive', database: 'default', password: '' },
+  hdfs: { host: '202.113.76.55', port: '9870', user: 'hadoop', database: '/', password: '', path: '/' },
+  hbase: { host: '202.113.76.55', port: '19090', user: 'root', database: 'default', password: '' },
 };
 
 function applyDbTypeDefaults() {
@@ -967,7 +1265,7 @@ function renderDbFields() {
       const hostEl = document.getElementById('dbHost');
       const portEl = document.getElementById('dbPort');
       const userEl = document.getElementById('dbUser');
-      if (hostEl && (!hostEl.value || ['192.168.1.181', '127.0.0.1', 'localhost'].includes(String(hostEl.value).trim()))) hostEl.value = '192.168.1.181';
+      if (hostEl && (!hostEl.value || ['202.113.76.55', '192.168.1.181', '127.0.0.1', 'localhost'].includes(String(hostEl.value).trim()))) hostEl.value = '202.113.76.55';
       if (portEl && (!portEl.value || ['3306', '5432', '1433', '1521', '10000', '9090', '9870', '19090'].includes(String(portEl.value).trim()))) portEl.value = '9870';
       if (userEl && (!userEl.value || ['root', 'hive', 'admin'].includes(String(userEl.value).trim()))) userEl.value = 'hadoop';
       // HDFS 通常不需要密码字段，隐藏 password input 与其 label（仅隐藏，不移除 DOM）
@@ -1152,6 +1450,7 @@ function buildSchedulePayload() {
   if (desc) payload.description = desc;
   return {
     job_name: `db_export_${table}_${Date.now()}`,
+    username: _currentUsername(),
     factory_id: DEFAULT_FACTORY_ID,
     owner_id: (state.currentUser && state.currentUser.username) || "user-001",
     schedule: spec,
@@ -1208,7 +1507,7 @@ function renderExportJobsRows(list) {
     tr.innerHTML = `
       <td>${job.id ?? "-"}</td>
       <td>${job.job_name || "-"}</td>
-      <td>${job.factory_id || DEFAULT_FACTORY_ID}</td>
+      <td>${job.username || job.factory_id || DEFAULT_USERNAME}</td>
       <td>${job.schedule || "-"}</td>
       <td>${(job.file_format || "-").toUpperCase()}</td>
       <td>${job.enabled ? "是" : "否"}</td>
@@ -1243,7 +1542,7 @@ function renderExportJobsRows(list) {
 }
 
 async function loadExportJobsForModal() {
-  const q = new URLSearchParams({ factory_id: DEFAULT_FACTORY_ID });
+  const q = new URLSearchParams({ username: _currentUsername(), factory_id: DEFAULT_FACTORY_ID });
   const res = await exportJobsApi(`/export-jobs?${q.toString()}`, { method: "GET" });
   if (res.code !== 0) {
     setScheduleMessage(`加载任务失败: ${res.message || "未知错误"}`, true);
@@ -1283,7 +1582,7 @@ async function triggerExportJob(id) {
   const body = {
     id: detail.data.id,
     job_name: detail.data.job_name,
-    factory_id: detail.data.factory_id || DEFAULT_FACTORY_ID,
+    factory_id: detail.data.factory_id || detail.data.username || DEFAULT_USERNAME,
     owner_id: detail.data.owner_id,
     db_config: detail.data.db_config,
     file_format: detail.data.file_format,
@@ -1306,6 +1605,10 @@ function bindEvents() {
   document.getElementById("loadFilesBtn").addEventListener("click", loadFiles);
   const purgeMissingBtn = document.getElementById("purgeMissingBtn");
   if (purgeMissingBtn) purgeMissingBtn.addEventListener("click", purgeMissingFiles);
+  const expandAllDirsBtn = document.getElementById("expandAllDirsBtn");
+  const collapseAllDirsBtn = document.getElementById("collapseAllDirsBtn");
+  if (expandAllDirsBtn) expandAllDirsBtn.addEventListener("click", expandAllDirs);
+  if (collapseAllDirsBtn) collapseAllDirsBtn.addEventListener("click", collapseAllDirs);
   document.getElementById("loadRulesBtn").addEventListener("click", loadTagRules);
   document.getElementById("autoTagBtn").addEventListener("click", triggerAutoTag);
   const addTagRuleBtn = document.getElementById("addTagRuleBtn");
@@ -1314,6 +1617,34 @@ function bindEvents() {
   const backendNifiBtn = document.getElementById("backendNifiBtn");
   if (backendLocalBtn) backendLocalBtn.addEventListener("click", () => setBackendMode("local"));
   if (backendNifiBtn) backendNifiBtn.addEventListener("click", () => setBackendMode("nifi"));
+
+  // 训练中心
+  const loadTrainingFilesBtn = document.getElementById("loadTrainingFilesBtn");
+  const submitTrainingBtn = document.getElementById("submitTrainingBtn");
+  const selectAllTraining = document.getElementById("selectAllTraining");
+  if (loadTrainingFilesBtn) loadTrainingFilesBtn.addEventListener("click", loadTrainingFiles);
+  if (submitTrainingBtn) submitTrainingBtn.addEventListener("click", submitTraining);
+  if (selectAllTraining) {
+    selectAllTraining.addEventListener("change", () => {
+      document.querySelectorAll("#trainingFilesTable .training-checkbox").forEach((cb) => {
+        cb.checked = selectAllTraining.checked;
+      });
+    });
+  }
+  ["trainingCategoryFilter", "trainingTagFilter", "trainingKeywordFilter"].forEach((id) => {
+    const el = document.getElementById(id);
+    if (el) {
+      el.addEventListener("change", loadTrainingFiles);
+      el.addEventListener("keyup", (e) => { if (e.key === "Enter") loadTrainingFiles(); });
+    }
+  });
+
+  // v4: 退出登录
+  const logoutBtn = document.getElementById("logoutBtn");
+  if (logoutBtn) logoutBtn.addEventListener("click", doLogout);
+
+  // v4: 显示当前用户
+  try { renderCurrentUserLabel(); } catch (e) {}
 
   // DB export UI
   const dbTestBtn = document.getElementById("dbTestBtn");
@@ -1372,12 +1703,38 @@ function bindEvents() {
 }
 
 async function init() {
+  // v4: 通过 /api/v1/auth/me 验证登录态；access_token 是 HttpOnly cookie，
+  // JavaScript 无法读取 document.cookie，必须依赖后端接口判断。
   try {
-    const savedMode = localStorage.getItem(BACKEND_MODE_STORAGE_KEY);
-    if (savedMode) {
-      state.backendMode = savedMode === "nifi" ? "nifi" : "local";
+    const me = await fetch("/api/v1/auth/me", { credentials: "include" });
+    if (!me.ok) {
+      window.location.href = "/login.html?next=" + encodeURIComponent(window.location.pathname + window.location.search);
+      return;
     }
-  } catch (_) {}
+    const meJson = await me.json().catch(() => null);
+    if (meJson && (meJson.user || meJson.username)) {
+      window.currentUser = meJson.user || { username: meJson.username, is_admin: !!meJson.is_admin };
+      state.currentUser = window.currentUser;
+      // v4: 存储 token 过期时间，用于会话过期提醒
+      if (meJson.user && meJson.user.expires_at) {
+        state.sessionExpiresAt = meJson.user.expires_at;
+      }
+      // 存储用户信息到 localStorage 供后续使用
+      try { localStorage.setItem('currentUser', JSON.stringify(window.currentUser)); } catch (e) {}
+    } else {
+      window.location.href = "/login.html?next=" + encodeURIComponent(window.location.pathname + window.location.search);
+      return;
+    }
+  } catch (e) {
+    window.location.href = "/login.html?next=" + encodeURIComponent(window.location.pathname + window.location.search);
+    return;
+  }
+
+  // v4: 设置会话过期提醒
+  setupSessionExpiryWarning();
+
+  // v4: 不读取 localStorage，直接从后端获取当前用户的模式配置
+  // 避免 localStorage 中持久化的旧值导致 UI 闪现错误的模式
   try {
     const res = await getBackendModeState();
     if (res && res.code === 0 && res.data && res.data.mode) {
@@ -1390,32 +1747,11 @@ async function init() {
   loadFiles();
   loadTagRules();
 
-  // Check current user to decide whether to show internal management link
-  (async function checkCurrentUser(){
-    try{
-      const res = await api('/auth/me');
-      // normalize responses from different backend shapes
-      const user = (res && res.user) || (res && res.data && res.data.user) || (res && res.data) || null;
-      if (user) {
-        state.currentUser = user;
-        try { localStorage.setItem('currentUser', JSON.stringify(user)); } catch (e) {}
-        if (user.is_admin) {
-          const a = document.getElementById('internalLink');
-          if(a) a.style.display = '';
-        }
-      } else {
-        // fallback: try from localStorage
-        try {
-          const raw = localStorage.getItem('currentUser');
-          if (raw) state.currentUser = JSON.parse(raw);
-        } catch (e) {}
-      }
-    }catch(e){
-      // not logged in or error: clear cached user
-      try { localStorage.removeItem('currentUser'); } catch (e) {}
-      state.currentUser = null;
-    }
-  })();
+  // 显示内部管理链接（仅管理员）
+  if (state.currentUser && state.currentUser.is_admin) {
+    const a = document.getElementById('internalLink');
+    if(a) a.style.display = '';
+  }
 }
 
 async function testDbConnection() {
@@ -1673,4 +2009,83 @@ if (fileInput && uploadBtn && uploadResult) {
       uploadResult.textContent = `上传异常：${e}`;
     }
   };
+}
+
+// === v4: 登录相关辅助 ===
+async function doLogout() {
+  if (!confirm("确定退出登录？")) return;
+  try {
+    await fetch("/api/v1/auth/logout", { method: "POST", credentials: "include" });
+  } catch (e) {
+    // ignore
+  }
+  try { localStorage.removeItem(BACKEND_MODE_STORAGE_KEY); } catch (_) {}
+  window.location.href = "/login.html";
+}
+
+function renderCurrentUserLabel() {
+  const el = document.getElementById("currentUserLabel");
+  if (!el) return;
+  const u = window.currentUser || (state && state.currentUser);
+  if (u && u.username) {
+    const adminTag = u.is_admin ? " (管理员)" : "";
+    el.textContent = "当前用户：" + u.username + adminTag;
+  } else {
+    el.textContent = "";
+  }
+}
+
+// v4: 会话过期提醒（过期前 5 分钟弹窗）
+let _sessionWarningTimer = null;
+let _sessionWarningShown = false;
+
+function setupSessionExpiryWarning() {
+  if (_sessionWarningTimer) {
+    clearTimeout(_sessionWarningTimer);
+    _sessionWarningTimer = null;
+  }
+  _sessionWarningShown = false;
+  const expiresAt = (state && state.sessionExpiresAt);
+  if (!expiresAt) return;
+  const nowSec = Math.floor(Date.now() / 1000);
+  const remainingSec = expiresAt - nowSec;
+  const WARNING_BEFORE_SEC = 5 * 60; // 5 分钟
+  if (remainingSec <= WARNING_BEFORE_SEC) {
+    // 已经快过期了，直接提示
+    showSessionExpiryWarning();
+    return;
+  }
+  const delayMs = (remainingSec - WARNING_BEFORE_SEC) * 1000;
+  _sessionWarningTimer = setTimeout(() => {
+    showSessionExpiryWarning();
+  }, delayMs);
+}
+
+function showSessionExpiryWarning() {
+  if (_sessionWarningShown) return;
+  _sessionWarningShown = true;
+  const ok = confirm("会话即将过期（5 分钟内），是否延长会话？\n\n点击「确定」延长 15 分钟，点击「取消」将跳转到登录页。");
+  if (ok) {
+    refreshSession();
+  } else {
+    window.location.href = "/login.html";
+  }
+}
+
+async function refreshSession() {
+  try {
+    const resp = await fetch("/api/v1/auth/refresh", { method: "POST", credentials: "include" });
+    if (resp.ok) {
+      const j = await resp.json().catch(() => null);
+      if (j && j.expires_at) {
+        state.sessionExpiresAt = j.expires_at;
+      }
+      _sessionWarningShown = false;
+      setupSessionExpiryWarning();
+    } else {
+      window.location.href = "/login.html";
+    }
+  } catch (e) {
+    window.location.href = "/login.html";
+  }
 }

@@ -28,9 +28,37 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 GENERATED = BASE_DIR / "data" / "generated"
 MANIFEST = GENERATED / "silent_export_manifest.json"
 CONFIG = GENERATED / "silent_export_config.json"
-NIFI_SILENT_DIR = Path("/home/yhz/nifi-data") / "silent_exports"
+NIFI_SILENT_DIR = Path("/home/yhz/nifi-data") / "silent_exports"  # deprecated — v4 使用 _get_silent_export_dir
 SILENT_EXPORT_TMP_DIRNAME = "tmp"
 DEFAULT_SCHEDULE = os.getenv("SILENT_EXPORT_SCHEDULE", "daily")
+IN_DATA_BASE_DIR = Path(os.getenv("IN_DATA_BASE_DIR", "/home/yhz"))
+
+
+def _normalize_username(value: Optional[str]) -> str:
+    """v4: 标准化用户名。"""
+    v = (value or "").strip().lower()
+    return v if v else "admin"
+
+
+def _get_silent_export_dir(username: str) -> Path:
+    """v4: 返回用户 silent_exports 目录，自动创建，支持私有化 ceph_endpoint。"""
+    from .db_models import IotUser, get_engine
+    from sqlalchemy.orm import sessionmaker
+    db_path = Path(__file__).resolve().parent.parent / "data" / "app.db"
+    engine = get_engine(db_path)
+    SessionLocal = sessionmaker(bind=engine)
+    session = SessionLocal()
+    try:
+        user = session.query(IotUser).filter(IotUser.username == username).first()
+        if user and user.deployment_mode == "private" and user.ceph_endpoint:
+            base = Path(user.ceph_endpoint)
+        else:
+            base = IN_DATA_BASE_DIR / _normalize_username(username)
+    finally:
+        session.close()
+    root = base / "nifi-data" / "silent_exports"
+    root.mkdir(parents=True, exist_ok=True)
+    return root
 
 
 # ── manifest ──────────────────────────────────────────────────────────
@@ -173,7 +201,7 @@ def _write_csv(path: Path, columns: List[str], rows: List[Dict[str, Any]]) -> No
 
 def _export_table(engine, tenant: str, db_key: str, table: str,
                   marker_col: Optional[str], last_marker) -> Optional[dict]:
-    out_dir = NIFI_SILENT_DIR / tenant / db_key
+    out_dir = _get_silent_export_dir(tenant) / db_key
     tmp_dir = out_dir / SILENT_EXPORT_TMP_DIRNAME
     out_dir.mkdir(parents=True, exist_ok=True)
     tmp_dir.mkdir(parents=True, exist_ok=True)

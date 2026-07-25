@@ -1,12 +1,14 @@
 """
-meta_json.py  – 标签配置文件读写模块（Local 后端专用）
+meta_json.py  – 标签配置文件读写模块（V3 xattr 集成版）
 
-为每个数据文件提供配套 .meta.json 配置文件的读写能力。
+Linux 生产环境：自动使用 xattr + AES-256-GCM 加密存储，同时写 .meta.json 备份。
+macOS/Windows 开发环境：自动降级为纯 .meta.json 文件存储。
 所有读写均基于标准文件系统，不依赖任何特殊文件系统特性。
 """
 
 import json
 import os
+import sys as _sys
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -17,14 +19,23 @@ try:
 except ImportError:
     from backports.zoneinfo import ZoneInfo
 
+# ---------- xattr 集成 ----------
+
+meta_xattr = None  # type: ignore
+try:
+    from . import meta_xattr as _meta_xattr
+    meta_xattr = _meta_xattr
+except Exception:
+    pass
+
 META_SUFFIX = ".meta.json"
 
 # ---------- 目录常量 ----------
 
-NIFI_BASE_DIR = Path(os.getenv("NIFI_BASE_DIR", "/home/yhz/nifi-data"))
-TAGGED_OUTPUT_DIR = Path(os.getenv("TAGGED_OUTPUT_DIR", "/home/yhz/nifi-data/tagged_output"))
+NIFI_BASE_DIR = Path(os.getenv("NIFI_BASE_DIR", "/home/yhz/nifi-data"))  # deprecated — v4 使用 _get_user_nifi_dir(username)
+TAGGED_OUTPUT_DIR = Path(os.getenv("TAGGED_OUTPUT_DIR", "/home/yhz/nifi-data/tagged_output"))  # deprecated — v4 使用 _get_user_nifi_dir(username, "tagged_output")
 
-# 确保目录存在
+# 确保目录存在（兼容旧路径）
 NIFI_BASE_DIR.mkdir(parents=True, exist_ok=True)
 TAGGED_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -87,30 +98,57 @@ def data_file_from_meta(meta_path: str) -> str:
     return meta_path
 
 
-# ---------- 核心读写 ----------
+# ---------- 平台与密钥检测 ----------
 
-# 版本备份配置
-META_BACKUP_DIR = Path(os.getenv("META_BACKUP_DIR", str(NIFI_BASE_DIR / "meta_backups")))
-META_BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+_using_xattr: bool = False
+try:
+    if meta_xattr and _sys.platform == "linux" and hasattr(os, "setxattr") and meta_xattr.is_available():
+        # 仅当已配置固定密钥时才真正启用 xattr 加密，避免开发环境随机密钥导致数据不可读
+        if os.environ.get("META_XATTR_KEY"):
+            _using_xattr = True
+except Exception:
+    pass
+
+
+# ---------- 版本备份配置 ----------
+
+def _meta_backup_dir_for(file_path: str) -> Path:
+    """根据数据文件路径返回对应的 meta 备份目录。
+
+    优先使用用户目录下的 meta_backups/，无法推导时回退到全局目录。
+    """
+    try:
+        p = Path(file_path).resolve()
+        parts = p.parts
+        # /home/yhz/{username}/... -> /home/yhz/{username}/meta_backups
+        if len(parts) >= 4 and parts[0] == "/" and parts[1] == "home" and parts[2] == "yhz":
+            user_root = Path(*parts[:4])  # /home/yhz/{username}
+            return user_root / "meta_backups"
+    except Exception:
+        pass
+    return Path(os.getenv("META_BACKUP_DIR", str(NIFI_BASE_DIR / "meta_backups")))
+
+
 MAX_BACKUP_VERSIONS = int(os.getenv("META_BACKUP_MAX_VERSIONS", "5"))
 
 
 def _backup_meta(file_path: str) -> None:
-    """修改 meta 前自动备份旧版本。"""
-    mp = Path(meta_path(file_path))
-    if not mp.exists():
+    """修改 meta 前自动备份旧版本（兼容 xattr 和 .meta.json）。"""
+    try:
+        old_meta = read_meta(file_path)
+    except Exception:
         return
-    # 备份文件命名: {fileId}_{timestamp}.meta.json
-    old_meta = json.loads(mp.read_text(encoding="utf-8"))
     fid = old_meta.get("fileId", "unknown")
     ts = _now_ts()
     backup_name = f"{fid}_{ts}.meta.json"
-    backup_path = META_BACKUP_DIR / backup_name
-    backup_path.write_text(mp.read_text(encoding="utf-8"))
+    backup_dir = _meta_backup_dir_for(file_path)
+    backup_path = backup_dir / backup_name
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    backup_path.write_text(json.dumps(old_meta, ensure_ascii=False, indent=2), encoding="utf-8")
     # 清理旧备份，每个 fileId 最多保留 MAX_BACKUP_VERSIONS 个
     try:
         backups = sorted(
-            [f for f in META_BACKUP_DIR.iterdir() if f.name.startswith(f"{fid}_")],
+            [f for f in backup_dir.iterdir() if f.name.startswith(f"{fid}_")],
             key=lambda f: f.stat().st_mtime,
             reverse=True,
         )
@@ -123,14 +161,26 @@ def _backup_meta(file_path: str) -> None:
 def _find_meta_path(file_path: str) -> Optional[str]:
     """查找数据文件对应的 meta 文件路径（兼容新旧命名）。
 
-    优先查找新命名（file.meta.json），回退查找旧命名（file.csv.meta.json）。
+    xattr 模式下：只要 xattr 中存在元数据即返回 meta_path（用于兼容性检查）。
+    .meta.json 模式下：优先查找新命名，回退查找旧命名。
     """
-    p = Path(file_path)
-    # 新命名：file.meta.json
+    if _using_xattr:
+        # xattr 模式：直接检查 xattr 是否存在
+        if meta_xattr.has_meta(file_path):
+            return meta_path(file_path)
+        # 回退：检查是否有 .meta.json 文件（迁移前遗留或备份）
+        new_path = meta_path(file_path)
+        if Path(new_path).exists():
+            return new_path
+        old_path = f"{file_path}{META_SUFFIX}"
+        if Path(old_path).exists():
+            return old_path
+        return None
+
+    # 纯 .meta.json 模式
     new_path = meta_path(file_path)
     if Path(new_path).exists():
         return new_path
-    # 旧命名：file.csv.meta.json（兼容已有文件）
     old_path = f"{file_path}{META_SUFFIX}"
     if Path(old_path).exists():
         return old_path
@@ -138,43 +188,86 @@ def _find_meta_path(file_path: str) -> Optional[str]:
 
 
 def write_meta(file_path: str, meta: Dict[str, Any]) -> None:
-    """将元数据写入 .meta.json 配置文件（新命名规则）。
+    """将元数据写入存储。
 
-    如果存在旧命名的 meta 文件，会先读取备份后删除，再写入新命名文件。
+    xattr 模式：AES-256-GCM 加密写入 xattr，同时写 .meta.json 备份。
+    .meta.json 模式：写入 .meta.json 配置文件。
     """
-    path = Path(meta_path(file_path))
-    path.parent.mkdir(parents=True, exist_ok=True)
     # 写入前备份旧版本（兼容旧命名）
     existing = _find_meta_path(file_path)
     if existing:
         _backup_meta(file_path)
-        # 如果是旧命名文件，写入新命名后删除旧的
-        if existing != str(path):
+        if existing != meta_path(file_path):
             try:
                 Path(existing).unlink(missing_ok=True)
             except Exception:
                 pass
+
+    if _using_xattr:
+        # 主存储：xattr 加密写入
+        meta_xattr.write_meta(file_path, meta)
+
+    # 始终写入 .meta.json 作为可读备份与灾难恢复
+    path = Path(meta_path(file_path))
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def read_meta(file_path: str) -> Dict[str, Any]:
-    """读取配套 .meta.json 配置文件中的元数据（兼容新旧命名）。"""
+    """读取元数据。
+
+    xattr 模式：优先从 xattr 解密读取，失败则回退到 .meta.json。
+    .meta.json 模式：从 .meta.json 文件读取。
+    """
+    if _using_xattr:
+        try:
+            return meta_xattr.read_meta(file_path)
+        except Exception:
+            # xattr 读取失败，尝试回退到 .meta.json
+            found = _find_meta_path(file_path)
+            if found and Path(found).exists():
+                return json.loads(Path(found).read_text(encoding="utf-8"))
+            raise FileNotFoundError(f"配置文件不存在: {meta_path(file_path)}")
+
     found = _find_meta_path(file_path)
     if not found:
         raise FileNotFoundError(f"配置文件不存在: {meta_path(file_path)}")
     return json.loads(Path(found).read_text(encoding="utf-8"))
 
 
+def is_xattr_enabled() -> bool:
+    """返回当前是否启用了 xattr（Linux + 已配置固定密钥）。"""
+    return _using_xattr
+
+
 def has_meta(file_path: str) -> bool:
-    """检查文件是否存在配套 .meta.json 配置文件（兼容新旧命名）。"""
+    """检查文件是否存在元数据。
+
+    xattr 模式：优先检查 xattr，回退到 .meta.json。
+    .meta.json 模式：检查 .meta.json 文件。
+    """
+    if _using_xattr:
+        if meta_xattr.has_meta(file_path):
+            return True
+        # 回退：检查 .meta.json 文件
+        return _find_meta_path(file_path) is not None
+
     return _find_meta_path(file_path) is not None
 
 
 def delete_meta(file_path: str) -> None:
-    """删除配套 .meta.json 配置文件（兼容新旧命名）。"""
-    found = _find_meta_path(file_path)
-    if found:
-        Path(found).unlink()
+    """删除元数据（同时删除 xattr 和 .meta.json）。"""
+    if _using_xattr:
+        try:
+            meta_xattr.delete_meta(file_path)
+        except Exception:
+            pass
+    # 同时删除 .meta.json 文件（含旧命名）
+    for candidate in [meta_path(file_path), f"{file_path}{META_SUFFIX}"]:
+        try:
+            Path(candidate).unlink(missing_ok=True)
+        except Exception:
+            pass
 
 
 # ---------- 工具函数 ----------
@@ -375,15 +468,16 @@ def is_tagged_file(file_path: str) -> bool:
 is_tagged_path = is_tagged_file
 
 
-def target_dir_for_has_tag(has_tag: bool) -> Path:
+def target_dir_for_has_tag(has_tag: bool, base_dir: Optional[Path] = None) -> Path:
     """根据 hasTag 决定目标目录。
 
     - hasTag=true  → TAGGED_OUTPUT_DIR（标签目录）
     - hasTag=false → NIFI_BASE_DIR / output_csv（普通目录）
+    v4: 可通过 base_dir 指定用户存储根目录的 nifi-data 路径。
     """
     if has_tag:
-        return TAGGED_OUTPUT_DIR
-    return NIFI_BASE_DIR / "output_csv"
+        return (base_dir / "tagged_output") if base_dir else TAGGED_OUTPUT_DIR
+    return (base_dir / "output_csv") if base_dir else NIFI_BASE_DIR / "output_csv"
 
 
 # ---------- 摘要提取 ----------
@@ -440,10 +534,10 @@ def migrate_all(
     scan_dirs: Optional[List[Path]] = None,
     dry_run: bool = False,
 ) -> Dict[str, Any]:
-    """为所有数据文件批量生成 .meta.json 配置文件。
+    """为所有数据文件批量补齐元数据。
 
-    遍历指定目录下所有数据文件（CSV/JSON/TSV），为缺少 .meta.json 的文件
-    创建基本元数据。已存在的配置文件不会被覆盖。
+    Linux + xattr 模式下会写入扩展属性；其他平台继续写 sidecar `.meta.json`。
+    遍历指定目录下所有数据文件（CSV/JSON/TSV），为缺少元数据的文件创建基础记录。
 
     Args:
         scan_dirs: 需要扫描的目录列表，默认扫描所有已知数据目录。
@@ -555,25 +649,36 @@ def migrate_all(
 # ---------- 完整性校验 ----------
 
 def check_integrity(base_dir: Optional[Path] = None) -> Dict[str, Any]:
-    """校验数据文件与 .meta.json 的完整性。
+    """校验数据文件与元数据的完整性。
 
     检测：
-    - 有数据文件但没有 meta 的（孤儿文件）
-    - 有 meta 但没有数据文件的（孤儿 meta）
+    - 有数据文件但没有可读元数据的（孤儿文件）
+    - 遗留 `.meta.json` 存在但数据文件不存在的（孤儿 meta）
+    - 元数据存在但无法读取/解密的（损坏或密钥不匹配）
 
     Args:
         base_dir: 要扫描的目录，默认 NIFI_BASE_DIR。
 
     Returns:
-        {"orphan_files": [...], "orphan_metas": [...], "total_data_files": int, "total_meta_files": int}
+        {
+            "orphan_files": [...],
+            "orphan_metas": [...],
+            "unreadable_meta": [...],
+            "total_data_files": int,
+            "total_meta_files": int,
+            "xattr_enabled": bool,
+            "xattr_files": int,
+        }
     """
     if base_dir is None:
         base_dir = NIFI_BASE_DIR
 
     orphan_files: List[str] = []
     orphan_metas: List[str] = []
+    unreadable_meta: List[Dict[str, str]] = []
     total_data_files = 0
     total_meta_files = 0
+    xattr_files = 0
 
     for file_path in base_dir.rglob("*"):
         if not file_path.is_file():
@@ -590,12 +695,22 @@ def check_integrity(base_dir: Optional[Path] = None) -> Dict[str, Any]:
             total_data_files += 1
             if not has_meta(str(file_path)):
                 orphan_files.append(str(file_path))
+                continue
+            if _using_xattr:
+                xattr_files += 1
+            try:
+                read_meta(str(file_path))
+            except Exception as exc:
+                unreadable_meta.append({"file": str(file_path), "error": str(exc)})
 
     return {
         "orphan_files": orphan_files,
         "orphan_metas": orphan_metas,
+        "unreadable_meta": unreadable_meta,
         "total_data_files": total_data_files,
         "total_meta_files": total_meta_files,
+        "xattr_enabled": _using_xattr,
+        "xattr_files": xattr_files,
     }
 
 

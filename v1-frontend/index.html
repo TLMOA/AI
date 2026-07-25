@@ -15,12 +15,15 @@
           <p>简化可改造版（JetLinks联调开关默认关闭）</p>
           <p>
             <a id="internalLink" href="./internal.html" target="_blank" rel="noopener" style="display:none">打开内部管理页（单工厂）</a>
+            <a href="./tasks.html" style="margin-left:12px;font-size:13px;color:#2563eb;display:inline-block;padding:4px 8px;border:1px solid #bfdbfe;border-radius:6px;background:#eff6ff;text-decoration:none;">任务中心</a>
           </p>
         </div>
         <div class="backend-switcher" style="display:flex;align-items:center;gap:8px;">
+          <span class="small" id="currentUserLabel" style="color:#475569;"></span>
           <span class="small" id="backendModeLabel">当前后端：Local</span>
           <button id="backendLocalBtn" type="button" class="secondary">Local</button>
           <button id="backendNifiBtn" type="button" class="secondary">NiFi</button>
+          <button id="logoutBtn" type="button" class="secondary" style="background:#ef4444;color:#fff;border-color:#ef4444;">退出登录</button>
         </div>
       </div>
     </header>
@@ -50,7 +53,7 @@
       </div>
       <div class="row">
         <label>Host</label>
-        <input id="dbHost" type="text" value="192.168.1.181" />
+        <input id="dbHost" type="text" value="202.113.76.55" />
         <label>Port</label>
         <input id="dbPort" type="number" value="3306" />
       </div>
@@ -176,7 +179,11 @@
       </div>
       <div class="row">
         <div style="min-width:280px;max-width:360px;flex:1;">
-          <h3 style="margin:0 0 8px 0;">目录树（nifi-data）</h3>
+          <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px;">
+            <h3 style="margin:0;">目录树</h3>
+            <button id="expandAllDirsBtn" type="button" class="secondary small">全部展开</button>
+            <button id="collapseAllDirsBtn" type="button" class="secondary small">全部折叠</button>
+          </div>
           <div id="fileTree" class="small" style="max-height:260px;overflow:auto;border:1px solid #ddd;padding:8px;"></div>
         </div>
         <div style="flex:2;min-width:520px;">
@@ -332,8 +339,44 @@
       <p id="uploadHint">六条转换已独立：CSV->JSON、JSON->CSV、CSV->TSV、TSV->CSV、JSON->TSV、TSV->JSON；每次只执行一条转换并写入对应目录。若源文件无表头，请填写“无表头时列名”。</p>
       <p id="uploadResult"></p>
     </section>
+
+    <section class="card">
+      <h2>训练中心</h2>
+      <div class="row">
+        <button id="loadTrainingFilesBtn">刷新训练文件</button>
+        <button id="submitTrainingBtn" class="primary">提交训练</button>
+        <span id="trainingStatus" class="muted"></span>
+      </div>
+      <div class="row">
+        <label>类别筛选</label>
+        <select id="trainingCategoryFilter"><option value="">全部</option></select>
+        <label>标签筛选</label>
+        <input id="trainingTagFilter" type="text" placeholder="标签名" />
+        <label>关键词</label>
+        <input id="trainingKeywordFilter" type="text" placeholder="文件名/描述" />
+      </div>
+      <div id="trainingFilesWrapper">
+        <table>
+          <thead>
+            <tr><th><input type="checkbox" id="selectAllTraining" /></th><th>fileId</th><th>文件名</th><th>类型</th><th>大小</th><th>标签</th><th>标签列</th></tr>
+          </thead>
+          <tbody id="trainingFilesTable"><tr><td colspan="7" class="empty">请点击“刷新训练文件”</td></tr></tbody>
+        </table>
+      </div>
+      <div class="row" style="margin-top:12px;">
+        <label>模型名称（可选）</label>
+        <input id="trainingModelName" type="text" placeholder="如 设备故障检测模型" />
+        <label>训练参数（可选 JSON）</label>
+        <input id="trainingParams" type="text" placeholder='{"epochs": 10}' />
+      </div>
+      <div id="trainingTaskPanel" style="display:none; margin-top:12px; padding:12px; background:#f0fdf4; border:1px solid #bbf7d0; border-radius:6px;">
+        <strong>训练任务：<span id="trainingTaskId"></span></strong>
+        <div>状态：<span id="trainingTaskStatus"></span> / 进度：<span id="trainingTaskProgress"></span>%</div>
+        <div id="trainingTaskResult" class="muted"></div>
+      </div>
+    </section>
   </div>
-  <script src="./config.js?v=20260525_1"></script>
-  <script src="./app.js?v=20260525_1"></script>
+  <script src="./config.js?v=20260725_1"></script>
+  <script src="./app.js?v=20260725_1"></script>
 </body>
 </html>

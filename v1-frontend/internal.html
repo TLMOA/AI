@@ -109,17 +109,29 @@
 <body>
   <div class="app">
     <header>
-      <h1>内部管理页</h1>
-      <p>工厂归档中心（in_data）</p>
-      <p><a href="./index.html" rel="noopener">返回主控制台</a></p>
+      <div class="row" style="justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;">
+        <div>
+          <h1>内部管理页</h1>
+          <p>工厂归档中心（in_data）</p>
+          <p><a href="./index.html" rel="noopener">返回主控制台</a></p>
+        </div>
+        <div style="display:flex;align-items:center;gap:12px;">
+          <span class="small" id="currentUserLabel" style="color:#475569;"></span>
+          <button id="logoutBtn" type="button" class="secondary" style="background:#ef4444;color:#fff;border-color:#ef4444;">退出登录</button>
+        </div>
+      </div>
     </header>
 
     <section class="card">
       <div class="row">
-        <label>工厂</label>
-        <select id="factorySelect"></select>
+        <label>切换用户</label>
+        <select id="userSelect"></select>
+        <button id="pullBtn" class="secondary" style="display:none;">拉取数据</button>
         <button id="refreshBtn">刷新</button>
         <span id="statusMsg" class="muted"></span>
+      </div>
+      <div class="row" style="margin-top:4px;">
+        <span id="userInfo" class="muted"></span>
       </div>
     </section>
 
@@ -198,9 +210,72 @@
         </div>
       </div>
     </section>
+
+    <section class="card" id="xattrMetaSection" style="margin-top:16px;">
+      <h3>文件元数据（xattr）</h3>
+      <p class="small muted">展示文件扩展属性中存储的配置信息，仅管理员可查看。</p>
+      <div class="row">
+        <label>当前选中文件</label>
+        <input id="xattrSelectedFileId" type="text" placeholder="在文件列表点击“预览”选择文件" readonly style="flex:1;" />
+        <button id="xattrLoadBtn" type="button" class="secondary">加载 xattr</button>
+      </div>
+      <div id="xattrStatus" class="small muted" style="margin-top:8px;"></div>
+      <div id="xattrMetaContent" style="margin-top:12px; background:#f8fafc; border:1px solid #e2e8f0; border-radius:6px; padding:12px; max-height:360px; overflow:auto;">
+        <div class="muted">请选择文件后点击“加载 xattr”。</div>
+      </div>
+    </section>
+
+    <section class="card" id="userManagementSection" style="margin-top:16px;">
+      <h3>用户管理</h3>
+      <div class="row" style="margin-bottom:8px; gap:8px;">
+        <button id="userMgmtRefreshBtn" class="secondary">刷新列表</button>
+        <span id="userMgmtStatus" class="muted"></span>
+      </div>
+      <div class="file-table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>用户名</th><th>管理员</th><th>部署模式</th><th>Ceph 路径</th><th>创建时间</th><th>操作</th>
+            </tr>
+          </thead>
+          <tbody id="userMgmtBody"></tbody>
+        </table>
+      </div>
+      <!-- 编辑部署模式弹窗 -->
+      <div id="editDeploymentModal" style="display:none; position:fixed; top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.4);z-index:999; align-items:center;justify-content:center;">
+        <div style="background:#fff; padding:24px; border-radius:8px; width:420px; max-width:92%;">
+          <h3>修改部署模式</h3>
+          <div class="form-group">
+            <label>用户名</label>
+            <input id="editDeployUsername" type="text" readonly style="background:#f5f5f5;">
+          </div>
+          <div class="form-group">
+            <label>部署模式</label>
+            <div style="display:flex; gap:14px;">
+              <label style="font-weight:400; cursor:pointer;">
+                <input type="radio" name="editDeployMode" value="public" checked> 公有化
+              </label>
+              <label style="font-weight:400; cursor:pointer;">
+                <input type="radio" name="editDeployMode" value="private"> 私有化
+              </label>
+            </div>
+          </div>
+          <div class="form-group" id="editCephGroup">
+            <label>Ceph 路径</label>
+            <input id="editCephEndpoint" type="text" placeholder="/home/yhz/ceph/factory_x">
+          </div>
+          <div class="row" style="gap:8px; margin-top:12px;">
+            <button id="editDeploySave" class="primary">保存</button>
+            <button id="editDeployCancel" class="secondary">取消</button>
+          </div>
+          <div id="editDeployError" class="error" style="display:none; margin-top:8px;"></div>
+        </div>
+      </div>
+    </section>
+
   </div>
 
-  <script src="./config.js?v=20260525_1"></script>
-  <script src="./internal.js?v=20260525_1"></script>
+  <script src="./config.js?v=20260725_1"></script>
+  <script src="./internal.js?v=20260725_1"></script>
 </body>
 </html>

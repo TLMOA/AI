@@ -153,13 +153,23 @@ def build_output_path(source_fmt: str, target_fmt: str, file_name: str, ts: str)
     return out_dir / out_name
 
 
-def write_status(status_dir: Path, job_id: str, state: str, message: str = "", outputs: List[str] = None):
+def write_status(
+    status_dir: Path,
+    job_id: str,
+    state: str,
+    message: str = "",
+    outputs: List[str] = None,
+    username: str = "",
+    owner_id: str = "",
+):
     status_dir.mkdir(parents=True, exist_ok=True)
     payload = {
         "jobId": job_id,
         "status": state,
         "message": message,
         "outputFiles": outputs or [],
+        "username": username,
+        "ownerId": owner_id,
         "finishedAt": now_iso(),
     }
     (status_dir / f"{job_id}.json").write_text(
@@ -183,12 +193,21 @@ def main():
     src_fmt    = task.get("sourceFormat", "CSV")
     targets    = task.get("targetFormats", [])
     file_name  = task.get("fileName", "upload")
+    username   = task.get("username", "")
+    owner_id   = task.get("ownerId", "")
     ts         = datetime.now().strftime("%Y%m%d_%H%M%S")
 
     try:
         rows = read_file(source, src_fmt)
     except Exception as e:
-        write_status(STATUS_ERROR, job_id, "FAILED", f"read source failed: {e}\n{traceback.format_exc()}")
+        write_status(
+            STATUS_ERROR,
+            job_id,
+            "FAILED",
+            f"read source failed: {e}\n{traceback.format_exc()}",
+            username=username,
+            owner_id=owner_id,
+        )
         sys.exit(1)
 
     outputs = []
@@ -198,11 +217,25 @@ def main():
             write_file(out_path, target_fmt, rows)
             outputs.append(str(out_path))
         except Exception as e:
-            write_status(STATUS_ERROR, job_id, "FAILED",
-                         f"convert to {target_fmt} failed: {e}\n{traceback.format_exc()}")
+            write_status(
+                STATUS_ERROR,
+                job_id,
+                "FAILED",
+                f"convert to {target_fmt} failed: {e}\n{traceback.format_exc()}",
+                username=username,
+                owner_id=owner_id,
+            )
             sys.exit(1)
 
-    write_status(STATUS_DONE, job_id, "SUCCEEDED", f"converted {src_fmt} to {', '.join(targets)}", outputs)
+    write_status(
+        STATUS_DONE,
+        job_id,
+        "SUCCEEDED",
+        f"converted {src_fmt} to {', '.join(targets)}",
+        outputs,
+        username=username,
+        owner_id=owner_id,
+    )
     inbox_task = STATUS_INBOX / f"{job_id}.json"
     if inbox_task.exists():
         try:

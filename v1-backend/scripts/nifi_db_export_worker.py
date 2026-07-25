@@ -389,18 +389,23 @@ def main() -> int:
         columns, rows = fetch_data(task)
         out_path = output_path(task, fmt)
         write_rows(out_path, fmt, columns, rows)
+        owner_id = str(task.get("ownerId") or task.get("owner") or task.get("factoryId") or "unknown")
         status = {
             "jobId": task.get("jobId"),
             "status": "SUCCEEDED",
             "filePath": str(out_path.resolve()),
             "rows": len(rows),
             "message": f"export completed via {task.get('dbType','unknown')} worker",
+            "ownerId": owner_id,
+            "factoryId": owner_id,
+            "username": owner_id,
             "finishedAt": now_iso(),
         }
         status_path = write_status(task, status, failed=False)
         print(json.dumps({**status, "statusPath": str(status_path)}, ensure_ascii=False, default=str))
         return 0
     except Exception as exc:
+        owner_id = str(task.get("ownerId") or task.get("owner") or task.get("factoryId") or "") if isinstance(task, dict) else ""
         payload = {
             "jobId": task.get("jobId") if isinstance(task, dict) else "",
             "status": "FAILED",
@@ -408,6 +413,9 @@ def main() -> int:
             "rows": 0,
             "message": str(exc),
             "errorTrace": traceback.format_exc(limit=5),
+            "ownerId": owner_id,
+            "factoryId": owner_id,
+            "username": owner_id,
             "finishedAt": now_iso(),
         }
         try:

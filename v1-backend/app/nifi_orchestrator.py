@@ -1,6 +1,7 @@
 import json
 import os
 import shutil
+import ssl
 import subprocess
 import time
 from datetime import datetime
@@ -13,11 +14,14 @@ from urllib.request import Request, urlopen
 NIFI_CONTAINER_NAME = os.getenv("NIFI_CONTAINER_NAME", "iot-nifi")
 NIFI_IMAGE = os.getenv("NIFI_IMAGE", "apache/nifi:latest")
 NIFI_HTTP_PORT = int(os.getenv("NIFI_HTTP_PORT", "8080"))
-NIFI_API_BASE = os.getenv("NIFI_API_BASE", f"http://127.0.0.1:{NIFI_HTTP_PORT}/nifi-api")
+NIFI_API_BASE = os.getenv("NIFI_API_BASE", f"https://localhost:{NIFI_HTTP_PORT}/nifi-api")
 NIFI_REAL_BASE_DIR = Path(os.getenv("NIFI_REAL_BASE_DIR", "/home/yhz/real_nifi_data")).resolve()
 NIFI_CONTAINER_DATA_DIR = os.getenv("NIFI_CONTAINER_DATA_DIR", "/opt/nifi/nifi-current/data/iot")
 NIFI_READY_TIMEOUT_SECONDS = int(os.getenv("NIFI_READY_TIMEOUT_SECONDS", "120"))
 NIFI_READY_INTERVAL_SECONDS = float(os.getenv("NIFI_READY_INTERVAL_SECONDS", "3"))
+NIFI_ADMIN_USER = os.getenv("NIFI_ADMIN_USER", "admin")
+NIFI_ADMIN_PASSWORD = os.getenv("NIFI_ADMIN_PASSWORD", "admin@nifi123")
+NIFI_AUTH_TOKEN = os.getenv("NIFI_AUTH_TOKEN", "")
 # 生产默认：只做后端对接，不在运行时自动创建容器或部署 Flow。
 NIFI_AUTO_CREATE_CONTAINER = os.getenv("NIFI_AUTO_CREATE_CONTAINER", "false").lower() == "true"
 NIFI_AUTO_START_CONTAINER = os.getenv("NIFI_AUTO_START_CONTAINER", "false").lower() == "true"
@@ -54,7 +58,8 @@ def _now_iso() -> str:
 
 def ensure_nifi_dirs() -> Dict[str, Any]:
     created = []
-    for rel in _REQUIRED_DIRS:
+    all_dirs = _REQUIRED_DIRS + _TAGGING_REQUIRED_DIRS
+    for rel in all_dirs:
         path = NIFI_REAL_BASE_DIR / rel
         existed = path.exists()
         path.mkdir(parents=True, exist_ok=True)
@@ -207,16 +212,42 @@ def _decode_nifi_response(resp) -> Any:
         return body
 
 
+def _acquire_nifi_token() -> str:
+    """获取 NiFi JWT 访问令牌，缓存到进程变量。"""
+    global NIFI_AUTH_TOKEN
+    if NIFI_AUTH_TOKEN:
+        return NIFI_AUTH_TOKEN
+    url = f"{NIFI_API_BASE}/access/token"
+    data = f"username={NIFI_ADMIN_USER}&password={NIFI_ADMIN_PASSWORD}".encode("utf-8")
+    headers = {"Content-Type": "application/x-www-form-urlencoded"}
+    req = Request(url, data=data, headers=headers, method="POST")
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    try:
+        with urlopen(req, timeout=10, context=ctx) as resp:
+            NIFI_AUTH_TOKEN = resp.read().decode("utf-8").strip()
+            return NIFI_AUTH_TOKEN
+    except Exception:
+        return ""
+
+
 def request_nifi_api(path: str, method: str = "GET", payload: Optional[Dict[str, Any]] = None, timeout: int = 10) -> Dict[str, Any]:
+    token = _acquire_nifi_token()
     url = f"{NIFI_API_BASE.rstrip('/')}/{path.lstrip('/')}"
     data = None
     headers = {"Accept": "application/json"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
     if payload is not None:
         data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         headers["Content-Type"] = "application/json"
     try:
         req = Request(url, data=data, headers=headers, method=method.upper())
-        with urlopen(req, timeout=timeout) as resp:
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        with urlopen(req, timeout=timeout, context=ctx) as resp:
             decoded = _decode_nifi_response(resp)
             return {"ok": 200 <= resp.status < 300, "status": resp.status, "url": url, "data": decoded}
     except HTTPError as exc:
@@ -385,7 +416,7 @@ def _ensure_command_processor() -> Dict[str, Any]:
     _stop_processor(proc)
     updated = _update_processor_config(proc, {
         "Command Path": "python3",
-        "Command Arguments": f"{NIFI_CONTAINER_DATA_DIR}/bin/nifi_mysql_export_worker.py",
+        "Command Arguments": f"{NIFI_CONTAINER_DATA_DIR}/bin/nifi_db_export_worker.py",
     }, auto_terminated_relationships=["output stream", "nonzero status", "original"])
     if not updated.get("ok"):
         return {"ok": False, "created": created, "error": updated.get("error"), "api": updated}
@@ -490,7 +521,7 @@ def ensure_export_flow() -> Dict[str, Any]:
         "inboxDir": f"{NIFI_CONTAINER_DATA_DIR}/export_jobs/inbox",
         "outputRoot": NIFI_CONTAINER_DATA_DIR,
         "workerCommand": "python3",
-        "workerArguments": f"{NIFI_CONTAINER_DATA_DIR}/bin/nifi_mysql_export_worker.py",
+        "workerArguments": f"{NIFI_CONTAINER_DATA_DIR}/bin/nifi_db_export_worker.py",
         "flowGuide": f"{NIFI_CONTAINER_DATA_DIR}/export_jobs/nifi_mysql_export_flow.md",
         "deployment": deployed,
     }
@@ -543,6 +574,337 @@ def ensure_nifi_ready_for_export() -> Dict[str, Any]:
         result["ok"] = False
         result["error"] = started.get("error") or "start export flow failed"
         return result
+
+    result["ok"] = True
+    result["finishedAt"] = _now_iso()
+    return result
+
+
+# ═══════════════════════════════════════════════════════════════════
+# 04 自动打标 Flow (GetFile + ExecuteStreamCommand + Worker)
+# ═══════════════════════════════════════════════════════════════════
+
+TAGGING_WORKER_SOURCE = Path(__file__).resolve().parent.parent / "scripts" / "nifi_auto_tagging_worker.py"
+TAGGING_WORKER_TARGET = NIFI_REAL_BASE_DIR / "bin" / "nifi_auto_tagging_worker.py"
+TAGGING_FLOW_MARKER = NIFI_REAL_BASE_DIR / "tagging_jobs" / ".iot_auto_tagging_flow_v1.ready.json"
+
+_TAGGING_REQUIRED_DIRS = [
+    "tagging_jobs/inbox",
+    "tagging_jobs/done",
+    "tagging_jobs/error",
+    "tagged_output",
+]
+
+
+def ensure_tagging_worker_assets() -> Dict[str, Any]:
+    copied = []
+    errors = []
+    if TAGGING_WORKER_SOURCE.exists():
+        TAGGING_WORKER_TARGET.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(TAGGING_WORKER_SOURCE, TAGGING_WORKER_TARGET)
+        try:
+            TAGGING_WORKER_TARGET.chmod(0o755)
+        except Exception:
+            pass
+        copied.append(str(TAGGING_WORKER_TARGET))
+    else:
+        errors.append(f"tagging worker source not found: {TAGGING_WORKER_SOURCE}")
+    return {"ok": not errors, "copied": copied, "errors": errors, "workerPath": str(TAGGING_WORKER_TARGET)}
+
+
+def _ensure_tagging_getfile_processor() -> Dict[str, Any]:
+    name = "iot_auto_tagging_getfile_v1"
+    proc = _find_processor_by_name(name)
+    if proc:
+        return {"ok": True, "created": False, "processor": proc, "message": f"tagging GetFile already exists: {name}"}
+    res = _create_processor(
+        name,
+        "org.apache.nifi.processors.standard.GetFile",
+        320.0,
+        400.0,
+    )
+    if not res.get("ok"):
+        return {"ok": False, "error": res.get("error"), "api": res}
+    proc = res.get("data")
+    # 先停止再刷新revision后更新配置
+    _stop_processor(proc)
+    latest = request_nifi_api(f"processors/{(proc.get('component') or {}).get('id') or proc.get('id')}")
+    if latest.get("ok"):
+        proc = latest.get("data")
+    updated = _update_processor_config(proc, {
+        "Input Directory": f"{NIFI_CONTAINER_DATA_DIR}/tagging_jobs/inbox",
+        "File Filter": r".*\.json",
+        "Keep Source File": "false",
+        "Batch Size": "1",
+    })
+    return {"ok": True, "created": True, "processor": updated.get("data") or proc, "message": f"tagging GetFile created: {name}"}
+
+
+def _ensure_tagging_command_processor() -> Dict[str, Any]:
+    name = "iot_auto_tagging_command_v1"
+    proc = _find_processor_by_name(name)
+    if proc:
+        return {"ok": True, "created": False, "processor": proc, "message": f"tagging command processor already exists: {name}"}
+    res = _create_processor(
+        name,
+        "org.apache.nifi.processors.standard.ExecuteStreamCommand",
+        760.0,
+        400.0,
+    )
+    if not res.get("ok"):
+        return {"ok": False, "error": res.get("error"), "api": res}
+    proc = res.get("data")
+    _stop_processor(proc)
+    latest = request_nifi_api(f"processors/{(proc.get('component') or {}).get('id') or proc.get('id')}")
+    if latest.get("ok"):
+        proc = latest.get("data")
+    updated = _update_processor_config(proc, {
+        "Command Path": "python3",
+        "Command Arguments": f"{NIFI_CONTAINER_DATA_DIR}/bin/nifi_auto_tagging_worker.py",
+    }, auto_terminated_relationships=["output stream", "nonzero status", "original"])
+    return {"ok": True, "created": True, "processor": updated.get("data") or proc, "message": f"tagging command processor created: {name}"}
+
+
+def _deploy_tagging_flow_via_api() -> Dict[str, Any]:
+    getfile = _ensure_tagging_getfile_processor()
+    if not getfile.get("ok"):
+        return {"ok": False, "error": "ensure tagging getfile failed", "getfile": getfile}
+    cmd = _ensure_tagging_command_processor()
+    if not cmd.get("ok"):
+        return {"ok": False, "error": "ensure tagging command failed", "command": cmd}
+
+    gf_id = (getfile["processor"].get("component") or getfile["processor"]).get("id", "")
+    cmd_id = (cmd["processor"].get("component") or cmd["processor"]).get("id", "")
+    if not _connection_exists(gf_id, cmd_id):
+        conn = _create_success_connection(getfile["processor"], cmd["processor"])
+        if not conn.get("ok"):
+            return {"ok": False, "error": "create tagging connection failed", "connection": conn}
+
+    return {"ok": True, "deployed": True, "getfile": getfile, "command": cmd, "message": "tagging flow deployed via NiFi API"}
+
+
+def inspect_tagging_flow() -> Dict[str, Any]:
+    gf = _find_processor_by_name("iot_auto_tagging_getfile_v1")
+    cmd = _find_processor_by_name("iot_auto_tagging_command_v1")
+    return {
+        "ok": bool(gf and cmd),
+        "processors": {
+            "getfile": gf,
+            "command": cmd,
+        },
+        "exists": {
+            "getfile": bool(gf),
+            "command": bool(cmd),
+        },
+    }
+
+
+def ensure_tagging_flow() -> Dict[str, Any]:
+    assets = ensure_tagging_worker_assets()
+    if not assets.get("ok"):
+        return {"ok": False, "error": "tagging worker assets not ready", "assets": assets}
+    deployed = _deploy_tagging_flow_via_api()
+    if not deployed.get("ok"):
+        return {"ok": False, "error": "deploy tagging flow failed", "deployment": deployed}
+    marker = {
+        "deployedAt": _now_iso(),
+        "inboxDir": f"{NIFI_CONTAINER_DATA_DIR}/tagging_jobs/inbox",
+        "outputRoot": NIFI_CONTAINER_DATA_DIR,
+        "workerCommand": "python3",
+        "workerArguments": f"{NIFI_CONTAINER_DATA_DIR}/bin/nifi_auto_tagging_worker.py",
+        "deployment": deployed,
+    }
+    TAGGING_FLOW_MARKER.parent.mkdir(parents=True, exist_ok=True)
+    TAGGING_FLOW_MARKER.write_text(json.dumps(marker, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+    return {"ok": True, "deployed": True, "flow": inspect_tagging_flow(), "assets": assets, "deployment": deployed, "message": "tagging flow created via NiFi API"}
+
+
+def start_tagging_flow() -> Dict[str, Any]:
+    flow = inspect_tagging_flow()
+    getfile = flow.get("processors", {}).get("getfile")
+    command = flow.get("processors", {}).get("command")
+    if not getfile or not command:
+        return {"ok": False, "started": False, "message": "tagging flow processors not found", "flow": flow}
+    results = []
+    for proc in [command, getfile]:
+        latest = _find_processor_by_name((proc.get("component") or {}).get("name") or "") or proc
+        started = _start_processor(latest or proc)
+        results.append(started)
+        if not started.get("ok"):
+            return {"ok": False, "started": False, "message": started.get("error") or "start tagging processor failed", "results": results, "flow": inspect_tagging_flow()}
+    return {"ok": True, "started": True, "message": "tagging flow processors started", "results": results, "flow": inspect_tagging_flow()}
+
+
+# ═══════════════════════════════════════════════════════════════════
+# 05 上传转换 Flow (GetFile + ExecuteStreamCommand + Worker)
+# ═══════════════════════════════════════════════════════════════════
+
+CONVERT_WORKER_SOURCE = Path(__file__).resolve().parent.parent / "scripts" / "nifi_upload_convert_worker.py"
+CONVERT_WORKER_TARGET = NIFI_REAL_BASE_DIR / "bin" / "nifi_upload_convert_worker.py"
+CONVERT_FLOW_MARKER = NIFI_REAL_BASE_DIR / "convert_jobs" / ".iot_convert_flow_v1.ready.json"
+
+_CONVERT_REQUIRED_DIRS = [
+    "convert_jobs/inbox",
+    "convert_jobs/done",
+    "convert_jobs/error",
+]
+
+
+def ensure_convert_worker_assets() -> Dict[str, Any]:
+    ensure_nifi_dirs()
+    copied = []
+    errors = []
+    if CONVERT_WORKER_SOURCE.exists():
+        CONVERT_WORKER_TARGET.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(CONVERT_WORKER_SOURCE, CONVERT_WORKER_TARGET)
+        try:
+            CONVERT_WORKER_TARGET.chmod(0o755)
+        except Exception:
+            pass
+        copied.append(str(CONVERT_WORKER_TARGET))
+    else:
+        errors.append(f"convert worker source not found: {CONVERT_WORKER_SOURCE}")
+    return {"ok": not errors, "copied": copied, "errors": errors, "workerPath": str(CONVERT_WORKER_TARGET)}
+
+
+def _ensure_convert_getfile_processor() -> Dict[str, Any]:
+    name = "iot_convert_getfile_v1"
+    proc = _find_processor_by_name(name)
+    if proc:
+        return {"ok": True, "created": False, "processor": proc, "message": f"convert GetFile already exists: {name}"}
+    res = _create_processor(name, "org.apache.nifi.processors.standard.GetFile", 320.0, 560.0)
+    if not res.get("ok"):
+        return {"ok": False, "error": res.get("error"), "api": res}
+    proc = res.get("data")
+    _stop_processor(proc)
+    latest = request_nifi_api(f"processors/{(proc.get('component') or proc).get('id') or proc.get('id')}")
+    if latest.get("ok"):
+        proc = latest.get("data")
+    updated = _update_processor_config(proc, {
+        "Input Directory": f"{NIFI_CONTAINER_DATA_DIR}/convert_jobs/inbox",
+        "File Filter": r".*\.json",
+        "Keep Source File": "false",
+        "Batch Size": "1",
+    })
+    return {"ok": True, "created": True, "processor": updated.get("data") or proc, "message": f"convert GetFile created: {name}"}
+
+
+def _ensure_convert_command_processor() -> Dict[str, Any]:
+    name = "iot_convert_command_v1"
+    proc = _find_processor_by_name(name)
+    if proc:
+        return {"ok": True, "created": False, "processor": proc, "message": f"convert command processor already exists: {name}"}
+    res = _create_processor(name, "org.apache.nifi.processors.standard.ExecuteStreamCommand", 760.0, 560.0)
+    if not res.get("ok"):
+        return {"ok": False, "error": res.get("error"), "api": res}
+    proc = res.get("data")
+    _stop_processor(proc)
+    latest = request_nifi_api(f"processors/{(proc.get('component') or proc).get('id') or proc.get('id')}")
+    if latest.get("ok"):
+        proc = latest.get("data")
+    updated = _update_processor_config(proc, {
+        "Command Path": "python3",
+        "Command Arguments": f"{NIFI_CONTAINER_DATA_DIR}/bin/nifi_upload_convert_worker.py",
+    }, auto_terminated_relationships=["output stream", "nonzero status", "original"])
+    return {"ok": True, "created": True, "processor": updated.get("data") or proc, "message": f"convert command processor created: {name}"}
+
+
+def _deploy_convert_flow_via_api() -> Dict[str, Any]:
+    getfile = _ensure_convert_getfile_processor()
+    if not getfile.get("ok"):
+        return {"ok": False, "error": "ensure convert getfile failed", "getfile": getfile}
+    cmd = _ensure_convert_command_processor()
+    if not cmd.get("ok"):
+        return {"ok": False, "error": "ensure convert command failed", "command": cmd}
+    gf_id = (getfile["processor"].get("component") or getfile["processor"]).get("id", "")
+    cmd_id = (cmd["processor"].get("component") or cmd["processor"]).get("id", "")
+    if not _connection_exists(gf_id, cmd_id):
+        conn = _create_success_connection(getfile["processor"], cmd["processor"])
+        if not conn.get("ok"):
+            return {"ok": False, "error": "create convert connection failed", "connection": conn}
+    return {"ok": True, "deployed": True, "getfile": getfile, "command": cmd, "message": "convert flow deployed via NiFi API"}
+
+
+def inspect_convert_flow() -> Dict[str, Any]:
+    gf = _find_processor_by_name("iot_convert_getfile_v1")
+    cmd = _find_processor_by_name("iot_convert_command_v1")
+    return {
+        "ok": bool(gf and cmd),
+        "processors": {"getfile": gf, "command": cmd},
+        "exists": {"getfile": bool(gf), "command": bool(cmd)},
+    }
+
+
+def ensure_convert_flow() -> Dict[str, Any]:
+    assets = ensure_convert_worker_assets()
+    if not assets.get("ok"):
+        return {"ok": False, "error": "convert worker assets not ready", "assets": assets}
+    deployed = _deploy_convert_flow_via_api()
+    if not deployed.get("ok"):
+        return {"ok": False, "error": "deploy convert flow failed", "deployment": deployed}
+    marker = {
+        "deployedAt": _now_iso(),
+        "inboxDir": f"{NIFI_CONTAINER_DATA_DIR}/convert_jobs/inbox",
+        "outputRoot": NIFI_CONTAINER_DATA_DIR,
+        "workerCommand": "python3",
+        "workerArguments": f"{NIFI_CONTAINER_DATA_DIR}/bin/nifi_upload_convert_worker.py",
+        "deployment": deployed,
+    }
+    CONVERT_FLOW_MARKER.parent.mkdir(parents=True, exist_ok=True)
+    CONVERT_FLOW_MARKER.write_text(json.dumps(marker, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+    return {"ok": True, "deployed": True, "flow": inspect_convert_flow(), "assets": assets, "deployment": deployed, "message": "convert flow created via NiFi API"}
+
+
+def start_convert_flow() -> Dict[str, Any]:
+    flow = inspect_convert_flow()
+    getfile = flow.get("processors", {}).get("getfile")
+    command = flow.get("processors", {}).get("command")
+    if not getfile or not command:
+        return {"ok": False, "started": False, "message": "convert flow processors not found", "flow": flow}
+    results = []
+    for proc in [command, getfile]:
+        latest = _find_processor_by_name((proc.get("component") or {}).get("name") or "") or proc
+        started = _start_processor(latest or proc)
+        results.append(started)
+        if not started.get("ok"):
+            return {"ok": False, "started": False, "message": started.get("error") or "start convert processor failed", "results": results, "flow": inspect_convert_flow()}
+    return {"ok": True, "started": True, "message": "convert flow processors started", "results": results, "flow": inspect_convert_flow()}
+
+
+def ensure_nifi_ready_for_all_flows() -> Dict[str, Any]:
+    """v4: 统一部署并启动 export / convert / tagging 三个真实 NiFi flow。"""
+    result: Dict[str, Any] = {"startedAt": _now_iso(), "steps": []}
+    container = ensure_nifi_container()
+    result["steps"].append({"step": "ensure_nifi_container", **container})
+    if not container.get("ok"):
+        result["ok"] = False
+        result["error"] = container.get("error") or "ensure nifi container failed"
+        return result
+
+    ready = wait_nifi_ready()
+    result["steps"].append({"step": "wait_nifi_ready", **ready})
+    if not ready.get("ok"):
+        result["ok"] = False
+        result["error"] = ready.get("error") or "nifi api is not ready"
+        return result
+
+    for name, ensure_fn, start_fn in [
+        ("export", ensure_export_flow, start_export_flow),
+        ("convert", ensure_convert_flow, start_convert_flow),
+        ("tagging", ensure_tagging_flow, start_tagging_flow),
+    ]:
+        flow = ensure_fn()
+        result["steps"].append({"step": f"ensure_{name}_flow", **flow})
+        if not flow.get("ok"):
+            result["ok"] = False
+            result["error"] = flow.get("error") or f"ensure {name} flow failed"
+            return result
+        started = start_fn()
+        result["steps"].append({"step": f"start_{name}_flow", **started})
+        if not started.get("ok"):
+            result["ok"] = False
+            result["error"] = started.get("error") or f"start {name} flow failed"
+            return result
 
     result["ok"] = True
     result["finishedAt"] = _now_iso()

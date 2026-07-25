@@ -1,0 +1,208 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>任务中心</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #f1f5f9; color: #1e293b; }
+    header { background: #fff; border-bottom: 1px solid #e2e8f0; padding: 12px 24px; display: flex; align-items: center; justify-content: space-between; }
+    header h1 { font-size: 18px; }
+    .container { max-width: 1100px; margin: 24px auto; padding: 0 24px; }
+    .filters { display: flex; gap: 12px; margin-bottom: 16px; flex-wrap: wrap; align-items: center; }
+    .filters select, .filters input { padding: 6px 10px; border: 1px solid #cbd5e1; border-radius: 6px; font-size: 13px; }
+    table { width: 100%; border-collapse: collapse; background: #fff; border-radius: 8px; overflow: hidden; box-shadow: 0 1px 3px rgba(0,0,0,.06); }
+    th, td { padding: 10px 14px; text-align: left; border-bottom: 1px solid #e2e8f0; font-size: 13px; }
+    th { background: #f8fafc; font-weight: 600; color: #475569; }
+    tr:hover { background: #f8fafc; }
+    .status { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 12px; font-weight: 500; }
+    .status-PENDING { background: #fef3c7; color: #92400e; }
+    .status-RUNNING { background: #dbeafe; color: #1e40af; }
+    .status-SUCCEEDED { background: #dcfce7; color: #166534; }
+    .status-FAILED { background: #fee2e2; color: #991b1b; }
+    .status-CANCELED { background: #f1f5f9; color: #64748b; }
+    .empty { text-align: center; padding: 48px; color: #94a3b8; }
+    .back-link { color: #2563eb; text-decoration: none; font-size: 13px; }
+    .back-link:hover { text-decoration: underline; }
+    .error-msg { color: #dc2626; font-size: 12px; max-width: 200px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .pagination { display: flex; gap: 8px; justify-content: center; margin-top: 16px; }
+    .pagination button { padding: 6px 12px; border: 1px solid #cbd5e1; border-radius: 6px; background: #fff; cursor: pointer; font-size: 13px; }
+    .pagination button:disabled { opacity: .5; cursor: default; }
+    .pagination .current { background: #2563eb; color: #fff; border-color: #2563eb; }
+    .refresh-info { font-size: 12px; color: #94a3b8; margin-left: auto; }
+  </style>
+</head>
+<body>
+<header>
+  <h1>任务中心</h1>
+  <div style="display:flex;align-items:center;gap:16px;">
+    <span id="currentUserLabel" style="font-size:13px;color:#475569;"></span>
+    <a href="./index.html" class="back-link">返回主控制台</a>
+  </div>
+</header>
+<div class="container">
+  <div class="filters">
+    <select id="filterJobType">
+      <option value="">全部类型</option>
+      <option value="export">数据库导出</option>
+      <option value="convert">格式转换</option>
+      <option value="tag">自动打标</option>
+    </select>
+    <select id="filterStatus">
+      <option value="">全部状态</option>
+      <option value="PENDING">已提交</option>
+      <option value="RUNNING">处理中</option>
+      <option value="SUCCEEDED">已完成</option>
+      <option value="FAILED">失败</option>
+    </select>
+    <button id="refreshBtn" style="padding:6px 14px;border:1px solid #cbd5e1;border-radius:6px;background:#fff;cursor:pointer;font-size:13px;">刷新</button>
+    <span class="refresh-info" id="refreshInfo"></span>
+  </div>
+  <table>
+    <thead>
+      <tr>
+        <th>任务ID</th>
+        <th>类型</th>
+        <th>状态</th>
+        <th>创建时间</th>
+        <th>完成时间</th>
+        <th>错误信息</th>
+      </tr>
+    </thead>
+    <tbody id="taskTableBody">
+      <tr><td colspan="6" class="empty">加载中...</td></tr>
+    </tbody>
+  </table>
+  <div class="pagination" id="pagination"></div>
+</div>
+<script src="./config.js?v=20260725_1"></script>
+<script>
+(function () {
+  const config = window.APP_CONFIG || {};
+  const DEFAULT_USERNAME = config.DEFAULT_USERNAME || "admin";
+  let currentUser = null;
+  let pollTimer = null;
+  let pageNo = 1;
+  const pageSize = 20;
+
+  async function init() {
+    try {
+      const me = await fetch("/api/v1/auth/me", { credentials: "include" });
+      if (!me.ok) {
+        window.location.href = "/login.html?next=" + encodeURIComponent(window.location.pathname);
+        return;
+      }
+      const j = await me.json().catch(() => null);
+      if (j && j.user) {
+        currentUser = j.user;
+        const el = document.getElementById("currentUserLabel");
+        if (el) el.textContent = "当前用户：" + (j.user.username || "");
+      }
+    } catch (e) {
+      window.location.href = "/login.html";
+      return;
+    }
+    bindEvents();
+    await loadTasks();
+    startPolling();
+  }
+
+  function bindEvents() {
+    document.getElementById("refreshBtn").addEventListener("click", () => { pageNo = 1; loadTasks(); });
+    document.getElementById("filterJobType").addEventListener("change", () => { pageNo = 1; loadTasks(); });
+    document.getElementById("filterStatus").addEventListener("change", () => { pageNo = 1; loadTasks(); });
+  }
+
+  function startPolling() {
+    stopPolling();
+    pollTimer = setInterval(async () => {
+      await loadTasks(false);
+    }, 5000);
+  }
+
+  function stopPolling() {
+    if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+  }
+
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden) stopPolling();
+    else { loadTasks(); startPolling(); }
+  });
+
+  async function loadTasks(showLoading = true) {
+    if (showLoading) {
+      document.getElementById("taskTableBody").innerHTML = '<tr><td colspan="6" class="empty">加载中...</td></tr>';
+    }
+    const jobType = document.getElementById("filterJobType").value;
+    const status = document.getElementById("filterStatus").value;
+    let url = `/api/v1/jobs?pageNo=${pageNo}&pageSize=${pageSize}`;
+    if (jobType) url += "&jobType=" + encodeURIComponent(jobType);
+    if (status) url += "&status=" + encodeURIComponent(status);
+    try {
+      const resp = await fetch(url, { credentials: "include" });
+      const j = await resp.json().catch(() => null);
+      if (j && j.code === 0 && j.data) {
+        renderTasks(j.data);
+        document.getElementById("refreshInfo").textContent = "上次刷新：" + new Date().toLocaleTimeString();
+      }
+    } catch (e) {
+      document.getElementById("taskTableBody").innerHTML = '<tr><td colspan="6" class="empty">加载失败，请重试</td></tr>';
+    }
+  }
+
+  function renderTasks(data) {
+    const rows = data.rows || [];
+    const total = data.total || 0;
+    const tbody = document.getElementById("taskTableBody");
+    if (rows.length === 0) {
+      tbody.innerHTML = '<tr><td colspan="6" class="empty">暂无任务</td></tr>';
+    } else {
+      tbody.innerHTML = rows.map(r => {
+        const jobType = r.jobType || r.source?.jobType || "-";
+        const typeLabel = { export: "数据库导出", convert: "格式转换", tag: "自动打标" }[jobType] || jobType;
+        return `<tr>
+          <td style="font-family:monospace;font-size:12px;">${esc(r.jobId || "-")}</td>
+          <td>${esc(typeLabel)}</td>
+          <td><span class="status status-${r.status || "PENDING"}">${esc(r.status || "-")}</span></td>
+          <td>${esc(r.createdAt || "-")}</td>
+          <td>${esc(r.finishedAt || "-")}</td>
+          <td><span class="error-msg" title="${esc(r.errorMessage || "")}">${esc(r.errorMessage || "-")}</span></td>
+        </tr>`;
+      }).join("");
+    }
+    renderPagination(total);
+  }
+
+  function renderPagination(total) {
+    const totalPages = Math.ceil(total / pageSize);
+    const pg = document.getElementById("pagination");
+    if (totalPages <= 1) { pg.innerHTML = ""; return; }
+    let html = "";
+    html += `<button ${pageNo <= 1 ? "disabled" : ""} onclick="void(0)" data-page="${pageNo - 1}">上一页</button>`;
+    for (let i = 1; i <= totalPages; i++) {
+      html += `<button class="${i === pageNo ? 'current' : ''}" data-page="${i}">${i}</button>`;
+    }
+    html += `<button ${pageNo >= totalPages ? "disabled" : ""} data-page="${pageNo + 1}">下一页</button>`;
+    pg.innerHTML = html;
+    pg.querySelectorAll("button").forEach(btn => {
+      btn.addEventListener("click", () => {
+        const p = parseInt(btn.dataset.page);
+        if (p && p !== pageNo && p >= 1 && p <= totalPages) {
+          pageNo = p;
+          loadTasks();
+        }
+      });
+    });
+  }
+
+  function esc(s) {
+    if (s == null) return "";
+    return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+  }
+
+  init();
+})();
+</script>
+</body>
+</html>

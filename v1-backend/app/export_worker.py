@@ -19,16 +19,67 @@ except ImportError:
     InsecureClient = None
 
 # avoid importing main to prevent circular imports; read base dir from env
-DEFAULT_NIFI_BASE = Path(os.getenv("NIFI_BASE_DIR", "/home/yhz/nifi-data"))
+DEFAULT_NIFI_BASE = Path(os.getenv("NIFI_BASE_DIR", "/home/yhz/nifi-data"))  # deprecated — v4 使用 _get_user_nifi_dir
+DEFAULT_USERNAME = os.getenv("DEFAULT_USERNAME", "admin")
+DEFAULT_FACTORY_ID = os.getenv("DEFAULT_FACTORY_ID", "factory-001")  # deprecated — 保留兼容
+
+
+def _normalize_username(value: Optional[str]) -> str:
+    """v4: 统一用户名标准化。"""
+    return (value or "").strip() or DEFAULT_USERNAME
 
 
 def now_ts():
     return datetime.now().strftime("%Y%m%d_%H%M%S")
 
 
-def ensure_export_dir(customer_id: str, job_id: str) -> Path:
-    base = Path(os.getenv("NIFI_BASE_DIR", str(DEFAULT_NIFI_BASE)))
-    # Keep files directly under job_id as requested: .../{customer_id}/{job_id}/job_xxx_yyy.csv
+def _resolve_user_storage_root(username: str) -> Path:
+    """v4: 与 main.py 保持一致的存储根解析。
+    - 公有化: /home/yhz/{username}/
+    - 私有化: {ceph_endpoint}/
+    """
+    from .db_models import IotUser, get_engine
+    from sqlalchemy.orm import sessionmaker
+    db_path = Path(__file__).resolve().parent.parent / "data" / "app.db"
+    engine = get_engine(db_path)
+    SessionLocal = sessionmaker(bind=engine)
+    session = SessionLocal()
+    try:
+        user = session.query(IotUser).filter(IotUser.username == username).first()
+        if user and user.deployment_mode == "private" and user.ceph_endpoint:
+            root = Path(user.ceph_endpoint)
+        else:
+            root = Path(os.getenv("IN_DATA_BASE_DIR", "/home/yhz")) / _normalize_username(username)
+    finally:
+        session.close()
+    try:
+        (root / "nifi-data").mkdir(parents=True, exist_ok=True)
+        (root / "real_nifi_data").mkdir(parents=True, exist_ok=True)
+    except (OSError, PermissionError):
+        import tempfile
+        fallback = Path(tempfile.gettempdir()) / "iot_user_data" / _normalize_username(username)
+        fallback.mkdir(parents=True, exist_ok=True)
+        return fallback
+    return root
+
+
+def _get_user_nifi_dir(username: str) -> Path:
+    """v4: 用户 nifi-data 目录。"""
+    root = _resolve_user_storage_root(username)
+    (root / "nifi-data").mkdir(parents=True, exist_ok=True)
+    return root / "nifi-data"
+
+
+def _get_user_real_nifi_dir(username: str) -> Path:
+    """v4: 用户 real_nifi_data 目录。"""
+    root = _resolve_user_storage_root(username)
+    (root / "real_nifi_data").mkdir(parents=True, exist_ok=True)
+    return root / "real_nifi_data"
+
+
+def ensure_export_dir(customer_id: str, job_id: str, username: Optional[str] = None) -> Path:
+    """v4: 用户隔离的导出目录。"""
+    base = _get_user_nifi_dir(username or customer_id)
     dest = base / "exports" / str(customer_id or "unknown") / str(job_id)
     dest.mkdir(parents=True, exist_ok=True)
     return dest
@@ -394,7 +445,8 @@ def _sanitize_fn(value: Optional[str]) -> str:
 def run_export_job(job_record: dict) -> dict:
     """job_record expects keys: job_name, owner_id, db_config, file_format, destination"""
     job_id = job_record.get("id") or uuid.uuid4().hex[:8]
-    factory_id = job_record.get("factory_id") or os.getenv("DEFAULT_FACTORY_ID", "factory-001")
+    username = _normalize_username(job_record.get("username") or job_record.get("factory_id"))
+    factory_id = username  # 兼容旧调用
     customer = job_record.get("owner_id") or "unknown"
     db_conf = job_record.get("db_config") or {}
     payload = job_record.get("payload") or {}
@@ -404,16 +456,13 @@ def run_export_job(job_record: dict) -> dict:
     owner = _sanitize_fn(customer)
     table_safe = _sanitize_fn(table)
     fmt = (job_record.get("file_format") or "csv").lower()
-    # mirror/export directory (per-job archive)
-    dest_dir = ensure_export_dir(customer, job_id)
+    # mirror/export directory (per-job archive, 用户隔离)
+    dest_dir = ensure_export_dir(customer, job_id, username=username)
     state = _load_state(dest_dir)
     filename = state.get("output_file") or f"export_{owner}_{table_safe}_{now_ts()}.{fmt}"
 
-    # Determine primary output directory:
-    # If destination type is "local", write directly to exports archive.
-    # Otherwise, resolve destination.path or default to NIFI_BASE_DIR/output_<format>
-    # and mirror a copy to exports.
-    nifi_root = Path(os.getenv("NIFI_BASE_DIR", str(DEFAULT_NIFI_BASE)))
+    # Determine primary output directory: 用户隔离的 real_nifi_data
+    nifi_root = _get_user_real_nifi_dir(username)
     destination = job_record.get("destination") or {}
     is_local = isinstance(destination, dict) and (destination.get("type") or "").lower() == "local"
 

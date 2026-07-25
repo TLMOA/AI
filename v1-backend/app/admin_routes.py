@@ -6,7 +6,7 @@ import json
 from datetime import datetime
 import threading
 
-from .silent_export_worker import process_once, _load_manifest
+from .silent_export_worker import process_once, _load_manifest, _get_silent_export_dir
 
 router = APIRouter()
 
@@ -15,8 +15,9 @@ def _get_generated_dir() -> Path:
     return Path(__file__).resolve().parent.parent / "data" / "generated"
 
 
-def _get_silent_export_dir() -> Path:
-    return Path("/home/yhz/nifi-data") / "silent_exports"
+def _get_silent_export_dir_default() -> Path:
+    """v4: 返回默认 admin 的 silent_export 目录（兼容旧调用）。"""
+    return _get_silent_export_dir("admin")
 
 
 def _config_path() -> Path:
@@ -121,7 +122,7 @@ def get_silent_export_manifest(tenant: str, request: Request = None):
             "tenant": tenant,
             "registered_count": len(db_tables),
             "registered_tables": db_tables,
-            "output_dir": f"/home/yhz/nifi-data/silent_exports/{tenant}/",
+            "output_dir": str(_get_silent_export_dir(tenant)),
         },
         "traceId": "",
     }
@@ -141,7 +142,7 @@ def trigger_silent_export(tenant: str, payload: Optional[Dict[str, Any]] = None,
     p = _requests_path()
     with p.open("a", encoding="utf-8") as fh:
         fh.write(json.dumps(job, ensure_ascii=False) + "\n")
-    _get_silent_export_dir().mkdir(parents=True, exist_ok=True)
+    _get_silent_export_dir_default().mkdir(parents=True, exist_ok=True)
 
     # 先统计当前 manifest 状态，便于前端告知用户"没表可处理"
     manifest = {}
@@ -180,3 +181,27 @@ def trigger_silent_export(tenant: str, payload: Optional[Dict[str, Any]] = None,
         "registered_count": len(db_tables),
         "hint": hint,
     }, "traceId": ""}
+
+
+@router.post("/internal/admin/ensure-user-storage")
+def ensure_user_storage(request: Request):
+    """v4: 管理员手动触发，为已存在但缺目录的用户补建 nifi-data / real_nifi_data。
+
+    用于历史上注册时未自动建目录的用户。
+    """
+    _require_admin(request)
+    from .db_models import SessionLocal, IotUser
+    from .auth import _create_user_storage_dirs
+    sess = SessionLocal()
+    results = []
+    try:
+        users = sess.query(IotUser).all()
+        for u in users:
+            try:
+                _create_user_storage_dirs(u.username, u.deployment_mode or "public", u.ceph_endpoint or "")
+                results.append({"username": u.username, "mode": u.deployment_mode, "ceph_endpoint": u.ceph_endpoint, "status": "ok"})
+            except Exception as e:
+                results.append({"username": u.username, "status": "error", "error": str(e)})
+    finally:
+        sess.close()
+    return {"code": 0, "message": "ok", "data": {"results": results, "count": len(results)}}

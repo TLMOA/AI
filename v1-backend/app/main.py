@@ -7,6 +7,7 @@ import tempfile
 import uuid
 from datetime import datetime
 from pathlib import Path
+import time
 from time import perf_counter
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -20,13 +21,17 @@ from .executors import MockExecutor, NiFiExecutor
 from .db_connect import router as db_router
 from .auth import router as auth_router
 from .admin_routes import router as admin_router
-from .auth import _get_current_user_from_token
+from .auth import _get_current_user_from_token, _get_all_nifi_db_users, _sync_user_to_local, _delete_nifi_db_user
 from . import db_models
 from .export_worker import run_export_job
 from . import meta_json
+from . import nifi_orchestrator
 
 def _get_nifi_status() -> Dict[str, Any]:
-    return {"ok": True, "mode": "manual", "message": "v2-nifi flow manually deployed"}
+    try:
+        return nifi_orchestrator.get_nifi_status()
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
 from .silent_export_worker import process_loop_once
 from .scheduler import start_scheduler, stop_scheduler, schedule_job, remove_scheduled
 import threading
@@ -37,20 +42,20 @@ except ImportError:
     from backports.zoneinfo import ZoneInfo
 
 
-    def _init_csv_field_size_limit() -> int:
-        # Python csv 默认字段限制为 131072，较大单列内容会触发解析错误。
-        configured = int(os.getenv("CSV_FIELD_SIZE_LIMIT", "20971520"))
-        limit = max(configured, 131072)
-        while limit >= 131072:
-            try:
-                return csv.field_size_limit(limit)
-            except OverflowError:
-                # 某些平台 C long 上限更小，逐步降低直到可接受范围。
-                limit = limit // 10
-        return csv.field_size_limit(min(sys.maxsize, 131072))
+def _init_csv_field_size_limit() -> int:
+    # Python csv 默认字段限制为 131072，较大单列内容会触发解析错误。
+    configured = int(os.getenv("CSV_FIELD_SIZE_LIMIT", "20971520"))
+    limit = max(configured, 131072)
+    while limit >= 131072:
+        try:
+            return csv.field_size_limit(limit)
+        except OverflowError:
+            # 某些平台 C long 上限更小，逐步降低直到可接受范围。
+            limit = limit // 10
+    return csv.field_size_limit(min(sys.maxsize, 131072))
 
 
-    CSV_FIELD_SIZE_LIMIT = _init_csv_field_size_limit()
+CSV_FIELD_SIZE_LIMIT = _init_csv_field_size_limit()
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 GENERATED_DIR = BASE_DIR / "data" / "generated"
@@ -64,6 +69,8 @@ else:
 
 EXECUTOR_MODE = os.getenv("APP_EXECUTOR_MODE", "mock").lower()
 EXECUTOR = NiFiExecutor(NIFI_FLOW_MAPPING) if EXECUTOR_MODE == "nifi" else MockExecutor()
+# v4: true 时 NiFi 模式把任务 JSON 写到共享目录，由 iot-nifi 容器内的 event-driven flow 真实执行
+NIFI_REAL_EXECUTION = os.getenv("NIFI_REAL_EXECUTION", "false").lower() in ("true", "1", "yes")
 NIFI_OUTPUT_DIR = Path(os.getenv("NIFI_OUTPUT_DIR", "/home/yhz/nifi-data/output_csv"))
 # ensure main NiFi output dir exists
 NIFI_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -83,11 +90,13 @@ JSON_TO_TSV_DIR = Path(os.getenv("JSON_TO_TSV_DIR", "/home/yhz/nifi-data/json_to
 CSV_TO_TSV_DIR = Path(os.getenv("CSV_TO_TSV_DIR", "/home/yhz/nifi-data/csv_to_tsv"))
 TSV_TO_CSV_DIR = Path(os.getenv("TSV_TO_CSV_DIR", "/home/yhz/nifi-data/tsv_to_csv"))
 TAGGED_OUTPUT_DIR = Path(os.getenv("TAGGED_OUTPUT_DIR", "/home/yhz/nifi-data/tagged_output"))
-NIFI_BASE_DIR = Path(os.getenv("NIFI_BASE_DIR", "/home/yhz/nifi-data"))
+NIFI_BASE_DIR = Path(os.getenv("NIFI_BASE_DIR", "/home/yhz/nifi-data"))  # deprecated — v4 使用 _get_user_nifi_dir(username)
 NIFI_OUTPUT_JSON_DIR = Path(os.getenv("NIFI_OUTPUT_JSON_DIR", "/home/yhz/nifi-data/output_json"))
-IN_DATA_BASE_DIR = Path(os.getenv("IN_DATA_BASE_DIR", "/home/yhz/in_data"))
-DEFAULT_FACTORY_ID = os.getenv("DEFAULT_FACTORY_ID", "factory-001")
+IN_DATA_BASE_DIR = Path(os.getenv("IN_DATA_BASE_DIR", "/home/yhz"))  # 公有化用户存放在 /home/yhz/{username}/ 下
+DEFAULT_USERNAME = os.getenv("DEFAULT_USERNAME", "admin")
+DEFAULT_FACTORY_ID = os.getenv("DEFAULT_FACTORY_ID", "factory-001")  # deprecated — 保留兼容
 FACTORY_REPORT_FILE = GENERATED_DIR / "factory_reports.ndjson"
+AUDIT_LOG_PATH = GENERATED_DIR / "audit.log"  # v4 P2-4: 全局审计日志
 OUTPUT_TSV_DIR.mkdir(parents=True, exist_ok=True)
 INBOX_TSV_DIR.mkdir(parents=True, exist_ok=True)
 CSV_TO_JSON_DIR.mkdir(parents=True, exist_ok=True)
@@ -114,6 +123,26 @@ def _require_admin(request: Request):
     if not user or not user.get("is_admin"):
         raise HTTPException(status_code=403, detail="管理员权限不足")
 
+
+def _check_file_access(request: Request, file_meta: Dict[str, Any]) -> Dict[str, Any]:
+    """v4: 检查当前用户是否可以访问此文件。
+    - admin: 全部允许
+    - 普通用户: 只能访问自己 username 名下的文件
+    """
+    cookie = request.cookies.get("access_token")
+    user = _get_current_user_from_token(cookie) or {}
+    if user.get("is_admin"):
+        return user
+    current_username = _normalize_username(user.get("username") or user.get("user") or user.get("name"))
+    file_username = _normalize_username(file_meta.get("username") or file_meta.get("factory_id"))
+    # 兼容：旧文件未标记 username，则放行（仅 admin 场景下应该被前置路由阻挡）
+    if not file_username:
+        return user
+    if file_username != current_username:
+        raise HTTPException(status_code=403, detail="无权限访问此文件")
+    return user
+
+
 def now_iso() -> str:
     try:
         tz = ZoneInfo("Asia/Shanghai")
@@ -124,15 +153,31 @@ def now_iso() -> str:
     return datetime.now(tz).isoformat(timespec="seconds")
 
 
-def _load_backend_mode_state() -> Dict[str, Any]:
-    default_state = {"factory_id": DEFAULT_FACTORY_ID, "mode": "local", "updatedAt": now_iso(), "updatedBy": "system"}
+def _get_user_backend_mode_file(username: str) -> Path:
+    """获取指定用户的后端模式配置文件路径"""
+    normalized = _normalize_username(username)
+    return GENERATED_DIR / f"backend_mode_{normalized}.json"
+
+
+def _load_backend_mode_state(username: Optional[str] = None) -> Dict[str, Any]:
+    """加载后端模式状态。如果指定了 username，则加载该用户的配置；否则加载全局配置。"""
+    default_state = {"username": DEFAULT_USERNAME, "factory_id": DEFAULT_USERNAME, "mode": "local", "updatedAt": now_iso(), "updatedBy": "system"}
+    
+    # 确定要读取的配置文件
+    if username:
+        mode_file = _get_user_backend_mode_file(username)
+    else:
+        mode_file = BACKEND_MODE_FILE
+    
     try:
-        if BACKEND_MODE_FILE.exists():
-            data = json.loads(BACKEND_MODE_FILE.read_text(encoding="utf-8"))
+        if mode_file.exists():
+            data = json.loads(mode_file.read_text(encoding="utf-8"))
             if isinstance(data, dict):
                 default_state.update({k: data.get(k, default_state.get(k)) for k in default_state.keys()})
+                if data.get("username"):
+                    default_state["username"] = _normalize_username(data.get("username"))
                 if data.get("factory_id"):
-                    default_state["factory_id"] = _normalize_factory_id(data.get("factory_id"))
+                    default_state["factory_id"] = _normalize_username(data.get("factory_id"))
                 if data.get("mode") in {"local", "nifi"}:
                     default_state["mode"] = data.get("mode")
     except Exception:
@@ -141,19 +186,29 @@ def _load_backend_mode_state() -> Dict[str, Any]:
 
 
 def _save_backend_mode_state(state: Dict[str, Any]) -> Dict[str, Any]:
+    """保存后端模式状态。根据 state 中的 username 保存到对应的配置文件。"""
     payload = {
-        "factory_id": _normalize_factory_id(state.get("factory_id")),
+        "username": _normalize_username(state.get("username")),
+        "factory_id": _normalize_username(state.get("factory_id")),
         "mode": "nifi" if str(state.get("mode", "local")).lower() == "nifi" else "local",
         "updatedAt": state.get("updatedAt") or now_iso(),
         "updatedBy": state.get("updatedBy") or "system",
     }
-    BACKEND_MODE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    BACKEND_MODE_FILE.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    
+    # 确定要保存的配置文件
+    username = state.get("username")
+    if username:
+        mode_file = _get_user_backend_mode_file(username)
+    else:
+        mode_file = BACKEND_MODE_FILE
+    
+    mode_file.parent.mkdir(parents=True, exist_ok=True)
+    mode_file.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     return payload
 
 
-BACKEND_MODE_STATE: Dict[str, Any] = {"factory_id": DEFAULT_FACTORY_ID, "mode": "local", "updatedAt": "", "updatedBy": "system"}
-NIFI_REAL_BASE_DIR = Path(os.getenv("NIFI_REAL_BASE_DIR", "/home/yhz/real_nifi_data")).resolve()
+BACKEND_MODE_STATE: Dict[str, Any] = {"username": DEFAULT_USERNAME, "factory_id": DEFAULT_USERNAME, "mode": "local", "updatedAt": "", "updatedBy": "system"}
+NIFI_REAL_BASE_DIR = Path(os.getenv("NIFI_REAL_BASE_DIR", "/home/yhz/real_nifi_data")).resolve()  # deprecated — v4 使用 _get_user_real_nifi_dir(username)
 NIFI_REAL_BASE_DIR.mkdir(parents=True, exist_ok=True)
 NIFI_CONTAINER_BASE = "/opt/nifi/nifi-current/data/iot"
 
@@ -172,28 +227,89 @@ def _container_to_host_path(container_path: str) -> str:
     return container_path
 
 
-def _current_backend_mode() -> str:
-    return _load_backend_mode_state().get("mode", BACKEND_MODE_STATE.get("mode", "local"))
+def _current_backend_mode(request: Optional[Request] = None) -> str:
+    """获取当前用户的后端模式。如果提供了 request，则提取当前登录用户。"""
+    username = None
+    if request:
+        cookie_user = _get_current_user_from_token(request.cookies.get("access_token")) or {}
+        username = cookie_user.get("username")
+    return _load_backend_mode_state(username).get("mode", BACKEND_MODE_STATE.get("mode", "local"))
 
 
-def _export_output_root(mode: Optional[str] = None) -> Path:
-    resolved = (mode or _current_backend_mode() or "local").lower()
-    if resolved == "nifi":
-        root = NIFI_REAL_BASE_DIR
+def _get_user_info(username: str) -> Optional[Dict[str, Any]]:
+    """从数据库查询用户的完整信息，包括 deployment_mode 和 ceph_endpoint。"""
+    session = SessionLocal()
+    try:
+        user = session.query(db_models.IotUser).filter(
+            db_models.IotUser.username == username
+        ).first()
+        if not user:
+            return None
+        return {
+            "username": user.username,
+            "is_admin": bool(user.is_admin),
+            "deployment_mode": user.deployment_mode or "public",
+            "ceph_endpoint": user.ceph_endpoint or "",
+        }
+    finally:
+        session.close()
+
+
+def _resolve_user_storage_root(username: str) -> Path:
+    """根据用户部署模式返回存储根路径。
+
+    当前阶段：所有用户（公有化 + 私有化）都存放在 /home/yhz/{username}/ 下。
+    私有化用户的 ceph_endpoint 记录在 DB 中，待后续阶段迁移。
+
+    自动创建 nifi-data/ 和 real_nifi_data/ 子目录。
+    """
+    # 当前阶段：无论公有私有，都放在 /home/yhz/{username}/
+    # TODO: 后续阶段私有化用户启用 Ceph 存储
+    root = IN_DATA_BASE_DIR / username
+    (root / "nifi-data").mkdir(parents=True, exist_ok=True)
+    (root / "real_nifi_data").mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def _get_user_nifi_dir(username: str) -> Path:
+    """v4: 返回用户专属的 nifi-data 目录。当前阶段所有用户都在 /home/yhz/{username}/nifi-data。"""
+    return _resolve_user_storage_root(username) / "nifi-data"
+
+
+def _get_user_real_nifi_dir(username: str) -> Path:
+    """v4: 返回用户专属的 real_nifi_data 目录。当前阶段所有用户都在 /home/yhz/{username}/real_nifi_data。"""
+    return _resolve_user_storage_root(username) / "real_nifi_data"
+
+
+def _get_active_user_data_dir(username: str) -> Path:
+    """v4: 根据当前 backend-mode 返回用户活跃数据目录。
+
+    Local 模式使用 nifi-data/，NiFi 模式使用 real_nifi_data/。
+    """
+    mode = _load_backend_mode_state(_normalize_username(username)).get("mode", BACKEND_MODE_STATE.get("mode", "local"))
+    return _get_user_real_nifi_dir(username) if mode == "nifi" else _get_user_nifi_dir(username)
+
+
+def _export_output_root(mode: Optional[str] = None, username: Optional[str] = None) -> Path:
+    """v4: 返回当前用户/模式的输出根目录。兼容旧调用：未传 username 时回退到默认 admin 的存储。"""
+    resolved_mode = (mode or _current_backend_mode() or "local").lower()
+    if username:
+        root = _get_user_real_nifi_dir(_normalize_username(username)) if resolved_mode == "nifi" else _get_user_nifi_dir(_normalize_username(username))
     else:
-        root = NIFI_BASE_DIR
+        root = NIFI_REAL_BASE_DIR if resolved_mode == "nifi" else NIFI_BASE_DIR
     root.mkdir(parents=True, exist_ok=True)
     return root
 
 
-def _nifi_export_job_dirs() -> Dict[str, Path]:
-    root = _export_output_root("nifi") / "export_jobs"
+def _nifi_export_job_dirs(username: Optional[str] = None) -> Dict[str, Path]:
+    """v4: 用户隔离的 nifi 任务目录。"""
+    root = _export_output_root("nifi", username=username) / "export_jobs"
     inbox = root / "inbox"
     done = root / "done"
     error = root / "error"
-    output_csv = _export_output_root("nifi") / "output_csv"
-    output_json = _export_output_root("nifi") / "output_json"
-    output_tsv = _export_output_root("nifi") / "output_tsv"
+    output_csv = _export_output_root("nifi", username=username) / "output_csv"
+    output_json = _export_output_root("nifi", username=username) / "output_json"
+    output_tsv = _export_output_root("nifi", username=username) / "output_tsv"
     for p in [inbox, done, error, output_csv, output_json, output_tsv]:
         p.mkdir(parents=True, exist_ok=True)
     return {"root": root, "inbox": inbox, "done": done, "error": error, "output_csv": output_csv, "output_json": output_json, "output_tsv": output_tsv}
@@ -204,11 +320,12 @@ def _build_nifi_export_task(job: Dict[str, Any]) -> Dict[str, Any]:
     db_conf = job.get("db_config") or {}
     payload = job.get("payload") or {}
     table = payload.get("table") or db_conf.get("table") or job.get("table") or ""
-    dirs = _nifi_export_job_dirs()
+    username = _normalize_username(job.get("username") or job.get("factory_id"))
+    dirs = _nifi_export_job_dirs(username=username)
     target_dir = dirs.get(f"output_{fmt}") or dirs["output_csv"]
     task = {
         "jobId": str(job.get("id") or f"export_{uuid.uuid4().hex[:8]}"),
-        "factoryId": _normalize_factory_id(job.get("factory_id")),
+        "username": _normalize_username(job.get("username") or job.get("factory_id")),
         "ownerId": job.get("owner_id") or "unknown",
         "dbType": str(db_conf.get("db_type") or db_conf.get("type") or "mysql").lower(),
         "host": db_conf.get("host") or "127.0.0.1",
@@ -221,19 +338,72 @@ def _build_nifi_export_task(job: Dict[str, Any]) -> Dict[str, Any]:
         "format": fmt.upper(),
         "appendToLatest": bool(job.get("append_to_latest") or job.get("appendToLatest") or False),
         "targetDir": _host_to_container_path(str(target_dir)),
-        "targetRoot": _host_to_container_path(str(_export_output_root("nifi"))),
+        "targetRoot": _host_to_container_path(str(_export_output_root("nifi", username=username))),
         "submittedAt": now_iso(),
     }
     return task
 
 
+def _mock_execute_nifi_task(task_record: Dict[str, Any], task: Dict[str, Any]) -> None:
+    """v4: 当没有真实 NiFi 容器时，后台模拟执行 NiFi 导出任务。"""
+    try:
+        job = {
+            "id": task["jobId"],
+            "job_name": task.get("jobName") or f"export_{task.get('table', 'data')}",
+            "username": task["username"],
+            "owner_id": task.get("ownerId") or task["username"],
+            "file_format": str(task.get("format", "CSV")).lower(),
+            "append_to_latest": bool(task.get("appendToLatest", False)),
+            "db_config": {
+                "db_type": str(task.get("dbType", "mysql")).lower(),
+                "host": task.get("host", "127.0.0.1"),
+                "port": int(task.get("port", 3306)),
+                "user": task.get("user", "root"),
+                "password": task.get("password", ""),
+                "database": task.get("database", ""),
+                "table": task.get("table", ""),
+                "where": task.get("where", ""),
+            },
+            "payload": {"table": task.get("table", "")},
+            "where": task.get("where", ""),
+        }
+        res = run_export_job(job)
+        status = "SUCCEEDED" if res.get("status") in ("ok", "demo_written") else "FAILED"
+        task_record["status"] = status
+        task_record["resultPath"] = res.get("path", "")
+        task_record["message"] = res.get("message", "mock nifi execution completed")
+        task_record["finishedAt"] = now_iso()
+
+        job_id = task["jobId"]
+        username = task["username"]
+        user_dirs = _nifi_export_job_dirs(username=username)
+        inbox_path = user_dirs["inbox"] / f"{job_id}.json"
+        done_path = user_dirs["done"] / f"{job_id}.json"
+        done_path.parent.mkdir(parents=True, exist_ok=True)
+        done_path.write_text(json.dumps(task_record, ensure_ascii=False, indent=2), encoding="utf-8")
+        inbox_path.unlink(missing_ok=True)
+
+        global_inbox = NIFI_REAL_BASE_DIR / "export_jobs" / "inbox" / f"{job_id}.json"
+        global_done = NIFI_REAL_BASE_DIR / "export_jobs" / "done" / f"{job_id}.json"
+        global_done.parent.mkdir(parents=True, exist_ok=True)
+        global_done.write_text(json.dumps(task_record, ensure_ascii=False, indent=2), encoding="utf-8")
+        global_inbox.unlink(missing_ok=True)
+
+        _route_nifi_output_to_user(username)
+    except Exception as e:
+        task_record["status"] = "FAILED"
+        task_record["message"] = f"mock execution error: {e}"
+        task_record["finishedAt"] = now_iso()
+
+
 def _submit_nifi_export_task(job: Dict[str, Any]) -> Dict[str, Any]:
-    dirs = _nifi_export_job_dirs()
+    username = _normalize_username(job.get("username") or job.get("factory_id"))
+    dirs = _nifi_export_job_dirs(username=username)
     task = _build_nifi_export_task(job)
     task_path = dirs["inbox"] / f"{task['jobId']}.json"
     task_record = {
         "jobId": task["jobId"],
-        "factoryId": task["factoryId"],
+        "username": task["username"],
         "ownerId": task["ownerId"],
         "status": "PENDING",
         "submittedAt": task["submittedAt"],
@@ -247,9 +417,16 @@ def _submit_nifi_export_task(job: Dict[str, Any]) -> Dict[str, Any]:
     tmp_path = task_path.with_suffix(".json.tmp")
     tmp_path.write_text(json.dumps(task, ensure_ascii=False, indent=2), encoding="utf-8")
     tmp_path.replace(task_path)
+    # v4: 同时写入全局工作区 inbox，供共享 NiFi 容器读取
+    global_inbox = NIFI_REAL_BASE_DIR / "export_jobs" / "inbox"
+    global_inbox.mkdir(parents=True, exist_ok=True)
+    global_task_path = global_inbox / f"{task['jobId']}.json"
+    global_tmp = global_task_path.with_suffix(".json.tmp")
+    global_tmp.write_text(json.dumps(task, ensure_ascii=False, indent=2), encoding="utf-8")
+    global_tmp.replace(global_task_path)
     nifi_export_jobs[task["jobId"]] = task_record
     _append_factory_report({
-        "factory_id": task["factoryId"],
+        "factory_id": task["username"],
         "job_id": task["jobId"],
         "batch_id": task["jobId"],
         "status": "PENDING",
@@ -259,11 +436,17 @@ def _submit_nifi_export_task(job: Dict[str, Any]) -> Dict[str, Any]:
         "reported_at": task["submittedAt"],
         "received_at": now_iso(),
     })
+    if NIFI_REAL_EXECUTION:
+        # v4: 真实 NiFi 执行：iot-nifi 容器内的 GetFile 处理器会轮询 export_jobs/inbox 并调用 nifi_db_export_worker.py
+        task_record["message"] = "submitted to iot-nifi"
+    else:
+        # v4: 没有真实 NiFi 容器时，后台模拟执行，确保 NiFi 模式也能立即产出结果
+        threading.Thread(target=_mock_execute_nifi_task, args=(task_record, task), daemon=True).start()
     return {"status": "submitted", "taskPath": str(task_path), "task": task}
 
 
-def _nifi_convert_job_dirs() -> Dict[str, Path]:
-    root = _export_output_root("nifi") / "convert_jobs"
+def _nifi_convert_job_dirs(username: Optional[str] = None) -> Dict[str, Path]:
+    root = _export_output_root("nifi", username=username) / "convert_jobs"
     inbox = root / "inbox"
     done = root / "done"
     error = root / "error"
@@ -272,10 +455,30 @@ def _nifi_convert_job_dirs() -> Dict[str, Path]:
     return {"root": root, "inbox": inbox, "done": done, "error": error}
 
 
+def _get_user_upload_dirs(username: str) -> Dict[str, Path]:
+    """v4: 返回用户隔离的上传/转换目录，自动创建。"""
+    nifi = _get_user_nifi_dir(_normalize_username(username))
+    dirs = {
+        "inbox_csv": nifi / "inbox_csv",
+        "inbox_json": nifi / "inbox_json",
+        "inbox_tsv": nifi / "inbox_tsv",
+        "csv_to_json": nifi / "csv_to_json",
+        "csv_to_tsv": nifi / "csv_to_tsv",
+        "json_to_csv": nifi / "json_to_csv",
+        "json_to_tsv": nifi / "json_to_tsv",
+        "tsv_to_json": nifi / "tsv_to_json",
+        "tsv_to_csv": nifi / "tsv_to_csv",
+    }
+    for d in dirs.values():
+        d.mkdir(parents=True, exist_ok=True)
+    return dirs
+
+
 def _submit_nifi_upload_convert_task(source_path: str, source_format: str,
                                       target_formats: List[str], file_name: str,
-                                      owner_id: str = "", factory_id: str = "") -> Dict[str, Any]:
-    dirs = _nifi_convert_job_dirs()
+                                      owner_id: str = "", username: str = "") -> Dict[str, Any]:
+    normalized_username = _normalize_username(username)
+    dirs = _nifi_convert_job_dirs(username=normalized_username or None)
     job_id = f"convert_{uuid.uuid4().hex[:8]}"
     nifi_source_path = source_path.replace(str(NIFI_REAL_BASE_DIR), "/opt/nifi/nifi-current/data/iot")
     task = {
@@ -285,11 +488,18 @@ def _submit_nifi_upload_convert_task(source_path: str, source_format: str,
         "targetFormats": [f.upper() for f in target_formats],
         "fileName": file_name,
         "ownerId": owner_id or "unknown",
-        "factoryId": _normalize_factory_id(factory_id),
+        "username": normalized_username,
         "submittedAt": now_iso(),
     }
     task_path = dirs["inbox"] / f"{job_id}.json"
+    task_path.parent.mkdir(parents=True, exist_ok=True)
     task_path.write_text(json.dumps(task, ensure_ascii=False, indent=2), encoding="utf-8")
+    if normalized_username:
+        global_dirs = _nifi_convert_job_dirs()
+        global_task_path = global_dirs["inbox"] / f"{job_id}.json"
+        if global_task_path != task_path:
+            global_task_path.parent.mkdir(parents=True, exist_ok=True)
+            global_task_path.write_text(json.dumps(task, ensure_ascii=False, indent=2), encoding="utf-8")
     return {"status": "submitted", "taskPath": str(task_path), "task": task}
 
 
@@ -301,8 +511,331 @@ def _read_json_file(path: Path) -> Optional[Dict[str, Any]]:
         return None
 
 
-def _scan_nifi_export_results() -> Dict[str, Any]:
-    dirs = _nifi_export_job_dirs()
+def _route_nifi_convert_output_to_user(username: str) -> Dict[str, Any]:
+    """v4: 将共享 NiFi 容器的转换结果搬移到用户专属目录。"""
+    global_workspace = NIFI_REAL_BASE_DIR / "convert_jobs"
+    moved = 0
+    skipped = 0
+    errors = 0
+    if not global_workspace.exists():
+        return {"moved": 0, "skipped": 0, "errors": 0, "message": "global convert workspace not found"}
+
+    normalized_username = _normalize_username(username)
+    user_job_dirs = _nifi_convert_job_dirs(username=normalized_username)
+    user_root = _get_user_real_nifi_dir(normalized_username)
+
+    for folder, status in ((global_workspace / "done", "done"), (global_workspace / "error", "error")):
+        if not folder.exists():
+            continue
+        for path in list(folder.glob("*.json")):
+            if path.name.endswith(".meta.json"):
+                continue
+            try:
+                payload = _read_json_file(path)
+                if not payload:
+                    path.unlink(missing_ok=True)
+                    skipped += 1
+                    continue
+                job_username = _normalize_username(payload.get("username") or payload.get("ownerId") or "")
+                if job_username != normalized_username:
+                    skipped += 1
+                    continue
+
+                output_files = payload.get("outputFiles") or []
+                routed_outputs: List[str] = []
+                for output_file in output_files:
+                    src = Path(str(output_file))
+                    if not src.exists() or not src.is_file():
+                        continue
+                    target_dir = user_root / src.parent.name
+                    target_dir.mkdir(parents=True, exist_ok=True)
+                    dst = target_dir / src.name
+                    shutil.move(str(src), str(dst))
+                    moved += 1
+                    routed_outputs.append(str(dst))
+                if routed_outputs:
+                    payload["outputFiles"] = routed_outputs
+
+                target_folder = user_job_dirs.get(status, user_job_dirs["done"])
+                target_folder.mkdir(parents=True, exist_ok=True)
+                dst_path = target_folder / path.name
+                dst_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+                path.unlink(missing_ok=True)
+            except Exception:
+                errors += 1
+
+    return {"moved": moved, "skipped": skipped, "errors": errors}
+
+
+def _route_nifi_convert_output_for_all_users() -> Dict[str, Any]:
+    """v4: 对所有用户执行 NiFi 转换结果回流。"""
+    usernames = _get_all_known_usernames()
+    total = {"moved": 0, "skipped": 0, "errors": 0, "per_user": {}}
+    for username in usernames:
+        try:
+            res = _route_nifi_convert_output_to_user(username)
+            total["moved"] += res.get("moved", 0)
+            total["skipped"] += res.get("skipped", 0)
+            total["errors"] += res.get("errors", 0)
+            total["per_user"][_normalize_username(username)] = res
+        except Exception:
+            total["errors"] += 1
+    return total
+
+
+# ═══════════════════════════════════════════════════════════════════
+# v4: NiFi 自动打标任务提交与结果回流
+# ═══════════════════════════════════════════════════════════════════
+
+TAGGED_OUTPUT_DIR = Path(os.getenv("TAGGED_OUTPUT_DIR", "/home/yhz/nifi-data/tagged_output"))
+
+
+def _nifi_tagging_job_dirs(username: Optional[str] = None) -> Dict[str, Path]:
+    root = _export_output_root("nifi", username=username) / "tagging_jobs"
+    inbox = root / "inbox"
+    done = root / "done"
+    error = root / "error"
+    for p in [inbox, done, error]:
+        p.mkdir(parents=True, exist_ok=True)
+    return {"root": root, "inbox": inbox, "done": done, "error": error}
+
+
+def _submit_nifi_tagging_task(
+    source_path: str,
+    source_format: str,
+    tag_type: str,
+    tag_config: Dict[str, Any],
+    file_name: str,
+    owner_id: str = "",
+    username: str = "",
+    target_format: str = "",
+) -> Dict[str, Any]:
+    """v4: 提交自动打标任务到 NiFi 容器（写入共享 tagging_jobs/inbox）。"""
+    normalized_username = _normalize_username(username)
+    dirs = _nifi_tagging_job_dirs(username=normalized_username or None)
+    job_id = f"tag_{uuid.uuid4().hex[:8]}"
+    nifi_source_path = source_path.replace(str(NIFI_REAL_BASE_DIR), "/opt/nifi/nifi-current/data/iot")
+    task = {
+        "jobId": job_id,
+        "sourcePath": nifi_source_path,
+        "sourceFormat": source_format.upper(),
+        "tagType": tag_type,
+        "tagConfig": tag_config,
+        "targetFormat": (target_format or source_format).upper(),
+        "fileName": file_name,
+        "ownerId": owner_id or normalized_username,
+        "factoryId": owner_id or normalized_username,
+        "username": normalized_username,
+        "submittedAt": now_iso(),
+    }
+    task_path = dirs["inbox"] / f"{job_id}.json"
+    task_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = task_path.with_suffix(".json.tmp")
+    tmp_path.write_text(json.dumps(task, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp_path.replace(task_path)
+    if normalized_username:
+        global_dirs = _nifi_tagging_job_dirs()
+        global_task_path = global_dirs["inbox"] / f"{job_id}.json"
+        if global_task_path != task_path:
+            global_task_path.parent.mkdir(parents=True, exist_ok=True)
+            global_tmp = global_task_path.with_suffix(".json.tmp")
+            global_tmp.write_text(json.dumps(task, ensure_ascii=False, indent=2), encoding="utf-8")
+            global_tmp.replace(global_task_path)
+    return {"status": "submitted", "taskPath": str(task_path), "task": task}
+
+
+def _route_nifi_tagging_output_to_user(username: str) -> Dict[str, Any]:
+    """v4: 将共享 NiFi 容器的自动打标结果搬移到用户专属目录。"""
+    global_workspace = NIFI_REAL_BASE_DIR / "tagging_jobs"
+    moved = 0
+    skipped = 0
+    errors = 0
+    if not global_workspace.exists():
+        return {"moved": 0, "skipped": 0, "errors": 0, "message": "global tagging workspace not found"}
+
+    normalized_username = _normalize_username(username)
+    user_job_dirs = _nifi_tagging_job_dirs(username=normalized_username)
+    user_tagged_dir = _get_user_real_nifi_dir(normalized_username) / "tagged_output"
+    user_tagged_dir.mkdir(parents=True, exist_ok=True)
+
+    for folder, status in ((global_workspace / "done", "done"), (global_workspace / "error", "error")):
+        if not folder.exists():
+            continue
+        for path in list(folder.glob("*.json")):
+            if path.name.endswith(".meta.json"):
+                continue
+            try:
+                payload = _read_json_file(path)
+                if not payload:
+                    path.unlink(missing_ok=True)
+                    skipped += 1
+                    continue
+                job_username = _normalize_username(payload.get("username") or payload.get("ownerId") or payload.get("factoryId") or "")
+                if job_username != normalized_username:
+                    skipped += 1
+                    continue
+
+                file_path = payload.get("filePath") or ""
+                if file_path and status == "done":
+                    src = Path(str(file_path))
+                    if src.exists() and src.is_file():
+                        dst = user_tagged_dir / src.name
+                        shutil.move(str(src), str(dst))
+                        moved += 1
+                        payload["filePath"] = str(dst)
+                        payload["path"] = str(dst)
+                        # 注册为新文件并写 meta
+                        try:
+                            meta = register_existing_file(dst, _guess_file_format(dst) or "csv")
+                            meta["jobId"] = payload.get("jobId", path.stem)
+                            meta["storagePath"] = str(dst.resolve())
+                            meta["storageType"] = "NIFI_TAGGING_OUTPUT"
+                            meta["username"] = normalized_username
+                            meta["sourceType"] = "auto_tag"
+                            meta["hasTag"] = True
+                            _write_meta_file(meta)
+                            files[str(meta.get("fileId") or "")] = meta
+                        except Exception:
+                            pass
+
+                target_folder = user_job_dirs.get(status, user_job_dirs["done"])
+                target_folder.mkdir(parents=True, exist_ok=True)
+                dst_path = target_folder / path.name
+                dst_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+                path.unlink(missing_ok=True)
+            except Exception:
+                errors += 1
+
+    return {"moved": moved, "skipped": skipped, "errors": errors}
+
+
+def _route_nifi_tagging_output_for_all_users() -> Dict[str, Any]:
+    """v4: 对所有用户执行 NiFi 自动打标结果回流。"""
+    usernames = _get_all_known_usernames()
+    total = {"moved": 0, "skipped": 0, "errors": 0, "per_user": {}}
+    for username in usernames:
+        try:
+            res = _route_nifi_tagging_output_to_user(username)
+            total["moved"] += res.get("moved", 0)
+            total["skipped"] += res.get("skipped", 0)
+            total["errors"] += res.get("errors", 0)
+            total["per_user"][_normalize_username(username)] = res
+        except Exception:
+            total["errors"] += 1
+    return total
+
+
+def _wait_nifi_task_done(
+    job_id: str,
+    job_type: str,
+    username: str,
+    timeout_seconds: float = 30.0,
+    poll_interval: float = 0.5,
+) -> Optional[Dict[str, Any]]:
+    """v4: 同步等待 NiFi 任务完成并回流结果。
+
+    job_type: "export" | "convert" | "tagging"
+    返回任务结果 payload，超时返回 None。
+    """
+    normalized_username = _normalize_username(username)
+    deadline = time.time() + timeout_seconds
+    payload: Optional[Dict[str, Any]] = None
+    while time.time() < deadline:
+        if job_type == "export":
+            _route_nifi_output_to_user(normalized_username)
+            dirs = _nifi_export_job_dirs(username=normalized_username)
+        elif job_type == "convert":
+            _route_nifi_convert_output_to_user(normalized_username)
+            dirs = _nifi_convert_job_dirs(username=normalized_username)
+        elif job_type == "tagging":
+            _route_nifi_tagging_output_to_user(normalized_username)
+            dirs = _nifi_tagging_job_dirs(username=normalized_username)
+        else:
+            return None
+
+        if payload is None:
+            for folder in [dirs["done"], dirs["error"]]:
+                if not folder.exists():
+                    continue
+                for path in folder.glob(f"{job_id}.json"):
+                    payload = _read_json_file(path)
+                    if payload:
+                        break
+                if payload:
+                    break
+
+        if payload:
+            # 确保结果文件已经回流到用户目录
+            file_path = payload.get("filePath") or ""
+            if file_path and Path(str(file_path)).exists():
+                return payload
+            # tagging 结果默认会回流到用户 tagged_output 目录
+            if job_type == "tagging":
+                user_tagged_dir = _get_user_real_nifi_dir(normalized_username) / "tagged_output"
+                for p in user_tagged_dir.glob("*"):
+                    if p.is_file() and p.stat().st_mtime > deadline - timeout_seconds - 5:
+                        payload["filePath"] = str(p.resolve())
+                        payload["path"] = str(p.resolve())
+                        return payload
+        time.sleep(poll_interval)
+    return payload
+
+
+def _route_nifi_output_to_user(username: str) -> Dict[str, Any]:
+    """v4: 将共享 NiFi 容器的全局工作区产物搬移到用户专属目录。
+
+    共享 NiFi 容器挂载全局 /home/yhz/real_nifi_data/，所有导出产物先写入该全局工作区。
+    本函数扫描全局工作区中的完成/错误任务，根据任务中的 username 将产物搬到用户目录。
+    """
+    global_workspace = NIFI_REAL_BASE_DIR / "export_jobs"
+    moved = 0
+    skipped = 0
+    errors = 0
+    if not global_workspace.exists():
+        return {"moved": 0, "skipped": 0, "errors": 0, "message": "global workspace not found"}
+    user_dirs = _nifi_export_job_dirs(username=username)
+    for folder, status in ((global_workspace / "done", "done"), (global_workspace / "error", "error")):
+        if not folder.exists():
+            continue
+        for path in list(folder.glob("*.json")):
+            if path.name.endswith(".meta.json"):
+                continue
+            try:
+                payload = _read_json_file(path)
+                if not payload:
+                    path.unlink(missing_ok=True)
+                    skipped += 1
+                    continue
+                job_username = _normalize_username(payload.get("username") or payload.get("ownerId") or "")
+                if job_username != _normalize_username(username):
+                    skipped += 1
+                    continue
+                file_path = payload.get("filePath") or payload.get("path") or ""
+                if file_path and status == "done":
+                    src = Path(str(file_path))
+                    if src.exists() and src.is_file():
+                        fmt = _guess_file_format(src).lower() if _guess_file_format(src) else "csv"
+                        target_dir = user_dirs.get(f"output_{fmt}") or user_dirs["output_csv"]
+                        dst = target_dir / src.name
+                        shutil.move(str(src), str(dst))
+                        moved += 1
+                        payload["filePath"] = str(dst)
+                        payload["path"] = str(dst)
+                target_folder = user_dirs.get(status, user_dirs["done"])
+                dst_path = target_folder / path.name
+                dst_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+                try:
+                    path.unlink(missing_ok=True)
+                except Exception:
+                    pass
+            except Exception:
+                errors += 1
+    return {"moved": moved, "skipped": skipped, "errors": errors}
+
+
+def _scan_nifi_export_results_for_user(username: str) -> Dict[str, Any]:
+    """v4: 扫描指定用户 nifi 输出目录。"""
+    dirs = _nifi_export_job_dirs(username=username)
     done_count = 0
     error_count = 0
     registered = 0
@@ -342,6 +875,7 @@ def _scan_nifi_export_results() -> Dict[str, Any]:
                     storage_path = str(p.resolve())
                     meta["storagePath"] = storage_path
                     meta["storageType"] = "NIFI_OUTPUT"
+                    meta["username"] = _normalize_username(username)
                     # 写入配套的 meta.json 文件，确保 tagRange 和 failedTag 字段被写入
                     try:
                         _write_meta_file(meta)
@@ -368,7 +902,8 @@ def _scan_nifi_export_results() -> Dict[str, Any]:
                     "rows": int(payload.get("rows") or 0),
                 })
             report = {
-                "factory_id": payload.get("factoryId") or payload.get("factory_id") or DEFAULT_FACTORY_ID,
+                "factory_id": _normalize_username(username),
+                "username": _normalize_username(username),
                 "job_id": job_id,
                 "batch_id": job_id,
                 "status": result_status,
@@ -387,6 +922,49 @@ def _scan_nifi_export_results() -> Dict[str, Any]:
             except Exception:
                 pass
     return {"done": done_count, "error": error_count, "registered": registered, "jobs": processed_jobs}
+
+
+def _scan_nifi_export_results() -> Dict[str, Any]:
+    """v4: 扫描所有用户 nifi 输出目录（兼容旧调用，内部循环每个用户）。"""
+    session = SessionLocal()
+    try:
+        users = session.query(db_models.IotUser.username).all()
+        usernames = [u[0] for u in users] or [DEFAULT_USERNAME]
+    finally:
+        session.close()
+    total = {"done": 0, "error": 0, "registered": 0, "jobs": []}
+    for username in usernames:
+        try:
+            _route_nifi_output_to_user(username)
+            res = _scan_nifi_export_results_for_user(username)
+            total["done"] += res.get("done", 0)
+            total["error"] += res.get("error", 0)
+            total["registered"] += res.get("registered", 0)
+            total["jobs"].extend(res.get("jobs", []))
+        except Exception:
+            continue
+    return total
+
+
+def _route_nifi_output_for_all_users() -> Dict[str, Any]:
+    """v4: 对所有用户执行全局工作区 → 用户目录的文件搬移。"""
+    session = SessionLocal()
+    try:
+        users = session.query(db_models.IotUser.username).all()
+        usernames = [u[0] for u in users] or [DEFAULT_USERNAME]
+    finally:
+        session.close()
+    total = {"moved": 0, "skipped": 0, "errors": 0, "per_user": {}}
+    for username in usernames:
+        try:
+            res = _route_nifi_output_to_user(username)
+            total["moved"] += res.get("moved", 0)
+            total["skipped"] += res.get("skipped", 0)
+            total["errors"] += res.get("errors", 0)
+            total["per_user"][username] = res
+        except Exception:
+            continue
+    return total
 
 
 def _run_export_job_by_mode(job: Dict[str, Any]) -> Dict[str, Any]:
@@ -506,6 +1084,7 @@ app.add_middleware(
 
 jobs: Dict[str, Dict[str, Any]] = {}
 files: Dict[str, Dict[str, Any]] = {}
+_files_lock = threading.RLock()
 schedules: Dict[str, Dict[str, Any]] = {}
 nifi_export_jobs: Dict[str, Dict[str, Any]] = {}
 tag_rules = [
@@ -679,8 +1258,9 @@ def _emit_structured_log(
     print(json.dumps(record, ensure_ascii=False, default=str))
 
 
-def _normalize_factory_id(value: Optional[str]) -> str:
-    return (value or "").strip() or DEFAULT_FACTORY_ID
+def _normalize_username(value: Optional[str]) -> str:
+    """v4: 统一用户名标准化，优先使用 username，fallback 到 factory_id 或 DEFAULT_USERNAME。"""
+    return (value or "").strip() or DEFAULT_USERNAME
 
 
 def _sanitize_filename_component(value: Optional[str]) -> str:
@@ -723,16 +1303,15 @@ def _resolve_upload_username(request: Request, username_query: Optional[str] = N
     return "user"
 
 
-def _mirror_to_in_data(file_path: Path, factory_id: str = DEFAULT_FACTORY_ID) -> Optional[Path]:
-    """Mirror a source file into the in_data archive tree.
+def _mirror_to_in_data(file_path: Path, username: str = DEFAULT_USERNAME) -> Optional[Path]:
+    """Mirror a source file into the user's storage tree (nifi-data/ subdir).
 
-    Current project convention keeps one factory per deployment, so we mirror
-    NIFI_BASE_DIR content into /in_data/<factory_id>/... while preserving the
-    original relative path under NIFI_BASE_DIR.
+    Uses _resolve_user_storage_root to route to /home/yhz/{username}/nifi-data/.
     """
     if not file_path.exists() or not file_path.is_file():
         return None
 
+    storage_root = _resolve_user_storage_root(username)
     in_data_root = IN_DATA_BASE_DIR.resolve()
     try:
         resolved = file_path.resolve()
@@ -746,7 +1325,7 @@ def _mirror_to_in_data(file_path: Path, factory_id: str = DEFAULT_FACTORY_ID) ->
     if rel is None:
         rel = Path(file_path.name)
 
-    target = IN_DATA_BASE_DIR / factory_id / rel
+    target = storage_root / "nifi-data" / rel
     target.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(resolved, target)
     return target
@@ -782,7 +1361,7 @@ def _build_export_runtime_payload(row: db_models.ExportJobModel) -> Dict[str, An
     return {
         "id": row.id,
         "job_name": row.job_name,
-        "factory_id": _normalize_factory_id(row.factory_id),
+        "username": _normalize_username(row.username or row.factory_id),
         "owner_id": row.owner_id,
         "db_config": row.db_config,
         "file_format": row.file_format,
@@ -791,14 +1370,15 @@ def _build_export_runtime_payload(row: db_models.ExportJobModel) -> Dict[str, An
     }
 
 
-def _persist_to_in_data(factory_id: str, job_id: int, src_path: str) -> str:
-    """Copy fetched file to local in_data directory and return the persisted path."""
+def _persist_to_in_data(username: str, job_id: int, src_path: str) -> str:
+    """Copy fetched file to the user's storage tree and return the persisted path."""
     if not src_path:
         return ""
     src = Path(src_path)
     if not src.exists() or not src.is_file():
         return src_path
-    target_dir = IN_DATA_BASE_DIR / factory_id / str(job_id)
+    storage_root = _resolve_user_storage_root(username)
+    target_dir = storage_root / "nifi-data" / str(job_id)
     target_dir.mkdir(parents=True, exist_ok=True)
     target = target_dir / src.name
     shutil.copy2(src, target)
@@ -876,11 +1456,12 @@ def _build_filesystem_tree(root: Path, label: Optional[str] = None, max_depth: i
     return walk(root, 0)
 
 
-def _copy_path_to_in_data(src: Path, factory_id: str, base_name: Optional[str] = None) -> List[str]:
+def _copy_path_to_in_data(src: Path, username: str, base_name: Optional[str] = None) -> List[str]:
     if not src.exists():
         raise HTTPException(status_code=404, detail="source path not found")
     copied: List[str] = []
-    target_base = IN_DATA_BASE_DIR / factory_id
+    storage_root = _resolve_user_storage_root(username)
+    target_base = storage_root / "nifi-data"
     target_base.mkdir(parents=True, exist_ok=True)
 
     if src.is_file():
@@ -900,8 +1481,6 @@ def _copy_path_to_in_data(src: Path, factory_id: str, base_name: Optional[str] =
             rel = file_path.relative_to(src)
         except Exception:
             rel = Path(file_path.name)
-        # When syncing the whole NIFI_BASE_DIR root, keep its children directly
-        # under the factory archive root instead of nesting an extra nifi-data/.
         if src.resolve() == NIFI_BASE_DIR.resolve() and not base_name:
             target = target_base / rel
         else:
@@ -989,8 +1568,11 @@ def _startup():
         try:
             BACKEND_MODE_STATE = _load_backend_mode_state()
         except Exception:
-            BACKEND_MODE_STATE = {"factory_id": DEFAULT_FACTORY_ID, "mode": "local", "updatedAt": now_iso(), "updatedBy": "system"}
+            BACKEND_MODE_STATE = {"username": DEFAULT_USERNAME, "factory_id": DEFAULT_USERNAME, "mode": "local", "updatedAt": now_iso(), "updatedBy": "system"}
         try:
+            _route_nifi_output_for_all_users()
+            _route_nifi_convert_output_for_all_users()
+            _route_nifi_tagging_output_for_all_users()
             _scan_nifi_export_results()
         except Exception:
             pass
@@ -1009,7 +1591,7 @@ def _startup():
                 schedule_job(str(r.id), r.schedule, _run_export_job_by_mode, args=[{
                     "id": r.id,
                     "job_name": r.job_name,
-                    "factory_id": _normalize_factory_id(r.factory_id),
+                    "username": _normalize_username(r.username or r.factory_id),
                     "owner_id": r.owner_id,
                     "db_config": r.db_config,
                     "file_format": r.file_format,
@@ -1044,11 +1626,12 @@ def api_trigger_export(job: Dict[str, Any], request: Request):
         submitted = _submit_nifi_export_task(job)
         task = submitted.get("task", {})
         fmt = (task.get("format") or "csv").lower()
+        username = _normalize_username(job.get("username") or job.get("factory_id") or task.get("username"))
         return ok({
             "jobId": task.get("jobId"),
             "status": "PENDING",
             "mode": "nifi",
-            "path": str(_export_output_root("nifi") / f"output_{fmt}"),
+            "path": str(_export_output_root("nifi", username=username) / f"output_{fmt}"),
             "taskPath": submitted.get("taskPath"),
             "task": task,
         }, trace_id)
@@ -1065,7 +1648,8 @@ def api_create_export(job: Dict[str, Any], request: Request):
     try:
         ej = db_models.ExportJobModel(
             job_name=job.get("job_name") or job.get("name") or "unnamed",
-            factory_id=_normalize_factory_id(job.get("factory_id")),
+            factory_id=_normalize_username(job.get("username") or job.get("factory_id")),
+            username=_normalize_username(job.get("username") or job.get("factory_id")),
             owner_id=job.get("owner_id"),
             schedule=job.get("schedule"),
             file_format=job.get("file_format", "csv"),
@@ -1083,7 +1667,7 @@ def api_create_export(job: Dict[str, Any], request: Request):
             schedule_job(str(ej.id), ej.schedule, _run_export_job_by_mode, args=[{
                 "id": ej.id,
                 "job_name": ej.job_name,
-                "factory_id": _normalize_factory_id(ej.factory_id),
+                "username": _normalize_username(ej.username or ej.factory_id),
                 "owner_id": ej.owner_id,
                 "db_config": ej.db_config,
                 "file_format": ej.file_format,
@@ -1096,7 +1680,7 @@ def api_create_export(job: Dict[str, Any], request: Request):
                 thread_args = {
                     "id": ej.id,
                     "job_name": ej.job_name,
-                    "factory_id": _normalize_factory_id(ej.factory_id),
+                    "username": _normalize_username(ej.username or ej.factory_id),
                     "owner_id": ej.owner_id,
                     "db_config": ej.db_config,
                     "file_format": ej.file_format,
@@ -1114,15 +1698,17 @@ def api_create_export(job: Dict[str, Any], request: Request):
 
 @app.get("/api/export-jobs")
 @app.get("/api/v1/export-jobs")
-def api_list_exports(request: Request, factory_id: Optional[str] = Query(default=None)):
+def api_list_exports(request: Request, username: Optional[str] = Query(default=None), factory_id: Optional[str] = Query(default=None)):
     trace_id = make_trace_id(request.headers.get("x-trace-id"))
     session = SessionLocal()
     try:
         q = session.query(db_models.ExportJobModel)
-        resolved_factory = _normalize_factory_id(factory_id) if factory_id is not None else None
+        resolved_factory = _normalize_username(username or factory_id) if (username or factory_id) is not None else None
         if resolved_factory:
             q = q.filter(
-                (db_models.ExportJobModel.factory_id == resolved_factory)
+                (db_models.ExportJobModel.username == resolved_factory)
+                | (db_models.ExportJobModel.factory_id == resolved_factory)
+                | (db_models.ExportJobModel.username.is_(None))
                 | (db_models.ExportJobModel.factory_id.is_(None))
             )
         rows = q.all()
@@ -1131,7 +1717,7 @@ def api_list_exports(request: Request, factory_id: Optional[str] = Query(default
             out.append({
                 "id": r.id,
                 "job_name": r.job_name,
-                "factory_id": _normalize_factory_id(r.factory_id),
+                "username": _normalize_username(r.username or r.factory_id),
                 "owner_id": r.owner_id,
                 "schedule": r.schedule,
                 "file_format": r.file_format,
@@ -1156,7 +1742,7 @@ def api_get_export(job_id: int, request: Request):
         return ok({
             "id": r.id,
             "job_name": r.job_name,
-            "factory_id": _normalize_factory_id(r.factory_id),
+            "username": _normalize_username(r.username or r.factory_id),
             "owner_id": r.owner_id,
             "schedule": r.schedule,
             "file_format": r.file_format,
@@ -1183,7 +1769,8 @@ def api_patch_export(job_id: int, patch: Dict[str, Any], request: Request):
         for k in ("job_name", "schedule", "file_format", "mode", "destination", "db_config", "factory_id", "payload"):
             if k in patch:
                 if k == "factory_id":
-                    setattr(r, k, _normalize_factory_id(patch[k]))
+                    setattr(r, k, _normalize_username(patch[k]))
+                    setattr(r, "username", _normalize_username(patch[k]))
                 else:
                     setattr(r, k, patch[k])
         if "enabled" in patch:
@@ -1197,7 +1784,7 @@ def api_patch_export(job_id: int, patch: Dict[str, Any], request: Request):
             schedule_job(str(r.id), r.schedule, _run_export_job_by_mode, args=[{
                 "id": r.id,
                 "job_name": r.job_name,
-                "factory_id": _normalize_factory_id(r.factory_id),
+                "username": _normalize_username(r.username or r.factory_id),
                 "owner_id": r.owner_id,
                 "db_config": r.db_config,
                 "file_format": r.file_format,
@@ -1210,7 +1797,7 @@ def api_patch_export(job_id: int, patch: Dict[str, Any], request: Request):
                 thread_args = {
                     "id": r.id,
                     "job_name": r.job_name,
-                    "factory_id": _normalize_factory_id(r.factory_id),
+                    "username": _normalize_username(r.username or r.factory_id),
                     "owner_id": r.owner_id,
                     "db_config": r.db_config,
                     "file_format": r.file_format,
@@ -1250,7 +1837,7 @@ def api_ingest_factory_report(payload: Dict[str, Any], request: Request):
     _require_admin(request)
     trace_id = make_trace_id(request.headers.get("x-trace-id"))
     record = {
-        "factory_id": _normalize_factory_id(payload.get("factory_id")),
+        "username": _normalize_username(payload.get("username") or payload.get("factory_id")),
         "job_id": str(payload.get("job_id") or ""),
         "batch_id": str(payload.get("batch_id") or ""),
         "status": str(payload.get("status") or "unknown"),
@@ -1271,8 +1858,8 @@ def api_list_factory_reports(request: Request, factory_id: Optional[str] = Query
     trace_id = make_trace_id(request.headers.get("x-trace-id"))
     items = _read_factory_reports()
     if factory_id is not None:
-        resolved_factory = _normalize_factory_id(factory_id)
-        items = [x for x in items if _normalize_factory_id(x.get("factory_id")) == resolved_factory]
+        resolved_factory = _normalize_username(factory_id)
+        items = [x for x in items if _normalize_username(x.get("username") or x.get("factory_id")) == resolved_factory]
     items = list(reversed(items))[:limit]
     return ok(items, trace_id)
 
@@ -1282,13 +1869,15 @@ def api_list_factory_reports(request: Request, factory_id: Optional[str] = Query
 def api_list_factory_jobs(request: Request, factory_id: Optional[str] = Query(default=None)):
     _require_admin(request)
     trace_id = make_trace_id(request.headers.get("x-trace-id"))
-    resolved_factory = _normalize_factory_id(factory_id)
+    resolved_factory = _normalize_username(factory_id)
     session = SessionLocal()
     try:
         rows = (
             session.query(db_models.ExportJobModel)
             .filter(
-                (db_models.ExportJobModel.factory_id == resolved_factory)
+                (db_models.ExportJobModel.username == resolved_factory)
+                | (db_models.ExportJobModel.factory_id == resolved_factory)
+                | (db_models.ExportJobModel.username.is_(None))
                 | (db_models.ExportJobModel.factory_id.is_(None))
             )
             .all()
@@ -1301,7 +1890,7 @@ def api_list_factory_jobs(request: Request, factory_id: Optional[str] = Query(de
             out.append({
                 "id": r.id,
                 "job_name": r.job_name,
-                "factory_id": _normalize_factory_id(r.factory_id),
+                "username": _normalize_username(r.username or r.factory_id),
                 "table": table_name,
                 "schedule": r.schedule,
                 "file_format": r.file_format,
@@ -1319,18 +1908,20 @@ def api_list_factory_jobs(request: Request, factory_id: Optional[str] = Query(de
 def api_fetch_factory_job(job_id: int, request: Request, factory_id: Optional[str] = Query(default=None)):
     _require_admin(request)
     trace_id = make_trace_id(request.headers.get("x-trace-id"))
-    resolved_factory = _normalize_factory_id(factory_id)
+    resolved_factory = _normalize_username(factory_id)
     session = SessionLocal()
     try:
         row = session.query(db_models.ExportJobModel).filter(db_models.ExportJobModel.id == job_id).first()
         if not row:
             raise HTTPException(status_code=404, detail="factory job not found")
-        if _normalize_factory_id(row.factory_id) != resolved_factory:
+        if _normalize_username(row.username or row.factory_id) != resolved_factory:
             raise HTTPException(status_code=404, detail="factory job not found")
 
         # backfill legacy records so subsequent filtering is explicit and stable
-        if not row.factory_id:
-            row.factory_id = resolved_factory
+        if not row.username:
+            row.username = resolved_factory
+            if not row.factory_id:
+                row.factory_id = resolved_factory
 
         runtime_payload = _build_export_runtime_payload(row)
         result = run_export_job(runtime_payload)
@@ -1344,7 +1935,7 @@ def api_fetch_factory_job(job_id: int, request: Request, factory_id: Optional[st
         session.commit()
 
         _append_factory_report({
-            "factory_id": resolved_factory,
+            "username": resolved_factory,
             "job_id": str(row.id),
             "batch_id": f"manual_{now_ts()}",
             "status": str(result.get("status") or "unknown"),
@@ -1360,7 +1951,7 @@ def api_fetch_factory_job(job_id: int, request: Request, factory_id: Optional[st
 
         return ok({
             "job_id": row.id,
-            "factory_id": resolved_factory,
+            "username": resolved_factory,
             **result,
         }, trace_id)
     finally:
@@ -1371,18 +1962,20 @@ def api_fetch_factory_job(job_id: int, request: Request, factory_id: Optional[st
 @app.get("/api/v1/internal/factory-assets")
 def api_list_factory_assets(
     request: Request,
+    username: Optional[str] = Query(default=None),
     factory_id: Optional[str] = Query(default=None),
     path: Optional[str] = Query(default=None),
     limit: int = Query(default=200, ge=1, le=2000),
 ):
     trace_id = make_trace_id(request.headers.get("x-trace-id"))
-    resolved_factory = _normalize_factory_id(factory_id)
+    resolved_username = username or _normalize_username(factory_id) or DEFAULT_USERNAME
+    storage_root = _resolve_user_storage_root(resolved_username)
     # 懒清理：移除磁盘上已不存在的文件索引（用户在 OS 删文件后也能从前端消失）
     _purge_missing_files()
 
     def _infer_in_data_source_type(file_path: Path) -> str:
         try:
-            rel_parts = file_path.relative_to(IN_DATA_BASE_DIR).parts
+            rel_parts = file_path.relative_to(storage_root).parts
         except Exception:
             rel_parts = file_path.parts
         for part in rel_parts:
@@ -1407,8 +2000,11 @@ def api_list_factory_assets(
         return "scheduled_fetch"
 
     assets: List[Dict[str, Any]] = []
-    if IN_DATA_BASE_DIR.exists() and IN_DATA_BASE_DIR.is_dir():
-        for file_path in IN_DATA_BASE_DIR.rglob("*"):
+    for subdir_name in ["nifi-data", "real_nifi_data"]:
+        subdir = storage_root / subdir_name
+        if not subdir.exists() or not subdir.is_dir():
+            continue
+        for file_path in subdir.rglob("*"):
             if not file_path.is_file():
                 continue
             if file_path.name.endswith(".meta.json"):
@@ -1417,7 +2013,7 @@ def api_list_factory_assets(
                 stat = file_path.stat()
             except Exception:
                 continue
-            existing = next((meta for meta in files.values() if str(meta.get("storagePath", "")) == str(file_path)), None)
+            existing = next((meta for meta in list(files.values()) if str(meta.get("storagePath", "")) == str(file_path)), None)
             if existing is None:
                 existing = register_existing_file(file_path, _guess_file_format(file_path) or "FILE")
             item = dict(existing)
@@ -1442,7 +2038,7 @@ def api_list_factory_assets(
         item.pop("mtime_ts", None)
 
     return ok({
-        "factory_id": resolved_factory,
+        "username": resolved_username,
         "total": len(assets),
         "items": assets,
     }, trace_id)
@@ -1450,15 +2046,25 @@ def api_list_factory_assets(
 
 @app.get("/api/internal/factory-tree")
 @app.get("/api/v1/internal/factory-tree")
-def api_get_factory_tree(request: Request, factory_id: Optional[str] = Query(default=None)):
+def api_get_factory_tree(request: Request, username: Optional[str] = Query(default=None)):
+    """管理员内部页：查看指定用户的 nifi-data 和 real_nifi_data 双树结构。
+
+    公有化用户：数据在公司 Ceph /home/yhz/in-data/{username}/ 下
+    私有化用户：数据在工厂 Ceph {ceph_endpoint}/ 下
+    """
     _require_admin(request)
     trace_id = make_trace_id(request.headers.get("x-trace-id"))
-    resolved_factory = _normalize_factory_id(factory_id)
+    resolved_username = username or DEFAULT_USERNAME
+
+    storage_root = _resolve_user_storage_root(resolved_username)
     roots = []
-    tree = _build_filesystem_tree(IN_DATA_BASE_DIR, label="in_data", max_depth=6)
-    if tree:
-        roots.append(tree)
-    return ok({"factory_id": resolved_factory, "roots": roots}, trace_id)
+    for subdir in ["nifi-data", "real_nifi_data"]:
+        subtree = storage_root / subdir
+        tree = _build_filesystem_tree(subtree, label=subdir, max_depth=6)
+        if tree:
+            roots.append(tree)
+
+    return ok({"username": resolved_username, "roots": roots}, trace_id)
 
 
 @app.post("/api/internal/factory-tree/fetch")
@@ -1467,7 +2073,7 @@ def api_fetch_factory_tree(request: Request, payload: Optional[Dict[str, Any]] =
     _require_admin(request)
     trace_id = make_trace_id(request.headers.get("x-trace-id"))
     body = payload or {}
-    resolved_factory = _normalize_factory_id(body.get("factory_id"))
+    resolved_username = _normalize_username(body.get("username") or body.get("factory_id"))
     source_raw = str(body.get("path") or "").strip()
     source_path = Path(source_raw).expanduser() if source_raw else NIFI_BASE_DIR
     if not source_path.exists():
@@ -1482,53 +2088,299 @@ def api_fetch_factory_tree(request: Request, payload: Optional[Dict[str, Any]] =
     if not any(str(resolved_source).startswith(str(root)) for root in allowed_roots):
         raise HTTPException(status_code=403, detail="path not allowed")
 
-    target_root = (IN_DATA_BASE_DIR / resolved_factory).resolve()
+    storage_root = _resolve_user_storage_root(resolved_username)
+    target_root = (storage_root / "nifi-data").resolve()
     if str(resolved_source).startswith(str(target_root)):
-        # Guard against nesting copies like in_data/factory-001 -> in_data/factory-001/factory-001/...
         return ok({
-            "factory_id": resolved_factory,
+            "username": resolved_username,
             "copied": [],
             "count": 0,
             "skipped": True,
-            "message": "source path is already target in_data factory root",
+            "message": "source path is already target storage root",
         }, trace_id)
 
-    copied = _copy_path_to_in_data(resolved_source, resolved_factory, base_name=body.get("alias"))
+    copied = _copy_path_to_in_data(resolved_source, resolved_username, base_name=body.get("alias"))
     record = {
-        "factory_id": resolved_factory,
+        "username": resolved_username,
         "job_id": str(payload.get("job_id") or ""),
         "batch_id": str(payload.get("batch_id") or f"tree_{now_ts()}"),
         "status": "ok",
         "rows": len(copied),
-        "file_path": str(IN_DATA_BASE_DIR / resolved_factory),
+        "file_path": str(storage_root / "nifi-data"),
         "message": f"copied {len(copied)} files",
         "reported_at": now_iso(),
         "received_at": now_iso(),
     }
     _append_factory_report(record)
-    return ok({"factory_id": resolved_factory, "copied": copied, "count": len(copied)}, trace_id)
+    return ok({"username": resolved_username, "copied": copied, "count": len(copied)}, trace_id)
 
 
 @app.post("/api/internal/factory-tree/refresh")
 @app.post("/api/v1/internal/factory-tree/refresh")
 def api_refresh_factory_tree(request: Request, payload: Optional[Dict[str, Any]] = Body(default=None)):
-    _require_admin(request)
+    # v4: 不要求管理员权限，普通用户也需要刷新自己的文件列表
+    # 移除 _require_admin 修复 403 导致前端重定向循环的闪烁问题
     trace_id = make_trace_id(request.headers.get("x-trace-id"))
     body = payload or {}
-    resolved_factory = _normalize_factory_id(body.get("factory_id"))
+    resolved_username = _normalize_username(body.get("username") or body.get("factory_id"))
 
-    # Refresh means rescan the known NiFi archive roots and mirror missing/new files
-    # into the current factory archive root, without creating an extra nifi_data layer.
-    before_known = set(str(meta.get("storagePath", "")) for meta in files.values() if meta.get("storagePath"))
+    before_known = set(str(meta.get("storagePath", "")) for meta in list(files.values()) if meta.get("storagePath"))
     _sync_nifi_files()
-    after_known = set(str(meta.get("storagePath", "")) for meta in files.values() if meta.get("storagePath"))
+    after_known = set(str(meta.get("storagePath", "")) for meta in list(files.values()) if meta.get("storagePath"))
     created = len(after_known - before_known)
 
     return ok({
-        "factory_id": resolved_factory,
+        "username": resolved_username,
         "created": created,
         "message": "refresh completed",
     }, trace_id)
+
+
+# ── 公有化/私有化部署管理 API ──
+
+
+@app.get("/api/v1/internal/users")
+def api_list_users(request: Request):
+    """管理员查看所有用户列表（含部署模式）。v4: 合并 SQLite 与 NiFi DB 用户。"""
+    _require_admin(request)
+    trace_id = make_trace_id(request.headers.get("x-trace-id"))
+    session = SessionLocal()
+    merged: Dict[str, Dict[str, Any]] = {}
+    try:
+        users = session.query(db_models.IotUser).order_by(db_models.IotUser.created_at.desc()).all()
+        for u in users:
+            merged[u.username.lower()] = {
+                "username": u.username,
+                "is_admin": bool(u.is_admin),
+                "deployment_mode": u.deployment_mode or "public",
+                "ceph_endpoint": u.ceph_endpoint or "",
+                "created_at": u.created_at.isoformat() if u.created_at else "",
+            }
+    finally:
+        session.close()
+
+    # 合并 NiFi DB 用户（如 888 仅存在于 NiFi DB 时也能展示）
+    for u in _get_all_nifi_db_users():
+        key = u["username"].lower()
+        if key not in merged:
+            merged[key] = u
+
+    result = sorted(merged.values(), key=lambda x: x.get("created_at") or "", reverse=True)
+    return ok({"users": result, "total": len(result)}, trace_id)
+
+
+@app.put("/api/v1/internal/users/{username}/deployment")
+def api_update_user_deployment(username: str, request: Request, body: Dict[str, Any] = Body(...)):
+    """管理员修改用户部署模式和 Ceph 路径"""
+    _require_admin(request)
+    trace_id = make_trace_id(request.headers.get("x-trace-id"))
+    deployment_mode = body.get("deployment_mode")
+    ceph_endpoint = body.get("ceph_endpoint")
+
+    if deployment_mode not in ("public", "private"):
+        raise HTTPException(status_code=400, detail="deployment_mode 必须为 public 或 private")
+    if deployment_mode == "private" and not ceph_endpoint:
+        raise HTTPException(status_code=400, detail="私有化部署必须提供 ceph_endpoint")
+
+    session = SessionLocal()
+    try:
+        user = session.query(db_models.IotUser).filter(
+            db_models.IotUser.username == username
+        ).first()
+        if not user:
+            raise HTTPException(status_code=404, detail="用户不存在")
+        user.deployment_mode = deployment_mode
+        user.ceph_endpoint = ceph_endpoint or ""
+        session.commit()
+        return ok({
+            "username": username,
+            "deployment_mode": deployment_mode,
+            "ceph_endpoint": ceph_endpoint or "",
+        }, trace_id)
+    finally:
+        session.close()
+
+
+@app.delete("/api/v1/internal/users/{username}")
+def api_delete_user(username: str, request: Request, body: Dict[str, Any] = Body(default={})):
+    """v4: 管理员删除用户（同时删除其 /home/yhz/{username}/ 用户目录及该用户关联的 export_jobs）。"""
+    _require_admin(request)
+    trace_id = make_trace_id(request.headers.get("x-trace-id"))
+
+    if username.lower() == "admin":
+        raise HTTPException(status_code=400, detail="不可删除管理员 admin 账号")
+
+    # 默认行为：purge_data=True 时同步删除 /home/yhz/{username}/ 用户目录
+    purge_data = bool(body.get("purge_data", True)) if isinstance(body, dict) else True
+
+    # 同步删除 NiFi DB 中的用户记录（AUTH_DB=nifi 时用户真实存于 MySQL）
+    nifi_deleted = _delete_nifi_db_user(username)
+
+    session = SessionLocal()
+    local_deleted = False
+    try:
+        user = session.query(db_models.IotUser).filter(
+            db_models.IotUser.username == username
+        ).first()
+        if user:
+            # 删除该用户关联的 export_jobs
+            try:
+                session.query(db_models.ExportJobModel).filter(
+                    db_models.ExportJobModel.username == username
+                ).delete(synchronize_session=False)
+            except Exception:
+                pass
+            try:
+                session.query(db_models.ExportJobModel).filter(
+                    db_models.ExportJobModel.factory_id == username
+                ).delete(synchronize_session=False)
+            except Exception:
+                pass
+
+            session.delete(user)
+            session.commit()
+            local_deleted = True
+    finally:
+        session.close()
+
+    # 若本地和 NiFi DB 都不存在该用户，才返回 404
+    if not local_deleted and not nifi_deleted:
+        raise HTTPException(status_code=404, detail=f"用户 {username} 不存在")
+
+    # 删除用户数据目录
+    data_purged = False
+    if purge_data:
+        try:
+            target = IN_DATA_BASE_DIR / username
+            if target.exists() and target.is_dir():
+                import shutil
+                shutil.rmtree(target)
+                data_purged = True
+        except Exception as e:
+            return ok({"deleted_user": username, "data_purged": False, "data_error": str(e), "nifi_deleted": nifi_deleted}, trace_id)
+
+    return ok({"deleted_user": username, "data_purged": data_purged, "nifi_deleted": nifi_deleted}, trace_id)
+
+
+@app.get("/api/v1/internal/all-users")
+def api_list_all_users_dropdown(request: Request):
+    """管理员获取所有用户下拉列表（含部署模式标注）。v4: 合并 SQLite 与 NiFi DB 用户。"""
+    _require_admin(request)
+    trace_id = make_trace_id(request.headers.get("x-trace-id"))
+    session = SessionLocal()
+    merged: Dict[str, Dict[str, str]] = {}
+    try:
+        users = session.query(db_models.IotUser).order_by(
+            db_models.IotUser.username
+        ).all()
+        for u in users:
+            merged[u.username.lower()] = {
+                "username": u.username,
+                "deployment_mode": u.deployment_mode or "public",
+            }
+    finally:
+        session.close()
+
+    # 合并 NiFi DB 用户
+    for u in _get_all_nifi_db_users():
+        key = u["username"].lower()
+        if key not in merged:
+            merged[key] = {
+                "username": u["username"],
+                "deployment_mode": u.get("deployment_mode") or "public",
+            }
+
+    result = sorted(merged.values(), key=lambda x: x["username"])
+    return ok({"users": result}, trace_id)
+
+
+@app.post("/api/v1/internal/private-users/{username}/pull")
+def api_pull_private_user_data(username: str, request: Request, body: Dict[str, Any] = Body(...)):
+    """管理员拉取私有化用户数据到公司 Ceph"""
+    _require_admin(request)
+    trace_id = make_trace_id(request.headers.get("x-trace-id"))
+
+    user_info = _get_user_info(username)
+    if not user_info:
+        raise HTTPException(status_code=404, detail="用户不存在")
+    if user_info["deployment_mode"] != "private":
+        raise HTTPException(status_code=400, detail="该用户不是私有化部署用户")
+
+    ceph_endpoint = user_info["ceph_endpoint"]
+    if not ceph_endpoint:
+        raise HTTPException(status_code=400, detail="该用户未配置 Ceph 路径")
+
+    ceph_root = Path(ceph_endpoint)
+    if not ceph_root.exists():
+        raise HTTPException(status_code=503, detail=f"工厂 Ceph 不可达: {ceph_root}")
+
+    source_paths = body.get("source_paths") or []
+    target_subdir = body.get("target_subdir") or f"pulled_{datetime.now().strftime('%Y-%m-%d')}"
+
+    if not source_paths:
+        source_paths = [str(ceph_root / "nifi-data"), str(ceph_root / "real_nifi_data")]
+
+    target_base = IN_DATA_BASE_DIR / username / target_subdir
+    target_base.mkdir(parents=True, exist_ok=True)
+
+    stats = {"files": 0, "bytes": 0}
+    for src_str in source_paths:
+        src_path = Path(src_str)
+        if not src_path.exists():
+            continue
+        try:
+            rel = src_path.relative_to(ceph_root)
+        except ValueError:
+            rel = Path(src_path.name)
+        dst = target_base / rel
+        if src_path.is_file():
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src_path, dst)
+            stats["files"] += 1
+            stats["bytes"] += src_path.stat().st_size
+        else:
+            for file_path in src_path.rglob("*"):
+                if not file_path.is_file():
+                    continue
+                if file_path.name.endswith(".meta.json"):
+                    continue
+                try:
+                    frel = file_path.relative_to(src_path)
+                except ValueError:
+                    frel = Path(file_path.name)
+                fdst = dst / frel
+                fdst.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(file_path, fdst)
+                stats["files"] += 1
+                stats["bytes"] += file_path.stat().st_size
+
+    return ok({
+        "username": username,
+        "target_dir": str(target_base),
+        "total_files": stats["files"],
+        "total_bytes": stats["bytes"],
+    }, trace_id)
+
+
+@app.get("/api/v1/user/files/tree")
+def api_user_files_tree(request: Request):
+    """普通用户文件中心：从 JWT 获取用户名，返回自己的 nifi-data + real_nifi_data 双树"""
+    cookie = request.cookies.get("access_token")
+    user = _get_current_user_from_token(cookie)
+    if not user:
+        raise HTTPException(status_code=401, detail="未登录")
+    username = user["username"]
+    trace_id = make_trace_id(request.headers.get("x-trace-id"))
+
+    storage_root = _resolve_user_storage_root(username)
+    roots = []
+    for subdir in ["nifi-data", "real_nifi_data"]:
+        subtree = storage_root / subdir
+        tree = _build_filesystem_tree(subtree, label=subdir, max_depth=6)
+        if tree:
+            roots.append(tree)
+
+    return ok({"username": username, "roots": roots}, trace_id)
 
 
 def _write_ndjson(path: Path, columns: List[str], rows: List[Dict[str, Any]], append: bool = False) -> None:
@@ -1793,7 +2645,7 @@ def _build_manual_tagged_rows(rows: List[Dict[str, Any]], records: List[Dict[str
     return tagged_rows
 
 
-def _write_tagged_output(source_meta: Dict[str, Any], rows: List[Dict[str, Any]], tag_field: str, columns: List[str], operator: str = "unknown") -> Dict[str, Any]:
+def _write_tagged_output(source_meta: Dict[str, Any], rows: List[Dict[str, Any]], tag_field: str, columns: List[str], operator: str = "unknown", username: Optional[str] = None) -> Dict[str, Any]:
     source_name = _infer_tag_source_name(source_meta.get("fileName", "source"))
     ts = now_ts()
     source_fmt = source_meta.get("fileFormat", "CSV").upper()
@@ -1802,38 +2654,52 @@ def _write_tagged_output(source_meta: Dict[str, Any], rows: List[Dict[str, Any]]
         out_columns.append(tag_field)
     user = _sanitize_filename_component(operator)
 
+    # v4: 使用用户隔离的 tagged_output 目录，并根据 backend-mode 选择 nifi-data/real_nifi_data
+    if username:
+        tagged_dir = _get_active_user_data_dir(_normalize_username(username)) / "tagged_output"
+        tagged_dir.mkdir(parents=True, exist_ok=True)
+    else:
+        tagged_dir = TAGGED_OUTPUT_DIR
+
     if source_fmt == "JSON":
-        out_path = TAGGED_OUTPUT_DIR / f"tag_{user}_{ts}_{source_name}.json"
+        out_path = tagged_dir / f"tag_{user}_{ts}_{source_name}.json"
         _write_ndjson_atomic(out_path, out_columns, rows)
         return _register_and_return_meta(out_path, "json")
 
     if source_fmt == "TSV":
-        out_path = TAGGED_OUTPUT_DIR / f"tag_{user}_{ts}_{source_name}.tsv"
+        out_path = tagged_dir / f"tag_{user}_{ts}_{source_name}.tsv"
         _write_tsv_atomic(out_path, out_columns, rows)
         return _register_and_return_meta(out_path, "tsv")
 
-    out_path = TAGGED_OUTPUT_DIR / f"tag_{user}_{ts}_{source_name}.csv"
+    out_path = tagged_dir / f"tag_{user}_{ts}_{source_name}.csv"
     _write_csv_atomic(out_path, out_columns, rows)
     return _register_and_return_meta(out_path, "csv")
 
 
-def _write_edited_output(source_meta: Dict[str, Any], rows: List[Dict[str, Any]], columns: List[str], operator: str = "unknown") -> Dict[str, Any]:
+def _write_edited_output(source_meta: Dict[str, Any], rows: List[Dict[str, Any]], columns: List[str], operator: str = "unknown", username: Optional[str] = None) -> Dict[str, Any]:
     source_name = _infer_tag_source_name(source_meta.get("fileName", "source"))
     ts = now_ts()
     source_fmt = source_meta.get("fileFormat", "CSV").upper()
     user = _sanitize_filename_component(operator)
 
+    # v4: 使用用户隔离的 tagged_output 目录，并根据 backend-mode 选择 nifi-data/real_nifi_data
+    if username:
+        tagged_dir = _get_active_user_data_dir(_normalize_username(username)) / "tagged_output"
+        tagged_dir.mkdir(parents=True, exist_ok=True)
+    else:
+        tagged_dir = TAGGED_OUTPUT_DIR
+
     if source_fmt == "JSON":
-        out_path = TAGGED_OUTPUT_DIR / f"tag_{user}_{ts}_{source_name}.json"
+        out_path = tagged_dir / f"tag_{user}_{ts}_{source_name}.json"
         _write_ndjson_atomic(out_path, columns, rows)
         return _register_and_return_meta(out_path, "json")
 
     if source_fmt == "TSV":
-        out_path = TAGGED_OUTPUT_DIR / f"tag_{user}_{ts}_{source_name}.tsv"
+        out_path = tagged_dir / f"tag_{user}_{ts}_{source_name}.tsv"
         _write_tsv_atomic(out_path, columns, rows)
         return _register_and_return_meta(out_path, "tsv")
 
-    out_path = TAGGED_OUTPUT_DIR / f"tag_{user}_{ts}_{source_name}.csv"
+    out_path = tagged_dir / f"tag_{user}_{ts}_{source_name}.csv"
     _write_csv_atomic(out_path, columns, rows)
     return _register_and_return_meta(out_path, "csv")
 
@@ -1881,33 +2747,44 @@ def register_existing_file(file_path: Path, file_format: str) -> Dict[str, Any]:
         if not file_path.exists():
             return {}
     resolved_path = file_path.resolve()
-    existing_meta = next((meta for meta in files.values() if str(meta.get("storagePath", "")) == str(resolved_path)), None)
-    if existing_meta is not None:
-        existing_meta.update({
+    with _files_lock:
+        existing_meta = next((meta for meta in list(files.values()) if str(meta.get("storagePath", "")) == str(resolved_path)), None)
+        if existing_meta is not None:
+            existing_meta.update({
+                "fileName": resolved_path.name,
+                "fileFormat": file_format.upper(),
+                "fileSize": resolved_path.stat().st_size,
+                "storageType": "LOCAL",
+                "storagePath": str(resolved_path),
+            })
+            try:
+                _mirror_to_in_data(resolved_path, DEFAULT_USERNAME)
+            except Exception:
+                pass
+            return existing_meta
+
+        file_id = f"file_{uuid.uuid4().hex[:10]}"
+        # v4: 从路径推断 username
+        inferred_username = None
+        path_str = str(resolved_path)
+        if path_str.startswith(str(IN_DATA_BASE_DIR)):
+            # 路径格式: /home/yhz/{username}/...
+            parts = resolved_path.relative_to(IN_DATA_BASE_DIR).parts
+            if parts:
+                inferred_username = parts[0]
+        
+        file_meta = {
+            "fileId": file_id,
             "fileName": resolved_path.name,
             "fileFormat": file_format.upper(),
             "fileSize": resolved_path.stat().st_size,
             "storageType": "LOCAL",
             "storagePath": str(resolved_path),
-        })
-        try:
-            _mirror_to_in_data(resolved_path, DEFAULT_FACTORY_ID)
-        except Exception:
-            pass
-        return existing_meta
-
-    file_id = f"file_{uuid.uuid4().hex[:10]}"
-    file_meta = {
-        "fileId": file_id,
-        "fileName": resolved_path.name,
-        "fileFormat": file_format.upper(),
-        "fileSize": resolved_path.stat().st_size,
-        "storageType": "LOCAL",
-        "storagePath": str(resolved_path),
-        "createdAt": now_iso(),
-        "jobId": "",
-    }
-    files[file_id] = file_meta
+            "createdAt": now_iso(),
+            "jobId": "",
+            "username": inferred_username,
+        }
+        files[file_id] = file_meta
     # persist to DB
     try:
         db = SessionLocal()
@@ -1927,7 +2804,7 @@ def register_existing_file(file_path: Path, file_format: str) -> Dict[str, Any]:
     # If the source file originates from the local NiFi archive area, mirror it
     # into in_data so the internal page always reflects the latest artifact set.
     try:
-        _mirror_to_in_data(resolved_path, DEFAULT_FACTORY_ID)
+        _mirror_to_in_data(resolved_path, DEFAULT_USERNAME)
     except Exception:
         pass
 
@@ -1963,6 +2840,27 @@ def _coerce_tag_list(value: Any) -> List[str]:
     return [p.strip() for p in parts if p and p.strip()]
 
 
+def _backup_meta_version(storage_path: str) -> None:
+    """v4 P2-5: 在覆盖 meta 前备份最近 5 个版本到用户 meta_backups 目录。"""
+    try:
+        p = Path(storage_path)
+        parts = p.parts
+        if len(parts) >= 4 and parts[1] == "home" and parts[2] == IN_DATA_BASE_DIR.name:
+            username = parts[3]
+            backup_dir = IN_DATA_BASE_DIR / username / "meta_backups"
+            backup_dir.mkdir(parents=True, exist_ok=True)
+            meta_path = Path(meta_json.meta_path(str(p)))
+            if meta_path.exists():
+                ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+                backup_name = f"{meta_path.stem}.{ts}.meta.json"
+                shutil.copy2(str(meta_path), str(backup_dir / backup_name))
+                backups = sorted(backup_dir.glob(f"{meta_path.stem}.*.meta.json"), key=lambda x: x.stat().st_mtime, reverse=True)
+                for old in backups[5:]:
+                    old.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
 def _write_meta_file(meta: Dict[str, Any], extra: Optional[Dict[str, Any]] = None) -> Path:
     """Write a companion <file>.meta.json next to the file described by meta.
     Merges existing meta file if present. Returns the Path written.
@@ -1973,6 +2871,9 @@ def _write_meta_file(meta: Dict[str, Any], extra: Optional[Dict[str, Any]] = Non
     p = Path(storage_path)
     while p.name.endswith(".meta.json"):
         p = Path(str(p)[: -len(".meta.json")])
+
+    # v4 P2-5: 覆盖前自动备份旧版本
+    _backup_meta_version(str(p))
 
     # 使用 meta_json 模块构建和写入
     extra = extra or {}
@@ -1998,6 +2899,9 @@ def _write_meta_file(meta: Dict[str, Any], extra: Optional[Dict[str, Any]] = Non
         tag_strategy=tag_strategy,
         tag_rule=tag_rule,
     )
+    # 保留已有 fileId，避免 register_existing_file 与 build_meta 生成不同 ID
+    if meta.get("fileId"):
+        new_meta["fileId"] = meta["fileId"]
 
     # 保留已有 meta 中有实际值的字段，跳过标签相关字段（由 extra 提供）和空值
     if meta_json.has_meta(str(p)):
@@ -2042,46 +2946,121 @@ def _guess_file_format(file_path: Path) -> Optional[str]:
     return "FILE"
 
 
+def _get_all_known_usernames() -> List[str]:
+    """v4: 返回 SQLite + NiFi DB 中所有已知用户名，用于文件路由/扫描。"""
+    seen = set()
+    try:
+        session = SessionLocal()
+        try:
+            for u in session.query(db_models.IotUser.username).all():
+                un = _normalize_username(u[0])
+                if un:
+                    seen.add(un)
+        finally:
+            session.close()
+    except Exception:
+        pass
+    for u in _get_all_nifi_db_users():
+        un = _normalize_username(u.get("username", ""))
+        if un:
+            seen.add(un)
+    if not seen:
+        seen.add(_normalize_username(DEFAULT_USERNAME))
+    return sorted(seen)
+
+
+def _is_under_user_storage(path_str: str) -> bool:
+    """判断路径是否位于 /home/yhz/{username}/ 下（而非旧全局路径）。"""
+    if not path_str:
+        return False
+    norm = path_str.replace("\\", "/")
+    in_data_root = str(IN_DATA_BASE_DIR.resolve()).replace("\\", "/")
+    if not norm.startswith(in_data_root + "/"):
+        return False
+    remainder = norm[len(in_data_root) + 1:]
+    first_part = remainder.split("/")[0]
+    # 排除旧全局目录名：nifi-data / real_nifi_data 直接挂在 /home/yhz/ 下时不视为用户目录
+    if first_part in ("nifi-data", "real_nifi_data"):
+        return False
+    return bool(first_part)
+
+
 def _sync_nifi_files() -> None:
-    # Merge files from disk into runtime registry so UI can show complete directory/file data.
-    # Build set of actual files on disk under tracked roots
-    disk_paths = set()
-    for root in [NIFI_BASE_DIR, NIFI_REAL_BASE_DIR, IN_DATA_BASE_DIR]:
-        if not root.exists() or not root.is_dir():
+    """v4: 同步所有用户 nifi/in_data 目录的文件到运行时注册表。
+
+    只扫描 /home/yhz/{username}/ 下的用户隔离目录，不再扫描旧全局路径
+    /home/yhz/nifi-data/ 与 /home/yhz/real_nifi_data/，避免旧文件污染文件中心。
+    """
+    try:
+        _route_nifi_output_for_all_users()
+        _route_nifi_convert_output_for_all_users()
+        _route_nifi_tagging_output_for_all_users()
+    except Exception:
+        pass
+
+    # Build set of actual files on disk under user storage roots
+    disk_paths: set[str] = set()
+
+    # 扫描所有已知用户（SQLite + NiFi DB），避免遍历整个 /home/yhz 导致超时
+    usernames = _get_all_known_usernames()
+    for username in usernames:
+        try:
+            storage_root = _resolve_user_storage_root(username)
+            if not storage_root.exists() or not storage_root.is_dir():
+                continue
+            for p in storage_root.rglob("*"):
+                if not p.is_file():
+                    continue
+                if p.name.endswith(".meta.json"):
+                    continue
+                if any(jobs_dir in p.parts for jobs_dir in ("export_jobs", "convert_jobs", "tagging_jobs")):
+                    continue
+                disk_paths.add(str(p.resolve()))
+        except Exception:
             continue
-        for p in root.rglob("*"):
-            if not p.is_file():
-                continue
-            if p.name.endswith(".meta.json"):
-                continue
-            if "export_jobs" in p.parts:
-                continue
-            disk_paths.add(str(p.resolve()))
 
     # Remove registry entries that point to files no longer present on disk
+    # 或指向旧全局路径（非用户隔离目录）的记录
     for fid, meta in list(files.items()):
         sp = str(meta.get("storagePath", ""))
         if not sp:
             continue
-        # only consider NiFi / in_data managed paths for removal
-        if sp.startswith(str(NIFI_BASE_DIR)) or sp.startswith(str(NIFI_REAL_BASE_DIR)) or sp.startswith(str(IN_DATA_BASE_DIR)):
+        if _is_under_user_storage(sp):
             if sp not in disk_paths:
                 try:
                     del files[fid]
                 except Exception:
                     pass
+        else:
+            # 旧全局路径 / 旧 factory-001 路径直接清理
+            try:
+                del files[fid]
+            except Exception:
+                pass
 
     # Register any new files found on disk
-    known_paths = set(str(meta.get("storagePath", "")) for meta in files.values() if meta.get("storagePath"))
+    known_paths = set(str(meta.get("storagePath", "")) for meta in list(files.values()) if meta.get("storagePath"))
     for p_str in disk_paths:
         if p_str in known_paths:
             continue
         p = Path(p_str)
         fmt = _guess_file_format(p)
-        register_existing_file(p, fmt)
+        meta = register_existing_file(p, fmt)
+        # 推断 username
+        if not meta.get("username"):
+            for username in usernames:
+                storage_root = _resolve_user_storage_root(username)
+                try:
+                    if str(p.resolve()).startswith(str(storage_root.resolve())):
+                        meta["username"] = _normalize_username(username)
+                        break
+                except Exception:
+                    continue
+            if not meta.get("username"):
+                meta["username"] = DEFAULT_USERNAME
 
 
-def resolve_nifi_output_file(expected_format: str) -> Optional[Dict[str, Any]]:
+def resolve_nifi_output_file(expected_format: str, username: Optional[str] = None) -> Optional[Dict[str, Any]]:
     """Search NiFi output and legacy inbox directories for the latest file of given format.
 
     Search order:
@@ -2089,9 +3068,19 @@ def resolve_nifi_output_file(expected_format: str) -> Optional[Dict[str, Any]]:
     2. `INBOX_CSV_DIR` (if format is csv)
     3. `INBOX_JSON_DIR` (if format is json)
     4. any fallback directory among the above
+    v4: 如果提供 username，优先搜索用户隔离目录。
     """
     ext = expected_format.lower()
     search_dirs = []
+
+    # v4: 优先搜索用户目录
+    if username:
+        user_nifi = _get_user_nifi_dir(_normalize_username(username))
+        for sub in ["output_csv", "output_json", "output_tsv", "inbox_csv", "inbox_json", "inbox_tsv"]:
+            d = user_nifi / sub
+            if d.exists() and d.is_dir():
+                search_dirs.append(d)
+
     if NIFI_OUTPUT_DIR.exists() and NIFI_OUTPUT_DIR.is_dir():
         search_dirs.append(NIFI_OUTPUT_DIR)
     if ext == "csv" and INBOX_CSV_DIR.exists() and INBOX_CSV_DIR.is_dir():
@@ -2150,7 +3139,10 @@ def get_executor_info(x_trace_id: Optional[str] = Header(default=None)):
 @app.get("/api/v1/internal/backend-mode")
 def get_backend_mode(request: Request, x_trace_id: Optional[str] = Header(default=None)):
     trace_id = make_trace_id(x_trace_id)
-    state = _load_backend_mode_state()
+    # v4: 提取当前登录用户，加载该用户的后端模式配置
+    cookie_user = _get_current_user_from_token(request.cookies.get("access_token")) or {}
+    username = cookie_user.get("username")
+    state = _load_backend_mode_state(username)
     request.state.observation = {
         "operation": "backend_mode",
         "status": "SUCCEEDED",
@@ -2166,29 +3158,45 @@ def get_backend_mode(request: Request, x_trace_id: Optional[str] = Header(defaul
 @app.post("/api/v1/internal/backend-mode")
 def set_backend_mode(payload: Dict[str, Any], request: Request):
     trace_id = request.state.trace_id
-    _require_admin(request)
     mode = str(payload.get("mode", "local")).strip().lower()
     if mode not in {"local", "nifi"}:
         return err(1002401, "mode must be local or nifi", trace_id)
-    factory_id = _normalize_factory_id(payload.get("factory_id") or payload.get("tenantId"))
-    operator = str(payload.get("operator") or (payload.get("user") or {}).get("username") or "system")
+
+    # v4: 提取目标用户与当前登录用户
+    cookie_user = _get_current_user_from_token(request.cookies.get("access_token")) or {}
+    current_username = _normalize_username(cookie_user.get("username") or cookie_user.get("user") or cookie_user.get("name"))
+    target_username = _normalize_username(payload.get("username") or payload.get("factory_id") or payload.get("tenantId") or current_username)
+    is_admin = bool(cookie_user.get("is_admin"))
+
+    # 权限校验：普通用户只能切换自己的模式；admin 可以切换任意用户
+    if not is_admin and target_username != current_username:
+        raise HTTPException(status_code=403, detail="只能切换自己的后端模式")
+
+    operator = str(payload.get("operator") or current_username or "system")
     state = {
-        "factory_id": factory_id,
+        "username": target_username,  # v4: 必须包含 username 字段
+        "factory_id": target_username,
         "mode": mode,
         "updatedAt": now_iso(),
         "updatedBy": operator,
     }
     saved = _save_backend_mode_state(state)
     _append_factory_report({
-        "factory_id": factory_id,
+        "factory_id": target_username,
         "job_id": "",
         "batch_id": f"backend_mode_{now_ts()}",
         "status": mode,
         "rows": 0,
         "file_path": str(BACKEND_MODE_FILE),
-        "message": f"backend mode switched to {mode}",
+        "message": f"backend mode switched to {mode} for {target_username}",
         "reported_at": now_iso(),
         "received_at": now_iso(),
+    })
+    _append_audit_log({
+        "event": "BACKEND_MODE_SWITCH",
+        "operator": operator,
+        "targetUser": target_username,
+        "mode": mode,
     })
     request.state.observation = {
         "operation": "backend_mode",
@@ -2212,9 +3220,12 @@ def get_internal_nifi_status(request: Request, x_trace_id: Optional[str] = Heade
 @app.post("/api/v1/internal/nifi/ensure")
 def ensure_internal_nifi(request: Request):
     trace_id = request.state.trace_id
-    result = {"ok": True, "ready": True, "message": "v2-nifi flow manually deployed"}
+    try:
+        result = nifi_orchestrator.ensure_nifi_ready_for_all_flows()
+    except Exception as exc:
+        result = {"ok": False, "error": str(exc)}
     _append_factory_report({
-        "factory_id": DEFAULT_FACTORY_ID,
+        "factory_id": DEFAULT_USERNAME,
         "job_id": "",
         "batch_id": f"nifi_ensure_{now_ts()}",
         "status": "SUCCEEDED" if result.get("ok") else "FAILED",
@@ -2232,6 +3243,7 @@ def ensure_internal_nifi(request: Request):
 @app.post("/api/v1/internal/nifi-export-jobs/sync")
 def sync_nifi_export_jobs(request: Request):
     trace_id = request.state.trace_id
+    _route_nifi_output_for_all_users()
     scan = _scan_nifi_export_results()
     return ok(scan, trace_id)
 
@@ -2239,6 +3251,7 @@ def sync_nifi_export_jobs(request: Request):
 @app.get("/api/v1/internal/nifi-export-jobs")
 def list_nifi_export_jobs(request: Request, x_trace_id: Optional[str] = Header(default=None)):
     trace_id = make_trace_id(x_trace_id)
+    _route_nifi_output_for_all_users()
     scan = _scan_nifi_export_results()
     return ok({"jobs": list(nifi_export_jobs.values()), "sync": scan}, trace_id)
 
@@ -2246,6 +3259,7 @@ def list_nifi_export_jobs(request: Request, x_trace_id: Optional[str] = Header(d
 @app.get("/api/v1/internal/nifi-export-jobs/{job_id}")
 def get_nifi_export_job(job_id: str, request: Request, x_trace_id: Optional[str] = Header(default=None)):
     trace_id = make_trace_id(x_trace_id)
+    _route_nifi_output_for_all_users()
     _scan_nifi_export_results()
     job = nifi_export_jobs.get(job_id)
     if not job:
@@ -2262,6 +3276,8 @@ async def create_job(req: JobCreateReq, x_trace_id: Optional[str] = Header(defau
         "jobType": req.jobType,
         "status": "PENDING",
         "progress": 0,
+        "username": req.runBy or DEFAULT_USERNAME,
+        "ownerId": req.runBy or DEFAULT_USERNAME,
         "source": req.source.model_dump(),
         "target": req.target.model_dump(),
         "errorCode": "",
@@ -2310,9 +3326,13 @@ def list_jobs(
     pageNo: int = Query(default=1),
     pageSize: int = Query(default=20),
     x_trace_id: Optional[str] = Header(default=None),
+    request: Request = None,
 ):
     trace_id = make_trace_id(x_trace_id)
-    data = list(jobs.values())
+    # v4: 获取当前用户，仅返回当前用户的任务
+    cookie_user = _get_current_user_from_token(request.cookies.get("access_token")) if request else {}
+    current_username = cookie_user.get("username") or DEFAULT_USERNAME
+    data = [j for j in jobs.values() if j.get("username", "") == current_username or j.get("ownerId", "") == current_username]
     if status:
         data = [j for j in data if j["status"] == status]
     if jobType:
@@ -2347,22 +3367,26 @@ def get_job_outputs(job_id: str, x_trace_id: Optional[str] = Header(default=None
 
 
 @app.get("/api/v1/files/{file_id}/download")
-def download_file(file_id: str):
+@app.get("/api/files/{file_id}/download")
+def download_file(file_id: str, request: Request):
     file_meta = files.get(file_id)
     if not file_meta:
         raise HTTPException(status_code=404, detail="file not found")
+    _check_file_access(request, file_meta)
     file_path = Path(file_meta["storagePath"])
     return FileResponse(file_path, filename=file_meta["fileName"], media_type="application/octet-stream")
 
 
 @app.get("/api/v1/files/{file_id}/preview")
-def preview_file(file_id: str, offset: int = 0, limit: int = 100, x_trace_id: Optional[str] = Header(default=None)):
+@app.get("/api/files/{file_id}/preview")
+def preview_file(file_id: str, request: Request, offset: int = 0, limit: int = 100, x_trace_id: Optional[str] = Header(default=None)):
     trace_id = make_trace_id(x_trace_id)
     if offset < 0 or limit <= 0:
         return err(1002401, "offset must be >= 0 and limit must be > 0", trace_id)
     file_meta = files.get(file_id)
     if not file_meta:
         return err(1002404, "file not found", trace_id)
+    _check_file_access(request, file_meta)
 
     file_path = Path(file_meta["storagePath"])
     fmt = file_meta["fileFormat"].upper()
@@ -2436,9 +3460,36 @@ def preview_file(file_id: str, offset: int = 0, limit: int = 100, x_trace_id: Op
     return ok({"columns": columns, "rows": rows, "total": len(data_rows), "meta": meta_summary}, trace_id)
 
 
+def _append_audit_log(event: Dict[str, Any]) -> None:
+    """v4 P2-4: 写入全局审计日志（JSONL）。"""
+    try:
+        AUDIT_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        record = {"timestamp": now_iso(), **event}
+        with AUDIT_LOG_PATH.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+
+def _sanitize_file_meta(meta: Dict[str, Any]) -> Dict[str, Any]:
+    """v4: 返回给前端的文件 meta 清理内部路径字段。
+
+    保留 storagePath：文件中心需要根据它构建目录树并按目录筛选文件。
+    """
+    if not isinstance(meta, dict):
+        return meta
+    sanitized = dict(meta)
+    sensitive_keys = ["absolutePath", "realPath", "internalPath", "containerPath"]
+    for key in sensitive_keys:
+        sanitized.pop(key, None)
+    return sanitized
+
+
 def _purge_missing_files() -> int:
     """懒清理：files 字典 + DB 中 storagePath 指向的文件已不存在的记录，统一移除。
 
+    v4 新增：同时清理指向旧全局路径（非 /home/yhz/{username}/ 用户隔离目录）的记录，
+    避免文件中心继续展示项目初期的旧 admin / factory-001 目录。
     返回被清理的条目数量。任意文件中心 / 内部管理页的列表接口都应在返回前调用一次，
     这样用户在 OS 层面删除文件后，前端不再看到残留条目。
     """
@@ -2452,6 +3503,28 @@ def _purge_missing_files() -> int:
         sp = meta.get("storagePath", "") if isinstance(meta, dict) else ""
         if not sp:
             continue
+
+        # v4: 旧全局路径记录直接清理
+        if not _is_under_user_storage(sp):
+            try:
+                del files[fid]
+            except Exception:
+                pass
+            # 同步从数据库删除
+            try:
+                db = SessionLocal()
+                try:
+                    row = db.query(db_models.FileModel).filter(db_models.FileModel.file_id == fid).first()
+                    if row is not None:
+                        db.delete(row)
+                        db.commit()
+                finally:
+                    db.close()
+            except Exception:
+                pass
+            removed += 1
+            continue
+
         try:
             if Path(sp).exists():
                 continue
@@ -2478,9 +3551,12 @@ def _purge_missing_files() -> int:
 
 
 @app.get("/api/v1/files")
+@app.get("/api/files")
 def list_files(
+    request: Request,
     fileFormat: Optional[str] = Query(default=None),
     nifiOnly: bool = Query(default=True),
+    username: Optional[str] = Query(default=None),
     pageNo: int = Query(default=1),
     pageSize: int = Query(default=20),
     x_trace_id: Optional[str] = Header(default=None),
@@ -2488,20 +3564,62 @@ def list_files(
     trace_id = make_trace_id(x_trace_id)
     _sync_nifi_files()
     try:
+        _route_nifi_output_for_all_users()
         scan = _scan_nifi_export_results()
     except Exception:
         scan = {"done": 0, "error": 0, "registered": 0, "jobs": []}
     # 懒清理：移除磁盘上已不存在的文件索引
     _purge_missing_files()
-    data = list(files.values())
+    with _files_lock:
+        data = list(files.values())
+    # v4: 权限过滤 — 非 admin 强制限定为当前 username
+    cookie_user = _get_current_user_from_token(request.cookies.get("access_token")) or {}
+    if cookie_user.get("is_admin"):
+        target_username = _normalize_username(username) if username else None
+    else:
+        target_username = _normalize_username(cookie_user.get("username") or cookie_user.get("user") or cookie_user.get("name"))
+    if target_username:
+        data = [f for f in data if _normalize_username(f.get("username") or f.get("factory_id")) == target_username or
+                # 兼容历史：username 字段为空时尝试路径匹配
+                (not (f.get("username") or f.get("factory_id")) and str(f.get("storagePath", "")).startswith(str(_resolve_user_storage_root(target_username).resolve())))]
     if nifiOnly:
-        roots = [str(_export_output_root("nifi")), str(_export_output_root("local"))]
-        data = [f for f in data if any(str(f.get("storagePath", "")).startswith(root) for root in roots)]
+        # v4: 动态构建当前用户的 nifi 路径前缀（仅用户隔离目录，不含旧全局路径）
+        if target_username:
+            user_roots = [
+                str(_get_user_real_nifi_dir(target_username)),
+                str(_get_user_nifi_dir(target_username)),
+            ]
+        else:
+            # admin 或未登录：扫描所有已知用户目录
+            user_roots = []
+            seen_users = set()
+            try:
+                sess = SessionLocal()
+                try:
+                    all_users = sess.query(db_models.IotUser.username).all()
+                    for u in all_users:
+                        un = _normalize_username(u[0])
+                        seen_users.add(un)
+                        user_roots.append(str(_get_user_real_nifi_dir(un)))
+                        user_roots.append(str(_get_user_nifi_dir(un)))
+                finally:
+                    sess.close()
+            except Exception:
+                pass
+            # 合并 NiFi DB 中尚未同步到 SQLite 的用户目录
+            for u in _get_all_nifi_db_users():
+                un = _normalize_username(u.get("username", ""))
+                if not un or un in seen_users:
+                    continue
+                seen_users.add(un)
+                user_roots.append(str(_get_user_real_nifi_dir(un)))
+                user_roots.append(str(_get_user_nifi_dir(un)))
+        data = [f for f in data if any(str(f.get("storagePath", "")).startswith(root) for root in user_roots)]
     if fileFormat:
         data = [f for f in data if f.get("fileFormat") == fileFormat.upper()]
     total = len(data)
     start = max((pageNo - 1) * pageSize, 0)
-    rows = data[start : start + pageSize]
+    rows = [_sanitize_file_meta(f) for f in data[start : start + pageSize]]
     return ok({"total": total, "pageNo": pageNo, "pageSize": pageSize, "rows": rows, "scan": scan}, trace_id)
 
 
@@ -2517,12 +3635,36 @@ def purge_missing_files(x_trace_id: Optional[str] = Header(default=None)):
     # 同步清理孤儿 meta.json（在 TAGGED_OUTPUT_DIR / 任何 data 根目录下，配套 .meta.json 无对应 .csv/.tsv/.json 的）
     removed_meta = 0
     try:
+        # v4: 动态路径，扫描所有用户隔离目录及全局目录
         roots = [
             str(TAGGED_OUTPUT_DIR),
-            "/home/yhz/nifi-data/output_csv",
-            "/home/yhz/nifi-data/output_tsv",
-            "/home/yhz/nifi-data/output_json",
         ]
+        # 扫描所有用户的 nifi-data 目录
+        try:
+            sess = SessionLocal()
+            try:
+                all_users = sess.query(db_models.IotUser.username).all()
+                for u in all_users:
+                    un = _normalize_username(u[0])
+                    base = _resolve_user_storage_root(un)
+                    for sub in ["output_csv", "output_tsv", "output_json"]:
+                        d = base / "nifi-data" / sub
+                        if d.exists():
+                            roots.append(str(d))
+            finally:
+                sess.close()
+        except Exception:
+            # fallback: 至少扫描 admin 和旧全局路径
+            try:
+                base = _resolve_user_storage_root("admin")
+                for sub in ["output_csv", "output_tsv", "output_json"]:
+                    d = base / "nifi-data" / sub
+                    if d.exists():
+                        roots.append(str(d))
+            except Exception:
+                roots.append("/home/yhz/nifi-data/output_csv")
+                roots.append("/home/yhz/nifi-data/output_tsv")
+                roots.append("/home/yhz/nifi-data/output_json")
         seen = set()
         for root in roots:
             r = Path(root)
@@ -2545,13 +3687,108 @@ def purge_missing_files(x_trace_id: Optional[str] = Header(default=None)):
     return ok({"removed": removed_files, "removedMeta": removed_meta}, trace_id)
 
 
+@app.delete("/api/v1/files/{file_id}")
+def delete_file(file_id: str, request: Request, x_trace_id: Optional[str] = Header(default=None)):
+    """v4 P2-10: 删除文件并同步删除配套 .meta.json、files 索引和数据库记录。"""
+    trace_id = make_trace_id(x_trace_id)
+    meta = files.get(file_id)
+    if not meta:
+        return err(1004404, "file not found", trace_id)
+
+    # 权限校验：非 admin 只能删除自己目录下的文件
+    cookie_user = _get_current_user_from_token(request.cookies.get("access_token")) or {}
+    if not cookie_user.get("is_admin"):
+        username = _normalize_username(cookie_user.get("username") or cookie_user.get("user") or cookie_user.get("name"))
+        if not str(meta.get("storagePath", "")).startswith(str(_resolve_user_storage_root(username))):
+            return err(1004403, "permission denied", trace_id)
+
+    storage_path = meta.get("storagePath", "")
+    p = Path(storage_path)
+    meta_path = Path(meta_json.meta_path(storage_path))
+    removed = False
+    try:
+        if p.exists():
+            p.unlink()
+            removed = True
+        if meta_path.exists():
+            meta_path.unlink()
+        # 清理 xattr（如果支持）
+        try:
+            meta_json.delete_meta(storage_path)
+        except Exception:
+            pass
+    except Exception as e:
+        return err(1005001, f"delete failed: {e}", trace_id)
+
+    # 从内存索引移除
+    files.pop(file_id, None)
+
+    # 从数据库移除
+    try:
+        db = SessionLocal()
+        try:
+            row = db.query(db_models.FileModel).filter(db_models.FileModel.file_id == file_id).first()
+            if row:
+                db.delete(row)
+                db.commit()
+        finally:
+            db.close()
+    except Exception:
+        pass
+
+    operator = _normalize_username(cookie_user.get("username") or cookie_user.get("user") or cookie_user.get("name") or "system")
+    _append_audit_log({
+        "event": "FILE_DELETE",
+        "operator": operator,
+        "fileId": file_id,
+        "fileName": meta.get("fileName"),
+        "storagePath": storage_path,
+        "removed": removed,
+    })
+
+    return ok({"fileId": file_id, "removed": removed}, trace_id)
+
+
+@app.get("/api/v1/files/{file_id}/xattr")
+def get_file_xattr(file_id: str, request: Request, x_trace_id: Optional[str] = Header(default=None)):
+    """v4: 返回文件扩展属性（xattr）中存储的解密后配置元数据，仅 admin 可查看。"""
+    trace_id = make_trace_id(x_trace_id)
+    meta = files.get(file_id)
+    if not meta:
+        return err(1004404, "file not found", trace_id)
+
+    cookie_user = _get_current_user_from_token(request.cookies.get("access_token")) or {}
+    if not cookie_user.get("is_admin"):
+        return err(1004403, "permission denied: admin only", trace_id)
+
+    storage_path = meta.get("storagePath", "")
+    if not storage_path or not Path(storage_path).exists():
+        return err(1004404, "file not found on disk", trace_id)
+
+    try:
+        xattr_meta = meta_json.read_meta(storage_path)
+    except Exception as e:
+        return err(1005001, f"read xattr failed: {e}", trace_id)
+
+    return ok({
+        "fileId": file_id,
+        "storagePath": storage_path,
+        "xattrEnabled": meta_json.is_xattr_enabled(),
+        "meta": xattr_meta,
+    }, trace_id)
+
+
 @app.post("/api/v1/tags/manual")
-def manual_tag(req: ManualTagReq, x_trace_id: Optional[str] = Header(default=None)):
+def manual_tag(request: Request, req: ManualTagReq, x_trace_id: Optional[str] = Header(default=None)):
     trace_id = make_trace_id(x_trace_id)
     if req.fileId not in files:
         return err(1002404, "file not found", trace_id)
     if not req.records:
         return err(1002401, "records must not be empty", trace_id)
+
+    # v4: 获取当前用户用于路径隔离
+    cookie_user = _get_current_user_from_token(request.cookies.get("access_token")) or {}
+    current_username = _normalize_username(cookie_user.get("username") or cookie_user.get("user") or cookie_user.get("name"))
 
     source_meta = files[req.fileId]
     source_path = Path(source_meta["storagePath"])
@@ -2602,7 +3839,7 @@ def manual_tag(req: ManualTagReq, x_trace_id: Optional[str] = Header(default=Non
     except Exception:
         pass
 
-    out_meta = _write_tagged_output(source_meta, tagged_rows, "tag", columns, req.operator)
+    out_meta = _write_tagged_output(source_meta, tagged_rows, "tag", columns, req.operator, username=current_username)
 
     # 写入新文件的配套 meta
     out_path = Path(out_meta["storagePath"])
@@ -2642,16 +3879,27 @@ def manual_table_edit(req: ManualTableEditReq, request: Request, x_trace_id: Opt
         }
         return err(1002404, "file not found", trace_id)
 
+    # v4: 获取当前用户用于路径隔离
+    cookie_user = _get_current_user_from_token(request.cookies.get("access_token")) or {}
+    current_username = _normalize_username(cookie_user.get("username") or cookie_user.get("user") or cookie_user.get("name"))
+
     source_meta = files[req.fileId]
     source_path = Path(source_meta["storagePath"])
     source_fmt = source_meta.get("fileFormat", "CSV")
 
-    # 读取配套 meta 获取 tagRange，用于校验编辑后的标签列值
+    # 读取元数据，用于校验编辑后的标签列值与输出文件继承
+    full_meta: Dict[str, Any] = {}
     tag_range = None
+    failed_tag = None
+    tag_column = None
+    tag_name = None
     try:
         if meta_json.has_meta(str(source_path)):
             full_meta = meta_json.read_meta(str(source_path))
             tag_range = full_meta.get("tagRange")
+            failed_tag = full_meta.get("failedTag")
+            tag_column = full_meta.get("tagColumn")
+            tag_name = full_meta.get("tagName")
     except Exception:
         pass
 
@@ -2669,6 +3917,8 @@ def manual_table_edit(req: ManualTableEditReq, request: Request, x_trace_id: Opt
         }
         return err(1002402, f"read source file failed: {e}", trace_id)
 
+    original_columns = list(columns)
+
     # Rename columns first so subsequent cell edits can use new column names.
     rename_count = 0
     if req.renameColumns:
@@ -2677,12 +3927,26 @@ def manual_table_edit(req: ManualTableEditReq, request: Request, x_trace_id: Opt
             new = str(item.get("new", "")).strip()
             if not old or not new or old == new:
                 continue
+            # 新增字段列名固定为 tag，且不允许通过重命名绕过限制。
+            if old == "tag" or new == "tag":
+                return err(1002401, "新增字段列名固定为 tag，且不允许重命名 tag 列", trace_id)
             if old in columns:
                 columns = [new if c == old else c for c in columns]
                 for r in rows:
                     if old in r:
                         r[new] = r.pop(old)
                 rename_count += 1
+
+    added_columns = {
+        str(change.get("column", "")).strip()
+        for change in req.changes
+        if str(change.get("column", "")).strip() and str(change.get("column", "")).strip() not in original_columns
+    }
+    if added_columns:
+        if len(added_columns) > 1 or added_columns != {"tag"}:
+            return err(1002401, "预览编辑区最多只能新增 1 列，且列名必须为 tag", trace_id)
+        if "tag" in original_columns:
+            return err(1002401, "当前文件已存在 tag 列，禁止再次新增", trace_id)
 
     changed_cells = 0
     db_tag_rows: List[Dict[str, str]] = []
@@ -2697,8 +3961,8 @@ def manual_table_edit(req: ManualTableEditReq, request: Request, x_trace_id: Opt
         if not column:
             continue
         value = str(change.get("value", ""))
-        # 标签相关列（label / tag / 自动识别为 tagColumn）编辑时校验值是否在 tagRange 内
-        is_tag_col = column in ("label", "tag") or (tag_name and column == tag_name)
+        # 标签相关列编辑时校验值是否在 tagRange 内。
+        is_tag_col = column in ("label", "tag") or (tag_column and column == tag_column)
         if is_tag_col and value and tag_range and isinstance(tag_range, list) and len(tag_range) > 0:
             if value not in tag_range:
                 return err(1002401, f"标签值 '{value}' 不在允许的标签范围 {tag_range} 中", trace_id)
@@ -2723,7 +3987,29 @@ def manual_table_edit(req: ManualTableEditReq, request: Request, x_trace_id: Opt
     except Exception:
         pass
 
-    out_meta = _write_edited_output(source_meta, rows, columns, req.operator)
+    out_meta = _write_edited_output(source_meta, rows, columns, req.operator, username=current_username)
+    out_path = Path(out_meta["storagePath"])
+    try:
+        output_tag_column = tag_column or ("tag" if "tag" in columns else "")
+        new_meta = meta_json.build_meta(
+            file_path=str(out_path),
+            source_type="manual_tag",
+            has_tag=bool(output_tag_column),
+            tag_column=output_tag_column or "tag",
+            tag_name=tag_name or "手动标签结果",
+            tag_strategy="manual_range",
+            tag_range=tag_range,
+            failed_tag=failed_tag,
+            columns=columns,
+            row_count=len(rows),
+            file_size=out_path.stat().st_size if out_path.exists() else 0,
+        )
+        for key in ("categoryId", "categoryName", "description", "trainable"):
+            if key in full_meta and full_meta.get(key) is not None:
+                new_meta[key] = full_meta.get(key)
+        meta_json.write_meta(str(out_path), new_meta)
+    except Exception:
+        pass
     request.state.observation = {
         "operation": "manual_table_edit",
         "status": "SUCCEEDED",
@@ -2771,10 +4057,36 @@ async def upload_file(request: Request,
     suffix = Path(file.filename or "").suffix.lower()
     filename = f"raw_{owner_id}_{stem}_{ts}.{suffix.lstrip('.')}"
 
+    # v4: 用户隔离上传目录（使用 cookie 解析出的真实用户名，并根据 backend-mode 选择 nifi-data/real_nifi_data）
+    user_data_dir = _get_active_user_data_dir(owner_id)
+    inbox_csv_dir = user_data_dir / "inbox_csv"
+    inbox_json_dir = user_data_dir / "inbox_json"
+    inbox_tsv_dir = user_data_dir / "inbox_tsv"
+    csv_to_json_dir = user_data_dir / "csv_to_json"
+    csv_to_tsv_dir = user_data_dir / "csv_to_tsv"
+    json_to_csv_dir = user_data_dir / "json_to_csv"
+    json_to_tsv_dir = user_data_dir / "json_to_tsv"
+    tsv_to_json_dir = user_data_dir / "tsv_to_json"
+    tsv_to_csv_dir = user_data_dir / "tsv_to_csv"
+    for d in [inbox_csv_dir, inbox_json_dir, inbox_tsv_dir, csv_to_json_dir, csv_to_tsv_dir, json_to_csv_dir, json_to_tsv_dir, tsv_to_json_dir, tsv_to_csv_dir]:
+        d.mkdir(parents=True, exist_ok=True)
+
     if suffix == ".csv":
-        dest = INBOX_CSV_DIR / filename
-        dest.write_bytes(content)
-        meta = register_existing_file(dest, "csv")
+        # v4: NiFi 真实调用模式下，源文件先写入全局共享目录供 iot-nifi 容器访问
+        current_mode = _load_backend_mode_state(owner_id).get("mode", "local")
+        if current_mode == "nifi" and NIFI_REAL_EXECUTION:
+            global_inbox_csv = NIFI_REAL_BASE_DIR / "inbox_csv"
+            global_inbox_csv.mkdir(parents=True, exist_ok=True)
+            dest = global_inbox_csv / filename
+            dest.write_bytes(content)
+            # 同时复制一份到用户目录备案
+            user_dest = inbox_csv_dir / filename
+            user_dest.write_bytes(content)
+            meta = register_existing_file(user_dest, "csv")
+        else:
+            dest = inbox_csv_dir / filename
+            dest.write_bytes(content)
+            meta = register_existing_file(dest, "csv")
         try:
             extra = {"sourceType": "upload"}
             if hasTag is not None:
@@ -2799,35 +4111,67 @@ async def upload_file(request: Request,
             _write_meta_file(meta, extra)
         except Exception:
             pass
-        try:
-            text = dest.read_text(encoding="utf-8")
-            rows = []
-            reader = csv.DictReader(text.splitlines())
-            for r in reader:
-                rows.append(r)
-                if rows:
-                    out_name = f"xform_{owner_id}_{stem}_{now_ts()}_csv2json.json"
-                    out_path = CSV_TO_JSON_DIR / out_name
-                    _write_ndjson(out_path, list(rows[0].keys()), rows)
-                    meta2 = _register_and_return_meta(out_path, "json")
-                    try:
-                        _write_meta_file(meta2, extra)
-                    except Exception:
-                        pass
-                    out_tsv_name = f"xform_{owner_id}_{stem}_{now_ts()}_csv2tsv.tsv"
-                    out_tsv_path = CSV_TO_TSV_DIR / out_tsv_name
-                    _write_tsv(out_tsv_path, list(rows[0].keys()), rows)
-                    meta3 = _register_and_return_meta(out_tsv_path, "tsv")
-                    try:
-                        _write_meta_file(meta3, extra)
-                    except Exception:
-                        pass
-        except Exception:
-            pass
+        # v4: NiFi 真实调用模式，将上传转换任务提交到 iot-nifi 容器
+        current_mode = _load_backend_mode_state(owner_id).get("mode", "local")
+        if current_mode == "nifi" and NIFI_REAL_EXECUTION:
+            submitted = _submit_nifi_upload_convert_task(
+                source_path=str(dest),
+                source_format="csv",
+                target_formats=["JSON", "TSV"],
+                file_name=filename,
+                owner_id=owner_id,
+                username=owner_id,
+            )
+            task = submitted.get("task", {})
+            payload = _wait_nifi_task_done(task.get("jobId", ""), "convert", owner_id, timeout_seconds=30.0)
+            if payload and payload.get("status") == "SUCCEEDED":
+                for output_file in payload.get("outputFiles", []):
+                    src = Path(str(output_file))
+                    if src.exists() and src.is_file():
+                        target_dir = _get_active_user_data_dir(owner_id) / src.parent.name
+                        target_dir.mkdir(parents=True, exist_ok=True)
+                        dst = target_dir / src.name
+                        try:
+                            shutil.move(str(src), str(dst))
+                        except Exception:
+                            continue
+                        try:
+                            out_meta = _register_and_return_meta(dst, _guess_file_format(dst) or "csv")
+                            _write_meta_file(out_meta, extra)
+                        except Exception:
+                            pass
+            # 无论 NiFi 转换是否成功，都返回源文件 meta
+        else:
+            try:
+                text = dest.read_text(encoding="utf-8")
+                rows = []
+                reader = csv.DictReader(text.splitlines())
+                for r in reader:
+                    rows.append(r)
+                    if rows:
+                        out_name = f"xform_{owner_id}_{stem}_{now_ts()}_csv2json.json"
+                        out_path = csv_to_json_dir / out_name
+                        _write_ndjson(out_path, list(rows[0].keys()), rows)
+                        meta2 = _register_and_return_meta(out_path, "json")
+                        try:
+                            _write_meta_file(meta2, extra)
+                        except Exception:
+                            pass
+                        out_tsv_name = f"xform_{owner_id}_{stem}_{now_ts()}_csv2tsv.tsv"
+                        out_tsv_path = csv_to_tsv_dir / out_tsv_name
+                        _write_tsv(out_tsv_path, list(rows[0].keys()), rows)
+                        meta3 = _register_and_return_meta(out_tsv_path, "tsv")
+                        try:
+                            _write_meta_file(meta3, extra)
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+        _append_audit_log({"event": "FILE_UPLOAD", "owner": owner_id, "fileId": meta.get("fileId"), "fileName": meta.get("fileName"), "format": "csv", "mode": _load_backend_mode_state(owner_id).get("mode", "local")})
         return ok(meta, make_trace_id(None))
 
     if suffix in {".json", ".jsonl", ".ndjson"}:
-        dest = INBOX_JSON_DIR / filename
+        dest = inbox_json_dir / filename
         dest.write_bytes(content)
         meta = register_existing_file(dest, "json")
         try:
@@ -2872,7 +4216,7 @@ async def upload_file(request: Request,
             if objs:
                 cols = sorted({k for o in objs for k in o.keys()})
                 out_name = f"xform_{owner_id}_{stem}_{now_ts()}_json2csv.csv"
-                out_path = JSON_TO_CSV_DIR / out_name
+                out_path = json_to_csv_dir / out_name
                 _write_csv(out_path, cols, objs)
                 meta2 = _register_and_return_meta(out_path, "csv")
                 try:
@@ -2880,7 +4224,7 @@ async def upload_file(request: Request,
                 except Exception:
                     pass
                 out_tsv_name = f"xform_{owner_id}_{stem}_{now_ts()}_json2tsv.tsv"
-                out_tsv_path = JSON_TO_TSV_DIR / out_tsv_name
+                out_tsv_path = json_to_tsv_dir / out_tsv_name
                 _write_tsv(out_tsv_path, cols, objs)
                 meta3 = _register_and_return_meta(out_tsv_path, "tsv")
                 try:
@@ -2889,10 +4233,11 @@ async def upload_file(request: Request,
                     pass
         except Exception:
             pass
+        _append_audit_log({"event": "FILE_UPLOAD", "owner": owner_id, "fileId": meta.get("fileId"), "fileName": meta.get("fileName"), "format": "json", "mode": _load_backend_mode_state(owner_id).get("mode", "local")})
         return ok(meta, make_trace_id(None))
 
     if suffix == ".tsv":
-        dest = INBOX_TSV_DIR / filename
+        dest = inbox_tsv_dir / filename
         dest.write_bytes(content)
         meta = register_existing_file(dest, "tsv")
         try:
@@ -2929,7 +4274,7 @@ async def upload_file(request: Request,
                     rows.append({header[i]: (vals[i] if i < len(vals) else "") for i in range(len(header))})
                 if rows:
                     out_json_name = f"xform_{owner_id}_{stem}_{now_ts()}_tsv2json.json"
-                    out_json_path = TSV_TO_JSON_DIR / out_json_name
+                    out_json_path = tsv_to_json_dir / out_json_name
                     _write_ndjson(out_json_path, header, rows)
                     meta2 = _register_and_return_meta(out_json_path, "json")
                     try:
@@ -2937,7 +4282,7 @@ async def upload_file(request: Request,
                     except Exception:
                         pass
                     out_csv_name = f"xform_{owner_id}_{stem}_{now_ts()}_tsv2csv.csv"
-                    out_csv_path = TSV_TO_CSV_DIR / out_csv_name
+                    out_csv_path = tsv_to_csv_dir / out_csv_name
                     _write_csv(out_csv_path, header, rows)
                     meta3 = _register_and_return_meta(out_csv_path, "csv")
                     try:
@@ -2946,6 +4291,7 @@ async def upload_file(request: Request,
                         pass
         except Exception:
             pass
+        _append_audit_log({"event": "FILE_UPLOAD", "owner": owner_id, "fileId": meta.get("fileId"), "fileName": meta.get("fileName"), "format": "tsv", "mode": _load_backend_mode_state(owner_id).get("mode", "local")})
         return ok(meta, make_trace_id(None))
 
     # fallback for non-CSV/JSON files
@@ -3133,7 +4479,7 @@ async def upload_inbox_csv(
     suffix = Path(file.filename or "").suffix.lower()
     filename = f"raw_{owner_id}_{stem}_{ts}.{suffix.lstrip('.')}"
     if _current_backend_mode() == "nifi":
-        dest = _export_output_root("nifi") / "inbox_csv" / filename
+        dest = _export_output_root("nifi", username=owner_id) / "inbox_csv" / filename
         dest.parent.mkdir(parents=True, exist_ok=True)
         dest.write_bytes(content_raw)
         target_formats = ["JSON"]
@@ -3145,8 +4491,12 @@ async def upload_inbox_csv(
             target_formats=target_formats,
             file_name=filename,
             owner_id=owner_id,
+            username=username,
         )
         meta = register_existing_file(dest, "csv")
+        # v4: 手动设置 username 字段，确保文件列表过滤正确
+        if meta.get("fileId") and meta["fileId"] in files:
+            files[meta["fileId"]]["username"] = _normalize_username(owner_id)
         return ok({
             "fileId": meta.get("fileId", ""),
             "jobId": submitted["task"]["jobId"],
@@ -3156,7 +4506,8 @@ async def upload_inbox_csv(
             "sourceFormat": "CSV",
             "targetFormats": target_formats,
         }, trace_id)
-    dest = INBOX_CSV_DIR / filename
+    udirs = _get_user_upload_dirs(owner_id)
+    dest = udirs["inbox_csv"] / filename
     dest.write_bytes(content_raw)
     # register in file index
     meta = register_existing_file(dest, "csv")
@@ -3242,7 +4593,7 @@ async def upload_inbox_csv(
 
             if convert == "csv_to_tsv":
                 out_name = f"xform_{owner_id}_{stem}_{now_ts()}_csv2tsv.tsv"
-                out_path = CSV_TO_TSV_DIR / out_name
+                out_path = udirs["csv_to_tsv"] / out_name
                 _write_tsv(out_path, cols, rows)
                 meta2 = _register_and_return_meta(out_path, "tsv")
                 try:
@@ -3252,7 +4603,7 @@ async def upload_inbox_csv(
                 target_path = str(out_path)
             else:
                 out_name = f"xform_{owner_id}_{stem}_{now_ts()}_csv2json.json"
-                out_path = CSV_TO_JSON_DIR / out_name
+                out_path = udirs["csv_to_json"] / out_name
                 _write_ndjson(out_path, cols, rows)
                 meta2 = _register_and_return_meta(out_path, "json")
                 try:
@@ -3314,7 +4665,7 @@ async def upload_inbox_json(
     suffix = Path(file.filename or "").suffix.lower()
     filename = f"raw_{owner_id}_{stem}_{ts}.{suffix.lstrip('.')}"
     if _current_backend_mode() == "nifi":
-        dest = _export_output_root("nifi") / "inbox_json" / filename
+        dest = _export_output_root("nifi", username=owner_id) / "inbox_json" / filename
         dest.parent.mkdir(parents=True, exist_ok=True)
         dest.write_bytes(content_raw)
         target_formats = ["CSV"]
@@ -3326,8 +4677,12 @@ async def upload_inbox_json(
             target_formats=target_formats,
             file_name=filename,
             owner_id=owner_id,
+            username=username,
         )
         meta = register_existing_file(dest, "json")
+        # v4: 手动设置 username 字段，确保文件列表过滤正确
+        if meta.get("fileId") and meta["fileId"] in files:
+            files[meta["fileId"]]["username"] = _normalize_username(owner_id)
         return ok({
             "fileId": meta.get("fileId", ""),
             "jobId": submitted["task"]["jobId"],
@@ -3337,7 +4692,8 @@ async def upload_inbox_json(
             "sourceFormat": "JSON",
             "targetFormats": target_formats,
         }, trace_id)
-    dest = INBOX_JSON_DIR / filename
+    udirs = _get_user_upload_dirs(owner_id)
+    dest = udirs["inbox_json"] / filename
     dest.write_bytes(content_raw)
     meta = register_existing_file(dest, "json")
     # 始终为源上传文件写入 meta，确保标签等配置信息落到 inbox_json 文件的 .meta.json
@@ -3420,7 +4776,7 @@ async def upload_inbox_json(
 
             if convert == "json_to_tsv":
                 out_name = f"xform_{owner_id}_{stem}_{now_ts()}_json2tsv.tsv"
-                out_path = JSON_TO_TSV_DIR / out_name
+                out_path = udirs["json_to_tsv"] / out_name
                 _write_tsv(out_path, cols, objs)
                 meta2 = _register_and_return_meta(out_path, "tsv")
                 try:
@@ -3431,7 +4787,7 @@ async def upload_inbox_json(
                 converted_file_id = meta2.get("fileId", "")
             else:
                 out_name = f"xform_{owner_id}_{stem}_{now_ts()}_json2csv.csv"
-                out_path = JSON_TO_CSV_DIR / out_name
+                out_path = udirs["json_to_csv"] / out_name
                 _write_csv(out_path, cols, objs)
                 meta2 = _register_and_return_meta(out_path, "csv")
                 try:
@@ -3444,10 +4800,10 @@ async def upload_inbox_json(
             # JSON 解析失败时也写一个空 CSV，方便用户在文件中心看到
             try:
                 out_name = f"xform_{owner_id}_{stem}_{now_ts()}_json2csv.empty.csv"
-                out_path = JSON_TO_CSV_DIR / out_name
+                out_path = udirs["json_to_csv"] / out_name
                 if (convertType or "").lower() == "json_to_tsv":
                     out_name = f"xform_{owner_id}_{stem}_{now_ts()}_json2tsv.empty.tsv"
-                    out_path = JSON_TO_TSV_DIR / out_name
+                    out_path = udirs["json_to_tsv"] / out_name
                 out_path.parent.mkdir(parents=True, exist_ok=True)
                 out_path.write_text("", encoding="utf-8")
                 target_path = str(out_path)
@@ -3510,7 +4866,7 @@ async def upload_inbox_tsv(
     suffix = Path(file.filename or "").suffix.lower()
     filename = f"raw_{owner_id}_{stem}_{ts}.{suffix.lstrip('.')}"
     if _current_backend_mode() == "nifi":
-        dest = _export_output_root("nifi") / "inbox_tsv" / filename
+        dest = _export_output_root("nifi", username=owner_id) / "inbox_tsv" / filename
         dest.parent.mkdir(parents=True, exist_ok=True)
         dest.write_bytes(content_raw)
         target_formats = ["JSON"]
@@ -3522,8 +4878,12 @@ async def upload_inbox_tsv(
             target_formats=target_formats,
             file_name=filename,
             owner_id=owner_id,
+            username=username,
         )
         meta = register_existing_file(dest, "tsv")
+        # v4: 手动设置 username 字段，确保文件列表过滤正确
+        if meta.get("fileId") and meta["fileId"] in files:
+            files[meta["fileId"]]["username"] = _normalize_username(owner_id)
         return ok({
             "fileId": meta.get("fileId", ""),
             "jobId": submitted["task"]["jobId"],
@@ -3533,7 +4893,8 @@ async def upload_inbox_tsv(
             "sourceFormat": "TSV",
             "targetFormats": target_formats,
         }, trace_id)
-    dest = INBOX_TSV_DIR / filename
+    udirs = _get_user_upload_dirs(owner_id)
+    dest = udirs["inbox_tsv"] / filename
     dest.write_bytes(content_raw)
     meta = register_existing_file(dest, "tsv")
     # 始终为源上传文件写入 meta，确保标签等配置信息落到 inbox_tsv 文件的 .meta.json
@@ -3612,7 +4973,7 @@ async def upload_inbox_tsv(
 
             if convert == "tsv_to_csv":
                 out_name = f"xform_{owner_id}_{stem}_{now_ts()}_tsv2csv.csv"
-                out_path = TSV_TO_CSV_DIR / out_name
+                out_path = udirs["tsv_to_csv"] / out_name
                 _write_csv(out_path, header, rows)
                 meta2 = _register_and_return_meta(out_path, "csv")
                 try:
@@ -3622,7 +4983,7 @@ async def upload_inbox_tsv(
                 target_path = str(out_path)
             else:
                 out_name = f"xform_{owner_id}_{stem}_{now_ts()}_tsv2json.json"
-                out_path = TSV_TO_JSON_DIR / out_name
+                out_path = udirs["tsv_to_json"] / out_name
                 _write_ndjson(out_path, header, rows)
                 meta2 = _register_and_return_meta(out_path, "json")
                 try:
@@ -3690,7 +5051,7 @@ def export_mysql(req: MySQLExportReq, request: Request, x_trace_id: Optional[str
         job = {
             "id": f"export_{now_ts()}_{uuid.uuid4().hex[:6]}",
             "job_name": f"mysql_export_{req.table}_{now_ts()}",
-            "factory_id": _normalize_factory_id(None),
+            "username": username,
             "owner_id": username,
             "file_format": req.format.lower(),
             "append_to_latest": req.append_to_latest,
@@ -3721,7 +5082,7 @@ def export_mysql(req: MySQLExportReq, request: Request, x_trace_id: Optional[str
             "jobId": job["id"],
             "status": "PENDING",
             "mode": "nifi",
-            "path": str(_export_output_root("nifi") / f"output_{job['file_format']}"),
+            "path": str(_export_output_root("nifi", username=username) / f"output_{job['file_format']}"),
             "taskPath": submitted.get("taskPath"),
             "task": submitted.get("task"),
         }
@@ -3753,7 +5114,7 @@ def export_mysql(req: MySQLExportReq, request: Request, x_trace_id: Optional[str
     table_safe = _sanitize_filename_component(req.table)
     base_name = f"export_{username}_{table_safe}_{ts}"
 
-    primary_root = _export_output_root()
+    primary_root = _export_output_root(username=username)
     primary_dir = primary_root / f"output_{fmt}"
     primary_dir.mkdir(parents=True, exist_ok=True)
 
@@ -3894,7 +5255,7 @@ def export_generic(body: Dict[str, Any], request: Request):
         job = {
             "id": body.get("id") or f"manual_{uuid.uuid4().hex[:8]}",
             "job_name": body.get("job_name") or f"manual_export_{now_ts()}",
-            "factory_id": _normalize_factory_id(body.get("factory_id")),
+            "username": _normalize_username(owner_from_cookie or body.get("username") or body.get("factory_id")),
             "owner_id": owner_id,
             "db_config": db_conf,
             "file_format": fmt,
@@ -3908,7 +5269,7 @@ def export_generic(body: Dict[str, Any], request: Request):
             return ok({
                 "status": "PENDING",
                 "mode": "nifi",
-                "path": str(_export_output_root("nifi") / f"output_{fmt}"),
+                "path": str(_export_output_root("nifi", username=owner_id) / f"output_{fmt}"),
                 "taskPath": submitted.get("taskPath"),
                 "task": submitted.get("task"),
             }, trace_id)
@@ -3927,7 +5288,7 @@ def export_generic(body: Dict[str, Any], request: Request):
                         table_safe = _sanitize_filename_component(table)
                         ts = now_ts()
                         # place manual export into format-specific output dir under the active backend root
-                        desired_dir = _export_output_root() / f"output_{fmt}"
+                        desired_dir = _export_output_root(username=owner) / f"output_{fmt}"
                         try:
                             desired_dir.mkdir(parents=True, exist_ok=True)
                         except Exception:
@@ -4009,7 +5370,7 @@ def export_generic(body: Dict[str, Any], request: Request):
                 try:
                     if table and db_conf:
                         from .silent_export_worker import register_table
-                        factory_id = job.get("factory_id") or DEFAULT_FACTORY_ID
+                        factory_id = job.get("username") or job.get("factory_id") or DEFAULT_USERNAME
                         register_table(db_conf, table, factory_id)
                 except Exception:
                     pass
@@ -4025,10 +5386,15 @@ def export_generic(body: Dict[str, Any], request: Request):
 
 
 @app.post("/api/v1/tags/auto")
-async def auto_tag(req: AutoTagReq, x_trace_id: Optional[str] = Header(default=None)):
+async def auto_tag(request: Request, req: AutoTagReq, x_trace_id: Optional[str] = Header(default=None)):
     trace_id = make_trace_id(x_trace_id)
     if req.fileId not in files:
         return err(1002404, "file not found", trace_id)
+    
+    # v4: 获取当前用户用于路径隔离
+    cookie_user = _get_current_user_from_token(request.cookies.get("access_token")) or {}
+    current_username = _normalize_username(cookie_user.get("username") or cookie_user.get("user") or cookie_user.get("name"))
+    
     source_meta = files[req.fileId]
     source_path = Path(source_meta["storagePath"])
     source_fmt = source_meta.get("fileFormat", "CSV")
@@ -4050,6 +5416,61 @@ async def auto_tag(req: AutoTagReq, x_trace_id: Optional[str] = Header(default=N
     except Exception:
         pass
 
+    # v4: NiFi 真实调用模式，将自动打标任务提交到 iot-nifi 容器
+    current_mode = _load_backend_mode_state(current_username).get("mode", "local")
+    if current_mode == "nifi" and NIFI_REAL_EXECUTION:
+        # 源文件必须位于全局共享目录下，iot-nifi 容器才能访问
+        nifi_source_path = source_path
+        if not str(source_path).startswith(str(NIFI_REAL_BASE_DIR)):
+            global_src_dir = NIFI_REAL_BASE_DIR / "inbox_csv"
+            global_src_dir.mkdir(parents=True, exist_ok=True)
+            nifi_source_path = global_src_dir / source_path.name
+            shutil.copy2(str(source_path), str(nifi_source_path))
+        tag_config: Dict[str, Any] = {}
+        tag_type = "auto-rule"
+        if tag_rule and isinstance(tag_rule, dict):
+            tag_type = "manual-table"
+            tag_config = {"columns": list(tag_rule.get("mapping", {}).keys()), "mappings": {"row_rules": [{"column": k, "mapping": v} for k, v in tag_rule.get("mapping", {}).items()]}}
+        else:
+            tag_config = {"rules": [{"name": "自动打标", "conditions": [], "then": {"tagColumn": "tag", "tagValue": "已打标"}}]}
+        submitted = _submit_nifi_tagging_task(
+            source_path=str(nifi_source_path),
+            source_format=source_fmt,
+            tag_type=tag_type,
+            tag_config=tag_config,
+            file_name=source_meta.get("fileName", "unknown"),
+            owner_id=current_username,
+            username=current_username,
+            target_format=req.outputFormat or source_fmt,
+        )
+        task = submitted.get("task", {})
+        payload = _wait_nifi_task_done(task.get("jobId", ""), "tagging", current_username, timeout_seconds=30.0)
+        if payload and payload.get("status") == "SUCCEEDED":
+            dst_path = payload.get("path") or payload.get("filePath") or ""
+            if dst_path and Path(dst_path).exists():
+                out_meta = files.get(str(register_existing_file(Path(dst_path), _guess_file_format(Path(dst_path)) or "csv").get("fileId")))
+                if out_meta:
+                    job_id = f"job_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:4]}"
+                    job = {
+                        "jobId": job_id,
+                        "jobType": "TAG_AUTO",
+                        "status": "SUCCEEDED",
+                        "progress": 100,
+                        "source": {"sourceType": "FILE_UPLOAD", "fileId": req.fileId},
+                        "target": {"format": req.outputFormat.upper() if req.outputFormat else source_fmt.upper(), "outputDir": str(_get_user_real_nifi_dir(current_username) / "tagged_output")},
+                        "errorCode": "",
+                        "errorMessage": "",
+                        "nifiFlowId": task.get("jobId"),
+                        "createdAt": now_iso(),
+                        "startedAt": now_iso(),
+                        "finishedAt": now_iso(),
+                        "outputs": [out_meta["fileId"]],
+                    }
+                    jobs[job_id] = job
+                    out_meta["jobId"] = job_id
+                    return ok({"jobId": job_id, "status": job["status"], "file": out_meta}, trace_id)
+        # 如果 NiFi 真实调用失败或超时，回退到本地执行
+
     try:
         columns, rows = _read_file_records(source_path, source_fmt)
     except Exception as e:
@@ -4068,7 +5489,7 @@ async def auto_tag(req: AutoTagReq, x_trace_id: Optional[str] = Header(default=N
             if v and v not in tag_range:
                 return err(1002401, f"自动打标结果 '{v}' 不在允许的标签范围 {tag_range} 中", trace_id)
 
-    out_meta = _write_tagged_output(source_meta, tagged_rows, "tag", columns, req.operator)
+    out_meta = _write_tagged_output(source_meta, tagged_rows, "tag", columns, req.operator, username=current_username)
     out_fmt = req.outputFormat.upper()
 
     # 写入新文件的配套 meta（同时携带 tagRange / failedTag）
@@ -4166,29 +5587,59 @@ def delete_schedule(schedule_id: str, x_trace_id: Optional[str] = Header(default
 
 training_tasks: Dict[str, Dict[str, Any]] = {}
 
-# 训练任务涉及的目录
-TRAINING_SCAN_DIRS = [
-    INBOX_CSV_DIR,
-    INBOX_JSON_DIR,
-    INBOX_TSV_DIR,
-    CSV_TO_JSON_DIR,
-    JSON_TO_CSV_DIR,
-    CSV_TO_TSV_DIR,
-    TSV_TO_CSV_DIR,
-    JSON_TO_TSV_DIR,
-    TSV_TO_JSON_DIR,
-    TAGGED_OUTPUT_DIR,
-    _export_output_root("nifi") / "output_csv",
-    _export_output_root("nifi") / "output_json",
-    _export_output_root("nifi") / "output_tsv",
-]
+def _get_training_scan_dirs(username: Optional[str] = None) -> List[Path]:
+    """v4: 返回用户隔离的训练扫描目录列表。"""
+    dirs: List[Path] = []
+    # 旧全局兼容目录
+    dirs.extend([
+        INBOX_CSV_DIR, INBOX_JSON_DIR, INBOX_TSV_DIR,
+        CSV_TO_JSON_DIR, JSON_TO_CSV_DIR, CSV_TO_TSV_DIR,
+        TSV_TO_CSV_DIR, JSON_TO_TSV_DIR, TSV_TO_JSON_DIR,
+        TAGGED_OUTPUT_DIR,
+    ])
+    if username:
+        un = _normalize_username(username)
+        nifi_root = _get_user_nifi_dir(un)
+        real_root = _get_user_real_nifi_dir(un)
+        for sub in ["inbox_csv", "inbox_json", "inbox_tsv",
+                     "csv_to_json", "json_to_csv", "csv_to_tsv",
+                     "tsv_to_csv", "json_to_tsv", "tsv_to_json",
+                     "tagged_output", "output_csv", "output_json", "output_tsv"]:
+            dirs.append(nifi_root / sub)
+        for sub in ["inbox_csv", "inbox_json", "inbox_tsv",
+                     "output_csv", "output_json", "output_tsv"]:
+            dirs.append(real_root / sub)
+    else:
+        # 未指定用户：扫描所有用户目录
+        try:
+            sess = SessionLocal()
+            try:
+                all_users = sess.query(db_models.IotUser.username).all()
+                for u in all_users:
+                    un = _normalize_username(u[0])
+                    nifi_root = _get_user_nifi_dir(un)
+                    real_root = _get_user_real_nifi_dir(un)
+                    for sub in ["inbox_csv", "inbox_json", "inbox_tsv",
+                                 "csv_to_json", "json_to_csv", "csv_to_tsv",
+                                 "tsv_to_csv", "json_to_tsv", "tsv_to_json",
+                                 "tagged_output", "output_csv", "output_json", "output_tsv"]:
+                        dirs.append(nifi_root / sub)
+                    for sub in ["inbox_csv", "inbox_json", "inbox_tsv",
+                                 "output_csv", "output_json", "output_tsv"]:
+                        dirs.append(real_root / sub)
+            finally:
+                sess.close()
+        except Exception:
+            pass
+    return dirs
 
 
-def _iter_training_files() -> List[Dict[str, Any]]:
-    """遍历训练目录，读取所有有 .meta.json 的文件。"""
+def _iter_training_files(username: Optional[str] = None) -> List[Dict[str, Any]]:
+    """遍历训练目录，读取所有有 .meta.json 的文件。v4: 支持按用户隔离。"""
     results: List[Dict[str, Any]] = []
     seen: set = set()
-    for base_dir in TRAINING_SCAN_DIRS:
+    scan_dirs = _get_training_scan_dirs(username)
+    for base_dir in scan_dirs:
         if not base_dir.exists():
             continue
         for file_path in base_dir.rglob("*"):
@@ -4212,6 +5663,7 @@ def _iter_training_files() -> List[Dict[str, Any]]:
 
 @app.get("/api/v1/training/files")
 def list_training_files(
+    request: Request,
     categoryId: Optional[str] = Query(default=None),
     tag: Optional[str] = Query(default=None),
     hasLabel: Optional[bool] = Query(default=None),
@@ -4223,7 +5675,13 @@ def list_training_files(
     x_trace_id: Optional[str] = Header(default=None),
 ):
     trace_id = make_trace_id(x_trace_id)
-    all_files = _iter_training_files()
+    # v4: 权限过滤 — 非 admin 只能看到自己的训练文件
+    cookie_user = _get_current_user_from_token(request.cookies.get("access_token")) or {}
+    if cookie_user.get("is_admin"):
+        target_username = None  # admin 看所有
+    else:
+        target_username = _normalize_username(cookie_user.get("username") or cookie_user.get("user") or cookie_user.get("name"))
+    all_files = _iter_training_files(username=target_username)
 
     # 筛选
     if categoryId:
@@ -4287,8 +5745,28 @@ def list_training_files(
     }, trace_id)
 
 
+def _mock_training_task(task_id: str, accepted: List[Dict[str, Any]], train_config: Dict[str, Any]) -> None:
+    """v4 P2-2: 后台模拟训练任务执行，状态从 accepted -> running -> completed。"""
+    import time
+    task = training_tasks.get(task_id)
+    if not task:
+        return
+    task["status"] = "running"
+    task["updatedAt"] = now_iso()
+    total = len(accepted)
+    for i, _ in enumerate(accepted):
+        time.sleep(0.3)
+        task["processedFiles"] = i + 1
+        task["progress"] = int((i + 1) / total * 100) if total else 100
+        task["updatedAt"] = now_iso()
+    task["status"] = "completed"
+    task["progress"] = 100
+    task["updatedAt"] = now_iso()
+    task["result"] = {"modelVersion": f"v{datetime.now().strftime('%Y%m%d%H%M%S')}", "metrics": {"accuracy": 0.95}}
+
+
 @app.post("/api/v1/training/submit")
-def submit_training(body: Dict[str, Any], x_trace_id: Optional[str] = Header(default=None)):
+def submit_training(request: Request, body: Dict[str, Any], x_trace_id: Optional[str] = Header(default=None)):
     trace_id = make_trace_id(x_trace_id)
     selected_ids = body.get("selectedFileIds") or []
     train_config = body.get("trainingConfig") or {}
@@ -4296,7 +5774,13 @@ def submit_training(body: Dict[str, Any], x_trace_id: Optional[str] = Header(def
     if not selected_ids:
         return err(1004001, "selectedFileIds must not be empty", trace_id)
 
-    all_files = _iter_training_files()
+    # v4: 权限过滤 — 非 admin 只能提交自己的训练文件
+    cookie_user = _get_current_user_from_token(request.cookies.get("access_token")) or {}
+    if cookie_user.get("is_admin"):
+        target_username = None  # admin 可以提交所有
+    else:
+        target_username = _normalize_username(cookie_user.get("username") or cookie_user.get("user") or cookie_user.get("name"))
+    all_files = _iter_training_files(username=target_username)
     meta_map = {f.get("fileId"): f for f in all_files if f.get("fileId")}
 
     accepted = []
@@ -4323,6 +5807,18 @@ def submit_training(body: Dict[str, Any], x_trace_id: Optional[str] = Header(def
         "updatedAt": now_iso(),
     }
     training_tasks[task_id] = task
+
+    threading.Thread(target=_mock_training_task, args=(task_id, accepted, train_config), daemon=True).start()
+
+    operator = _normalize_username(cookie_user.get("username") or cookie_user.get("user") or cookie_user.get("name") or "system")
+    _append_audit_log({
+        "event": "TRAINING_SUBMIT",
+        "operator": operator,
+        "taskId": task_id,
+        "acceptedCount": len(accepted),
+        "rejectedCount": len(rejected),
+        "mode": _load_backend_mode_state(operator).get("mode", "local"),
+    })
 
     return ok({
         "taskId": task_id,
@@ -4365,3 +5861,27 @@ def check_integrity(x_trace_id: Optional[str] = Header(default=None)):
     trace_id = make_trace_id(x_trace_id)
     result = meta_json.check_integrity()
     return ok(result, trace_id)
+
+
+@app.get("/api/v1/admin/audit-logs")
+def list_audit_logs(
+    request: Request,
+    limit: int = Query(default=100, ge=1, le=1000),
+    x_trace_id: Optional[str] = Header(default=None),
+):
+    """v4 P2-4: 查询全局审计日志（admin only）。"""
+    trace_id = make_trace_id(x_trace_id)
+    _require_admin(request)
+    logs: List[Dict[str, Any]] = []
+    if AUDIT_LOG_PATH.exists():
+        try:
+            with AUDIT_LOG_PATH.open("r", encoding="utf-8") as f:
+                lines = f.readlines()
+            for line in lines[-limit:]:
+                try:
+                    logs.append(json.loads(line))
+                except Exception:
+                    pass
+        except Exception:
+            pass
+    return ok({"total": len(logs), "logs": logs}, trace_id)
