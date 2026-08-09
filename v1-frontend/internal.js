@@ -698,15 +698,21 @@
       }
       const meta = res.data && res.data.meta ? res.data.meta : {};
       const xattrEnabled = res.data && res.data.xattrEnabled;
+      const xattrKeys = (res.data && res.data.xattrKeys) || [];
       const html = `
         <div class="small" style="margin-bottom:8px;">
-          <strong>xattr 状态:</strong> ${xattrEnabled ? '<span style="color:#16a34a;">已启用</span>' : '<span style="color:#dc2626;">未启用</span>'}
+          <strong>xattr 状态:</strong> ${xattrEnabled ? '<span style="color:#16a34a;">已启用（真读扩展属性）</span>' : '<span style="color:#dc2626;">未启用（回退 .meta.json）</span>'}
           &nbsp;|&nbsp; <strong>存储路径:</strong> ${escapeHtml(res.data.storagePath || '')}
         </div>
-        <pre style="white-space:pre-wrap;word-break:break-word;">${escapeHtml(JSON.stringify(meta, null, 2))}</pre>
+        <div class="small" style="margin-bottom:8px;">
+          <strong>文件扩展属性:</strong> ${xattrKeys.length > 0 ? xattrKeys.map(k => '<code style="background:#f0f0f0;padding:1px 4px;border-radius:2px;">' + escapeHtml(k) + '</code>').join(' ') : '<span class="muted">无（xattr 未启用）</span>'}
+        </div>
+        <details style="margin-bottom:8px;"><summary class="small muted">解密后元数据（${Object.keys(meta).length} 个字段）</summary>
+        <pre style="white-space:pre-wrap;word-break:break-word;margin-top:4px;">${escapeHtml(JSON.stringify(meta, null, 2))}</pre>
+        </details>
       `;
       if (contentEl) contentEl.innerHTML = html;
-      if (statusEl) statusEl.textContent = `已读取扩展属性 user.meta（${Object.keys(meta).length} 个字段）`;
+      if (statusEl) statusEl.textContent = xattrEnabled ? `已从 xattr 读取 ${xattrKeys.length} 个扩展属性` : 'xattr 未启用，从 .meta.json 读取';
     } catch (e) {
       if (contentEl) contentEl.innerHTML = `<div class="error">请求异常: ${escapeHtml(String(e))}</div>`;
     }

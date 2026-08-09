@@ -345,7 +345,16 @@ def _create_processor(name: str, processor_type: str, x: float, y: float) -> Dic
 def _update_processor_config(proc: Dict[str, Any], properties: Dict[str, Any], auto_terminated_relationships: Optional[list[str]] = None) -> Dict[str, Any]:
     component = proc.get("component") or {}
     proc_id = component.get("id") or proc.get("id")
-    revision = proc.get("revision") or {"version": 0}
+    # 刷新最新 revision：创建/停止后 NiFi 内部 revision 会变化，用旧值 PUT 会 400
+    refresh = request_nifi_api(f"processors/{proc_id}", "GET", None, timeout=20)
+    if refresh.get("ok") and refresh.get("data"):
+        revision = refresh["data"].get("revision") or proc.get("revision") or {"version": 0}
+        # 同步刷新 component，避免用旧的 config 覆盖最新值
+        latest_component = refresh["data"].get("component") or {}
+        if latest_component:
+            component = latest_component
+    else:
+        revision = proc.get("revision") or {"version": 0}
     config = dict(component.get("config") or {})
     merged_properties = dict(config.get("properties") or {})
     merged_properties.update(properties)
@@ -394,7 +403,7 @@ def _ensure_getfile_processor() -> Dict[str, Any]:
     _stop_processor(proc)
     updated = _update_processor_config(proc, {
         "Input Directory": f"{NIFI_CONTAINER_DATA_DIR}/export_jobs/inbox",
-        "File Filter": ".*\\\\.json",
+        "File Filter": r".*\.json",
         "Keep Source File": "false",
         "Batch Size": "1",
     })

@@ -75,7 +75,27 @@ def _create_user_storage_dirs(username: str, deployment_mode: str, ceph_endpoint
         (real_nifi_data / "silent_exports").mkdir(parents=True, exist_ok=True)
         (real_nifi_data / "inbox_csv").mkdir(parents=True, exist_ok=True)
         (real_nifi_data / "inbox_json").mkdir(parents=True, exist_ok=True)
+        (real_nifi_data / "inbox_tsv").mkdir(parents=True, exist_ok=True)
+        (real_nifi_data / "csv_to_json").mkdir(parents=True, exist_ok=True)
+        (real_nifi_data / "csv_to_tsv").mkdir(parents=True, exist_ok=True)
+        (real_nifi_data / "json_to_csv").mkdir(parents=True, exist_ok=True)
+        (real_nifi_data / "json_to_tsv").mkdir(parents=True, exist_ok=True)
+        (real_nifi_data / "tsv_to_csv").mkdir(parents=True, exist_ok=True)
+        (real_nifi_data / "tsv_to_json").mkdir(parents=True, exist_ok=True)
+        (real_nifi_data / "meta_backups").mkdir(parents=True, exist_ok=True)
         (real_nifi_data / "bin").mkdir(parents=True, exist_ok=True)
+
+        # v4: 有标签文件独立顶层目录（不放在 nifi-data/real_nifi_data 内）
+        # tagged_nifi_data — Local 模式有标签
+        # tagged_real_nifi_data — NiFi 模式有标签
+        for tagged_root_name in ("tagged_nifi_data", "tagged_real_nifi_data"):
+            tagged_root = root / tagged_root_name
+            tagged_root.mkdir(parents=True, exist_ok=True)
+            for sub in ("inbox_csv", "inbox_json", "inbox_tsv",
+                        "csv_to_json", "csv_to_tsv", "json_to_csv",
+                        "json_to_tsv", "tsv_to_csv", "tsv_to_json",
+                        "output_csv", "output_json", "output_tsv"):
+                (tagged_root / sub).mkdir(parents=True, exist_ok=True)
     except (OSError, PermissionError):
         # 只读环境或权限不足时静默跳过，不阻塞注册
         pass

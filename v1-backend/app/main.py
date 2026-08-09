@@ -89,7 +89,7 @@ TSV_TO_JSON_DIR = Path(os.getenv("TSV_TO_JSON_DIR", "/home/yhz/nifi-data/tsv_to_
 JSON_TO_TSV_DIR = Path(os.getenv("JSON_TO_TSV_DIR", "/home/yhz/nifi-data/json_to_tsv"))
 CSV_TO_TSV_DIR = Path(os.getenv("CSV_TO_TSV_DIR", "/home/yhz/nifi-data/csv_to_tsv"))
 TSV_TO_CSV_DIR = Path(os.getenv("TSV_TO_CSV_DIR", "/home/yhz/nifi-data/tsv_to_csv"))
-TAGGED_OUTPUT_DIR = Path(os.getenv("TAGGED_OUTPUT_DIR", "/home/yhz/nifi-data/tagged_output"))
+TAGGED_OUTPUT_DIR = Path(os.getenv("TAGGED_OUTPUT_DIR", "/home/yhz/tagged_nifi_data"))
 NIFI_BASE_DIR = Path(os.getenv("NIFI_BASE_DIR", "/home/yhz/nifi-data"))  # deprecated — v4 使用 _get_user_nifi_dir(username)
 NIFI_OUTPUT_JSON_DIR = Path(os.getenv("NIFI_OUTPUT_JSON_DIR", "/home/yhz/nifi-data/output_json"))
 IN_DATA_BASE_DIR = Path(os.getenv("IN_DATA_BASE_DIR", "/home/yhz"))  # 公有化用户存放在 /home/yhz/{username}/ 下
@@ -214,9 +214,16 @@ NIFI_CONTAINER_BASE = "/opt/nifi/nifi-current/data/iot"
 
 
 def _host_to_container_path(host_path: str) -> str:
+    """将宿主机路径转换为容器内路径。
+
+    因为 docker-compose 挂载了 /home/yhz -> /home/yhz:rw，
+    所有 /home/yhz/ 下的路径在容器内原样可用，无需转换。
+    只有全局 real_nifi_data 需要映射到容器挂载点。
+    """
     host_base = str(NIFI_REAL_BASE_DIR)
     if host_path.startswith(host_base):
         return NIFI_CONTAINER_BASE + host_path[len(host_base):]
+    # /home/yhz/ 已挂载到容器内，用户路径原样可用
     return host_path
 
 
@@ -281,6 +288,16 @@ def _get_user_real_nifi_dir(username: str) -> Path:
     return _resolve_user_storage_root(username) / "real_nifi_data"
 
 
+def _get_user_tagged_nifi_dir(username: str) -> Path:
+    """v4: 返回用户专属的 tagged_nifi_data 目录（Local 模式有标签文件独立顶层目录）。"""
+    return _resolve_user_storage_root(username) / "tagged_nifi_data"
+
+
+def _get_user_tagged_real_nifi_dir(username: str) -> Path:
+    """v4: 返回用户专属的 tagged_real_nifi_data 目录（NiFi 模式有标签文件独立顶层目录）。"""
+    return _resolve_user_storage_root(username) / "tagged_real_nifi_data"
+
+
 def _get_active_user_data_dir(username: str) -> Path:
     """v4: 根据当前 backend-mode 返回用户活跃数据目录。
 
@@ -301,15 +318,22 @@ def _export_output_root(mode: Optional[str] = None, username: Optional[str] = No
     return root
 
 
-def _nifi_export_job_dirs(username: Optional[str] = None) -> Dict[str, Path]:
-    """v4: 用户隔离的 nifi 任务目录。"""
-    root = _export_output_root("nifi", username=username) / "export_jobs"
+def _nifi_export_job_dirs(username: Optional[str] = None, tagged: bool = False) -> Dict[str, Path]:
+    """v4: 用户隔离的 nifi 任务目录。
+    当 tagged=True 时，output_* 目录根于独立顶层 tagged_real_nifi_data/ 而非 real_nifi_data/。
+    """
+    nifi_root = _export_output_root("nifi", username=username)
+    root = nifi_root / "export_jobs"
+    if tagged:
+        output_base = _get_user_tagged_real_nifi_dir(_normalize_username(username)) if username else (NIFI_REAL_BASE_DIR.parent / "tagged_real_nifi_data")
+    else:
+        output_base = nifi_root
     inbox = root / "inbox"
     done = root / "done"
     error = root / "error"
-    output_csv = _export_output_root("nifi", username=username) / "output_csv"
-    output_json = _export_output_root("nifi", username=username) / "output_json"
-    output_tsv = _export_output_root("nifi", username=username) / "output_tsv"
+    output_csv = output_base / "output_csv"
+    output_json = output_base / "output_json"
+    output_tsv = output_base / "output_tsv"
     for p in [inbox, done, error, output_csv, output_json, output_tsv]:
         p.mkdir(parents=True, exist_ok=True)
     return {"root": root, "inbox": inbox, "done": done, "error": error, "output_csv": output_csv, "output_json": output_json, "output_tsv": output_tsv}
@@ -321,8 +345,15 @@ def _build_nifi_export_task(job: Dict[str, Any]) -> Dict[str, Any]:
     payload = job.get("payload") or {}
     table = payload.get("table") or db_conf.get("table") or job.get("table") or ""
     username = _normalize_username(job.get("username") or job.get("factory_id"))
-    dirs = _nifi_export_job_dirs(username=username)
-    target_dir = dirs.get(f"output_{fmt}") or dirs["output_csv"]
+    has_tag = bool(job.get("hasTag") or payload.get("hasTag"))
+    # v4: worker 产物和 done 都写全局目录，回流函数再搬移到用户目录并写 meta
+    # targetRoot 用全局（无 username），targetDir 用全局 tagged/real 目录
+    global_nifi_root = _export_output_root("nifi")  # /home/yhz/real_nifi_data
+    if has_tag:
+        global_target_dir = NIFI_REAL_BASE_DIR.parent / "tagged_real_nifi_data" / f"output_{fmt}"
+    else:
+        global_target_dir = global_nifi_root / f"output_{fmt}"
+    target_dir = global_target_dir
     task = {
         "jobId": str(job.get("id") or f"export_{uuid.uuid4().hex[:8]}"),
         "username": _normalize_username(job.get("username") or job.get("factory_id")),
@@ -333,12 +364,15 @@ def _build_nifi_export_task(job: Dict[str, Any]) -> Dict[str, Any]:
         "user": db_conf.get("user") or db_conf.get("username") or "root",
         "password": db_conf.get("password") or "",
         "database": db_conf.get("database") or db_conf.get("db") or "",
+        "path": db_conf.get("path") or db_conf.get("dsn") or "",
         "table": table,
         "where": job.get("where") or db_conf.get("where") or "",
         "format": fmt.upper(),
         "appendToLatest": bool(job.get("append_to_latest") or job.get("appendToLatest") or False),
+        "hasTag": has_tag,
+        "datasetName": job.get("datasetName") or "",
         "targetDir": _host_to_container_path(str(target_dir)),
-        "targetRoot": _host_to_container_path(str(_export_output_root("nifi", username=username))),
+        "targetRoot": _host_to_container_path(str(global_nifi_root)),
         "submittedAt": now_iso(),
     }
     return task
@@ -445,6 +479,11 @@ def _submit_nifi_export_task(job: Dict[str, Any]) -> Dict[str, Any]:
     return {"status": "submitted", "taskPath": str(task_path), "task": task}
 
 
+def _nifi_container_path_to_host(container_path: str) -> Path:
+    """v4: 将 iot-nifi 容器内路径映射回宿主机路径。"""
+    return Path(str(container_path).replace("/opt/nifi/nifi-current/data/iot", str(NIFI_REAL_BASE_DIR)))
+
+
 def _nifi_convert_job_dirs(username: Optional[str] = None) -> Dict[str, Path]:
     root = _export_output_root("nifi", username=username) / "convert_jobs"
     inbox = root / "inbox"
@@ -455,19 +494,24 @@ def _nifi_convert_job_dirs(username: Optional[str] = None) -> Dict[str, Path]:
     return {"root": root, "inbox": inbox, "done": done, "error": error}
 
 
-def _get_user_upload_dirs(username: str) -> Dict[str, Path]:
-    """v4: 返回用户隔离的上传/转换目录，自动创建。"""
-    nifi = _get_user_nifi_dir(_normalize_username(username))
+def _get_user_upload_dirs(username: str, tagged: bool = False) -> Dict[str, Path]:
+    """v4: 返回用户隔离的上传/转换目录，自动创建。
+    当 tagged=True 时，所有目录根于独立顶层 tagged_nifi_data/ 而非 nifi-data/。
+    """
+    base = _get_user_tagged_nifi_dir(_normalize_username(username)) if tagged else _get_user_nifi_dir(_normalize_username(username))
     dirs = {
-        "inbox_csv": nifi / "inbox_csv",
-        "inbox_json": nifi / "inbox_json",
-        "inbox_tsv": nifi / "inbox_tsv",
-        "csv_to_json": nifi / "csv_to_json",
-        "csv_to_tsv": nifi / "csv_to_tsv",
-        "json_to_csv": nifi / "json_to_csv",
-        "json_to_tsv": nifi / "json_to_tsv",
-        "tsv_to_json": nifi / "tsv_to_json",
-        "tsv_to_csv": nifi / "tsv_to_csv",
+        "inbox_csv": base / "inbox_csv",
+        "inbox_json": base / "inbox_json",
+        "inbox_tsv": base / "inbox_tsv",
+        "csv_to_json": base / "csv_to_json",
+        "csv_to_tsv": base / "csv_to_tsv",
+        "json_to_csv": base / "json_to_csv",
+        "json_to_tsv": base / "json_to_tsv",
+        "tsv_to_json": base / "tsv_to_json",
+        "tsv_to_csv": base / "tsv_to_csv",
+        "output_csv": base / "output_csv",
+        "output_json": base / "output_json",
+        "output_tsv": base / "output_tsv",
     }
     for d in dirs.values():
         d.mkdir(parents=True, exist_ok=True)
@@ -476,7 +520,8 @@ def _get_user_upload_dirs(username: str) -> Dict[str, Path]:
 
 def _submit_nifi_upload_convert_task(source_path: str, source_format: str,
                                       target_formats: List[str], file_name: str,
-                                      owner_id: str = "", username: str = "") -> Dict[str, Any]:
+                                      owner_id: str = "", username: str = "",
+                                      has_tag: bool = False, dataset_name: str = "") -> Dict[str, Any]:
     normalized_username = _normalize_username(username)
     dirs = _nifi_convert_job_dirs(username=normalized_username or None)
     job_id = f"convert_{uuid.uuid4().hex[:8]}"
@@ -489,6 +534,8 @@ def _submit_nifi_upload_convert_task(source_path: str, source_format: str,
         "fileName": file_name,
         "ownerId": owner_id or "unknown",
         "username": normalized_username,
+        "hasTag": has_tag,
+        "datasetName": dataset_name or "",
         "submittedAt": now_iso(),
     }
     task_path = dirs["inbox"] / f"{job_id}.json"
@@ -542,17 +589,35 @@ def _route_nifi_convert_output_to_user(username: str) -> Dict[str, Any]:
                     continue
 
                 output_files = payload.get("outputFiles") or []
+                _is_tagged = bool(payload.get("hasTag"))
                 routed_outputs: List[str] = []
                 for output_file in output_files:
-                    src = Path(str(output_file))
+                    src = _nifi_container_path_to_host(str(output_file))
                     if not src.exists() or not src.is_file():
                         continue
-                    target_dir = user_root / src.parent.name
+                    target_parent = src.parent.name
+                    if _is_tagged:
+                        tagged_base = _get_user_tagged_real_nifi_dir(normalized_username)
+                        target_dir = tagged_base / target_parent
+                    else:
+                        target_dir = user_root / target_parent
                     target_dir.mkdir(parents=True, exist_ok=True)
                     dst = target_dir / src.name
                     shutil.move(str(src), str(dst))
                     moved += 1
                     routed_outputs.append(str(dst))
+                    # 将 datasetName / hasTag 写入转换产物 meta
+                    try:
+                        _fmt = _guess_file_format(dst).lower() if _guess_file_format(dst) else "json"
+                        _meta = _register_and_return_meta(dst, _fmt)
+                        _extra = {"sourceType": "upload"}
+                        if payload.get("hasTag") is not None:
+                            _extra["hasTag"] = bool(payload.get("hasTag"))
+                        if payload.get("datasetName"):
+                            _extra["datasetName"] = payload.get("datasetName")
+                        _write_meta_file(_meta, _extra)
+                    except Exception:
+                        pass
                 if routed_outputs:
                     payload["outputFiles"] = routed_outputs
 
@@ -587,7 +652,7 @@ def _route_nifi_convert_output_for_all_users() -> Dict[str, Any]:
 # v4: NiFi 自动打标任务提交与结果回流
 # ═══════════════════════════════════════════════════════════════════
 
-TAGGED_OUTPUT_DIR = Path(os.getenv("TAGGED_OUTPUT_DIR", "/home/yhz/nifi-data/tagged_output"))
+TAGGED_OUTPUT_DIR = Path(os.getenv("TAGGED_OUTPUT_DIR", "/home/yhz/tagged_nifi_data"))
 
 
 def _nifi_tagging_job_dirs(username: Optional[str] = None) -> Dict[str, Path]:
@@ -655,7 +720,7 @@ def _route_nifi_tagging_output_to_user(username: str) -> Dict[str, Any]:
 
     normalized_username = _normalize_username(username)
     user_job_dirs = _nifi_tagging_job_dirs(username=normalized_username)
-    user_tagged_dir = _get_user_real_nifi_dir(normalized_username) / "tagged_output"
+    user_tagged_dir = _get_user_tagged_real_nifi_dir(normalized_username)
     user_tagged_dir.mkdir(parents=True, exist_ok=True)
 
     for folder, status in ((global_workspace / "done", "done"), (global_workspace / "error", "error")):
@@ -677,7 +742,7 @@ def _route_nifi_tagging_output_to_user(username: str) -> Dict[str, Any]:
 
                 file_path = payload.get("filePath") or ""
                 if file_path and status == "done":
-                    src = Path(str(file_path))
+                    src = _nifi_container_path_to_host(str(file_path))
                     if src.exists() and src.is_file():
                         dst = user_tagged_dir / src.name
                         shutil.move(str(src), str(dst))
@@ -744,17 +809,20 @@ def _wait_nifi_task_done(
         if job_type == "export":
             _route_nifi_output_to_user(normalized_username)
             dirs = _nifi_export_job_dirs(username=normalized_username)
+            _global_dirs = _nifi_export_job_dirs(username=None)
         elif job_type == "convert":
             _route_nifi_convert_output_to_user(normalized_username)
             dirs = _nifi_convert_job_dirs(username=normalized_username)
+            _global_dirs = _nifi_convert_job_dirs(username=None)
         elif job_type == "tagging":
             _route_nifi_tagging_output_to_user(normalized_username)
             dirs = _nifi_tagging_job_dirs(username=normalized_username)
+            _global_dirs = _nifi_tagging_job_dirs(username=None)
         else:
             return None
 
         if payload is None:
-            for folder in [dirs["done"], dirs["error"]]:
+            for folder in [dirs["done"], dirs["error"], _global_dirs["done"], _global_dirs["error"]]:
                 if not folder.exists():
                     continue
                 for path in folder.glob(f"{job_id}.json"):
@@ -767,11 +835,12 @@ def _wait_nifi_task_done(
         if payload:
             # 确保结果文件已经回流到用户目录
             file_path = payload.get("filePath") or ""
-            if file_path and Path(str(file_path)).exists():
+            host_path = _nifi_container_path_to_host(str(file_path)) if file_path else None
+            if host_path and host_path.exists():
                 return payload
             # tagging 结果默认会回流到用户 tagged_output 目录
             if job_type == "tagging":
-                user_tagged_dir = _get_user_real_nifi_dir(normalized_username) / "tagged_output"
+                user_tagged_dir = _get_user_tagged_real_nifi_dir(normalized_username)
                 for p in user_tagged_dir.glob("*"):
                     if p.is_file() and p.stat().st_mtime > deadline - timeout_seconds - 5:
                         payload["filePath"] = str(p.resolve())
@@ -812,15 +881,31 @@ def _route_nifi_output_to_user(username: str) -> Dict[str, Any]:
                     continue
                 file_path = payload.get("filePath") or payload.get("path") or ""
                 if file_path and status == "done":
-                    src = Path(str(file_path))
+                    src = _nifi_container_path_to_host(str(file_path))
                     if src.exists() and src.is_file():
                         fmt = _guess_file_format(src).lower() if _guess_file_format(src) else "csv"
-                        target_dir = user_dirs.get(f"output_{fmt}") or user_dirs["output_csv"]
+                        # v4: 根据 hasTag 决定目标目录（tagged → tagged_real_nifi_data）
+                        if bool(payload.get("hasTag")):
+                            target_dir = _get_user_tagged_real_nifi_dir(_normalize_username(username)) / f"output_{fmt}"
+                        else:
+                            target_dir = user_dirs.get(f"output_{fmt}") or user_dirs["output_csv"]
+                        target_dir.mkdir(parents=True, exist_ok=True)
                         dst = target_dir / src.name
                         shutil.move(str(src), str(dst))
                         moved += 1
                         payload["filePath"] = str(dst)
                         payload["path"] = str(dst)
+                        # 将 datasetName / hasTag 写入产物 meta
+                        try:
+                            _meta = _register_and_return_meta(dst, fmt)
+                            _extra = {"sourceType": "db_export"}
+                            if payload.get("hasTag") is not None:
+                                _extra["hasTag"] = bool(payload.get("hasTag"))
+                            if payload.get("datasetName"):
+                                _extra["datasetName"] = payload.get("datasetName")
+                            _write_meta_file(_meta, _extra)
+                        except Exception:
+                            pass
                 target_folder = user_dirs.get(status, user_dirs["done"])
                 dst_path = target_folder / path.name
                 dst_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -1258,6 +1343,15 @@ def _emit_structured_log(
     print(json.dumps(record, ensure_ascii=False, default=str))
 
 
+def _parse_bool_query(value: Optional[str]) -> bool:
+    """安全解析 Query/Body 中的布尔值，避免 bool(\"false\")=True 的陷阱。"""
+    if value is None:
+        return False
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in ("true", "1", "yes")
+
+
 def _normalize_username(value: Optional[str]) -> str:
     """v4: 统一用户名标准化，优先使用 username，fallback 到 factory_id 或 DEFAULT_USERNAME。"""
     return (value or "").strip() or DEFAULT_USERNAME
@@ -1424,6 +1518,8 @@ def _infer_nifi_source_type(top_level_dir: str) -> str:
         "csv_to_tsv",
         "tsv_to_csv",
         "tagged_output",
+        "tagged_nifi_data",
+        "tagged_real_nifi_data",
     }:
         return "uploaded_converted"
     return "manual_db_export"
@@ -1622,7 +1718,7 @@ def _shutdown():
 def api_trigger_export(job: Dict[str, Any], request: Request):
     """Trigger an export job. Local runs synchronously; NiFi mode submits a task JSON."""
     trace_id = make_trace_id(request.headers.get("x-trace-id"))
-    if _current_backend_mode() == "nifi":
+    if _current_backend_mode(request) == "nifi":
         submitted = _submit_nifi_export_task(job)
         task = submitted.get("task", {})
         fmt = (task.get("format") or "csv").lower()
@@ -1995,6 +2091,8 @@ def api_list_factory_assets(
                 "csv_to_tsv",
                 "tsv_to_csv",
                 "tagged_output",
+                "tagged_nifi_data",
+                "tagged_real_nifi_data",
             }:
                 return inferred
         return "scheduled_fetch"
@@ -2654,12 +2752,19 @@ def _write_tagged_output(source_meta: Dict[str, Any], rows: List[Dict[str, Any]]
         out_columns.append(tag_field)
     user = _sanitize_filename_component(operator)
 
-    # v4: 使用用户隔离的 tagged_output 目录，并根据 backend-mode 选择 nifi-data/real_nifi_data
+    # v4: 使用用户隔离的独立顶层 tagged 目录，并根据 backend-mode 选择 tagged_nifi_data/tagged_real_nifi_data
     if username:
-        tagged_dir = _get_active_user_data_dir(_normalize_username(username)) / "tagged_output"
+        mode = _load_backend_mode_state(_normalize_username(username)).get("mode", BACKEND_MODE_STATE.get("mode", "local"))
+        tagged_dir = _get_user_tagged_real_nifi_dir(_normalize_username(username)) if mode == "nifi" else _get_user_tagged_nifi_dir(_normalize_username(username))
         tagged_dir.mkdir(parents=True, exist_ok=True)
     else:
         tagged_dir = TAGGED_OUTPUT_DIR
+
+    # v4: 打标产物按原文件所在子目录放置（如原文件在 inbox_csv → tagged_*_data/inbox_csv/）
+    _src_dir = Path(source_meta.get("storagePath", "")).parent.name if source_meta.get("storagePath") else ""
+    if _src_dir and _src_dir not in ("tagged_nifi_data", "tagged_real_nifi_data", "nifi-data", "real_nifi_data"):
+        tagged_dir = tagged_dir / _src_dir
+        tagged_dir.mkdir(parents=True, exist_ok=True)
 
     if source_fmt == "JSON":
         out_path = tagged_dir / f"tag_{user}_{ts}_{source_name}.json"
@@ -2682,12 +2787,22 @@ def _write_edited_output(source_meta: Dict[str, Any], rows: List[Dict[str, Any]]
     source_fmt = source_meta.get("fileFormat", "CSV").upper()
     user = _sanitize_filename_component(operator)
 
-    # v4: 使用用户隔离的 tagged_output 目录，并根据 backend-mode 选择 nifi-data/real_nifi_data
+    # v4: 使用用户隔离的独立顶层 tagged 目录，并根据 backend-mode 选择 tagged_nifi_data/tagged_real_nifi_data
     if username:
-        tagged_dir = _get_active_user_data_dir(_normalize_username(username)) / "tagged_output"
+        mode = _load_backend_mode_state(_normalize_username(username)).get("mode", BACKEND_MODE_STATE.get("mode", "local"))
+        tagged_dir = _get_user_tagged_real_nifi_dir(_normalize_username(username)) if mode == "nifi" else _get_user_tagged_nifi_dir(_normalize_username(username))
         tagged_dir.mkdir(parents=True, exist_ok=True)
     else:
         tagged_dir = TAGGED_OUTPUT_DIR
+
+    # v4: 打标产物按原文件所在子目录放置
+    try:
+        _src_dir = Path(source_meta.get("storagePath", "")).parent.name if source_meta.get("storagePath") else ""
+        if _src_dir and _src_dir not in ("tagged_nifi_data", "tagged_real_nifi_data", "nifi-data", "real_nifi_data"):
+            tagged_dir = tagged_dir / _src_dir
+            tagged_dir.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
 
     if source_fmt == "JSON":
         out_path = tagged_dir / f"tag_{user}_{ts}_{source_name}.json"
@@ -3770,11 +3885,15 @@ def get_file_xattr(file_id: str, request: Request, x_trace_id: Optional[str] = H
     except Exception as e:
         return err(1005001, f"read xattr failed: {e}", trace_id)
 
+    # 脱敏：移除 meta 中的 storagePath（内部路径不外泄）
+    safe_meta = {k: v for k, v in xattr_meta.items() if k != "storagePath"}
+
     return ok({
         "fileId": file_id,
-        "storagePath": storage_path,
+        "storagePath": "[protected]",  # 不返回真实路径
         "xattrEnabled": meta_json.is_xattr_enabled(),
-        "meta": xattr_meta,
+        "xattrKeys": meta_json.list_xattr_keys(storage_path),
+        "meta": safe_meta,
     }, trace_id)
 
 
@@ -3857,6 +3976,13 @@ def manual_tag(request: Request, req: ManualTagReq, x_trace_id: Optional[str] = 
         )
         if tag_range:
             new_meta["tagRange"] = tag_range
+        # v4: 打标产物继承原文件的 datasetName（决定数据分类）
+        try:
+            _src_full_meta = meta_json.read_meta(str(source_path))
+            if _src_full_meta.get("datasetName"):
+                new_meta["datasetName"] = _src_full_meta["datasetName"]
+        except Exception:
+            pass
         meta_json.write_meta(str(out_path), new_meta)
     except Exception:
         pass
@@ -4047,6 +4173,7 @@ async def upload_file(request: Request,
                       failedTag: Optional[str] = Query(default=None),
                       categoryId: Optional[str] = Query(default=None),
                       categoryName: Optional[str] = Query(default=None),
+                      datasetName: Optional[str] = Query(default=None),
                       description: Optional[str] = Query(default=None),
                       username: Optional[str] = Query(default="user")):
     # Compatibility endpoint: route CSV/JSON/TSV uploads to inbox dirs, others to GENERATED_DIR.
@@ -4121,12 +4248,14 @@ async def upload_file(request: Request,
                 file_name=filename,
                 owner_id=owner_id,
                 username=owner_id,
+                has_tag=_parse_bool_query(hasTag),
+                dataset_name=datasetName or "",
             )
             task = submitted.get("task", {})
-            payload = _wait_nifi_task_done(task.get("jobId", ""), "convert", owner_id, timeout_seconds=30.0)
+            payload = _wait_nifi_task_done(task.get("jobId", ""), "convert", owner_id, timeout_seconds=65.0)
             if payload and payload.get("status") == "SUCCEEDED":
                 for output_file in payload.get("outputFiles", []):
-                    src = Path(str(output_file))
+                    src = _nifi_container_path_to_host(str(output_file))
                     if src.exists() and src.is_file():
                         target_dir = _get_active_user_data_dir(owner_id) / src.parent.name
                         target_dir.mkdir(parents=True, exist_ok=True)
@@ -4444,7 +4573,7 @@ def nifi_callback(payload: Dict[str, Any], x_trace_id: Optional[str] = Header(de
     row_count = payload.get("rowCount")
     error = payload.get("errorMessage")
     if file_path:
-        p = Path(file_path)
+        p = _nifi_container_path_to_host(str(file_path))
         if p.exists():
             meta = register_existing_file(p, _guess_file_format(p))
             job.setdefault("outputs", []).append(meta["fileId"])
@@ -4469,6 +4598,7 @@ async def upload_inbox_csv(
     failedTag: Optional[str] = Query(default=None),
     categoryId: Optional[str] = Query(default=None),
     categoryName: Optional[str] = Query(default=None),
+    datasetName: Optional[str] = Query(default=None),
     description: Optional[str] = Query(default=None),
 ):
     trace_id = request.state.trace_id
@@ -4478,10 +4608,56 @@ async def upload_inbox_csv(
     content_raw = await file.read()
     suffix = Path(file.filename or "").suffix.lower()
     filename = f"raw_{owner_id}_{stem}_{ts}.{suffix.lstrip('.')}"
-    if _current_backend_mode() == "nifi":
-        dest = _export_output_root("nifi", username=owner_id) / "inbox_csv" / filename
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        dest.write_bytes(content_raw)
+    if _current_backend_mode(request) == "nifi":
+        # v4: NiFi 真实调用模式下，源文件先写入全局共享目录供 iot-nifi 容器访问；同时复制到用户目录备案
+        # hasTag=true 时，源文件也放在独立顶层 tagged 目录下
+        _src_tagged = bool(hasTag)
+        if NIFI_REAL_EXECUTION:
+            global_inbox = (NIFI_REAL_BASE_DIR.parent / "tagged_real_nifi_data") / f"inbox_{suffix.strip('.')}" if _src_tagged else NIFI_REAL_BASE_DIR / f"inbox_{suffix.strip('.')}"
+            global_inbox.mkdir(parents=True, exist_ok=True)
+            dest = global_inbox / filename
+            dest.write_bytes(content_raw)
+            user_inbox_dir = (_get_user_tagged_real_nifi_dir(owner_id) / f"inbox_{suffix.strip('.')}") if _src_tagged else (_get_user_real_nifi_dir(owner_id) / f"inbox_{suffix.strip('.')}")
+            user_inbox_dir.mkdir(parents=True, exist_ok=True)
+            user_dest = user_inbox_dir / filename
+            user_dest.write_bytes(content_raw)
+            meta = register_existing_file(user_dest, "csv")
+        else:
+            user_inbox_dir = (_get_user_tagged_real_nifi_dir(owner_id) / f"inbox_{suffix.strip('.')}") if _src_tagged else (_get_user_real_nifi_dir(owner_id) / f"inbox_{suffix.strip('.')}")
+            user_inbox_dir.mkdir(parents=True, exist_ok=True)
+            dest = user_inbox_dir / filename
+            # 原子写入，避免客户端断开时留下空文件
+            tmp = dest.with_suffix(dest.suffix + ".tmp")
+            tmp.write_bytes(content_raw)
+            tmp.rename(dest)
+            meta = register_existing_file(dest, "csv")
+        # v4: 为 NiFi 模式下的用户目录源文件写入元数据，与 Local 模式保持一致
+        extra_source = {"sourceType": "upload"}
+        if hasTag is not None:
+            extra_source["hasTag"] = bool(hasTag)
+        if tagColumn:
+            extra_source["tagColumn"] = tagColumn
+        if tagName:
+            extra_source["tagName"] = tagName
+        if tagRange:
+            try:
+                extra_source["tagRange"] = json.loads(tagRange)
+            except Exception:
+                extra_source["tagRange"] = [t.strip() for t in str(tagRange).split(",") if t.strip()]
+        if failedTag:
+            extra_source["failedTag"] = _coerce_tag_list(failedTag)
+        if categoryId:
+            extra_source["categoryId"] = categoryId
+        if categoryName:
+            extra_source["categoryName"] = categoryName
+        if datasetName:
+            extra_source["datasetName"] = datasetName
+        if description:
+            extra_source["description"] = description
+        try:
+            _write_meta_file(meta, extra_source)
+        except Exception:
+            pass
         target_formats = ["JSON"]
         if convertType == "csv_to_tsv":
             target_formats = ["TSV"]
@@ -4491,24 +4667,31 @@ async def upload_inbox_csv(
             target_formats=target_formats,
             file_name=filename,
             owner_id=owner_id,
-            username=username,
+            username=owner_id,
+            has_tag=_parse_bool_query(hasTag),
+            dataset_name=datasetName or "",
         )
-        meta = register_existing_file(dest, "csv")
         # v4: 手动设置 username 字段，确保文件列表过滤正确
         if meta.get("fileId") and meta["fileId"] in files:
             files[meta["fileId"]]["username"] = _normalize_username(owner_id)
+        # v4: 用户看到的 sourcePath 应该是其个人目录下的副本
+        response_source = str(user_dest) if (NIFI_REAL_EXECUTION and "user_dest" in locals()) else str(dest)
         return ok({
             "fileId": meta.get("fileId", ""),
             "jobId": submitted["task"]["jobId"],
             "status": "PENDING",
             "mode": "nifi",
-            "sourcePath": str(dest),
+            "sourcePath": response_source,
             "sourceFormat": "CSV",
             "targetFormats": target_formats,
         }, trace_id)
-    udirs = _get_user_upload_dirs(owner_id)
+    _src_tagged = bool(hasTag)
+    udirs = _get_user_upload_dirs(owner_id, tagged=_src_tagged)
     dest = udirs["inbox_csv"] / filename
-    dest.write_bytes(content_raw)
+    # 原子写入：先写临时文件再 rename，避免客户端断开时留下空文件
+    tmp = dest.with_suffix(dest.suffix + ".tmp")
+    tmp.write_bytes(content_raw)
+    tmp.rename(dest)
     # register in file index
     meta = register_existing_file(dest, "csv")
     # 始终为源上传文件写入 meta，确保标签等配置信息落到 inbox_csv 文件的 .meta.json
@@ -4530,6 +4713,8 @@ async def upload_inbox_csv(
         extra_source["categoryId"] = categoryId
     if categoryName:
         extra_source["categoryName"] = categoryName
+    if datasetName:
+        extra_source["datasetName"] = datasetName
     if description:
         extra_source["description"] = description
     try:
@@ -4571,6 +4756,8 @@ async def upload_inbox_csv(
         if rows:
             convert = (convertType or "csv_to_json").lower()
             extra = {"sourceType": "upload"}
+            _is_tagged = _src_tagged  # 已在上面源文件写入段计算
+            out_dirs = udirs  # udirs 已含 tagged 逻辑
             if hasTag is not None:
                 extra["hasTag"] = bool(hasTag)
             if tagColumn:
@@ -4588,12 +4775,14 @@ async def upload_inbox_csv(
                 extra["categoryId"] = categoryId
             if categoryName:
                 extra["categoryName"] = categoryName
+            if datasetName:
+                extra["datasetName"] = datasetName
             if description:
                 extra["description"] = description
 
             if convert == "csv_to_tsv":
                 out_name = f"xform_{owner_id}_{stem}_{now_ts()}_csv2tsv.tsv"
-                out_path = udirs["csv_to_tsv"] / out_name
+                out_path = out_dirs["csv_to_tsv"] / out_name
                 _write_tsv(out_path, cols, rows)
                 meta2 = _register_and_return_meta(out_path, "tsv")
                 try:
@@ -4603,7 +4792,7 @@ async def upload_inbox_csv(
                 target_path = str(out_path)
             else:
                 out_name = f"xform_{owner_id}_{stem}_{now_ts()}_csv2json.json"
-                out_path = udirs["csv_to_json"] / out_name
+                out_path = out_dirs["csv_to_json"] / out_name
                 _write_ndjson(out_path, cols, rows)
                 meta2 = _register_and_return_meta(out_path, "json")
                 try:
@@ -4656,6 +4845,7 @@ async def upload_inbox_json(
     categoryId: Optional[str] = Query(default=None),
     categoryName: Optional[str] = Query(default=None),
     description: Optional[str] = Query(default=None),
+    datasetName: Optional[str] = Query(default=None),
 ):
     trace_id = request.state.trace_id
     ts = now_ts()
@@ -4664,10 +4854,52 @@ async def upload_inbox_json(
     content_raw = await file.read()
     suffix = Path(file.filename or "").suffix.lower()
     filename = f"raw_{owner_id}_{stem}_{ts}.{suffix.lstrip('.')}"
-    if _current_backend_mode() == "nifi":
-        dest = _export_output_root("nifi", username=owner_id) / "inbox_json" / filename
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        dest.write_bytes(content_raw)
+    _src_tagged = bool(hasTag)
+    if _current_backend_mode(request) == "nifi":
+        # v4: NiFi 真实调用模式下，源文件先写入全局共享目录并复制到用户目录备案
+        if NIFI_REAL_EXECUTION:
+            global_inbox = (NIFI_REAL_BASE_DIR.parent / "tagged_real_nifi_data") / f"inbox_{suffix.strip('.')}" if _src_tagged else NIFI_REAL_BASE_DIR / f"inbox_{suffix.strip('.')}"
+            global_inbox.mkdir(parents=True, exist_ok=True)
+            dest = global_inbox / filename
+            dest.write_bytes(content_raw)
+            user_inbox_dir = (_get_user_tagged_real_nifi_dir(owner_id) / f"inbox_{suffix.strip('.')}") if _src_tagged else (_get_user_real_nifi_dir(owner_id) / f"inbox_{suffix.strip('.')}")
+            user_inbox_dir.mkdir(parents=True, exist_ok=True)
+            user_dest = user_inbox_dir / filename
+            user_dest.write_bytes(content_raw)
+            meta = register_existing_file(user_dest, "json")
+        else:
+            user_inbox_dir = (_get_user_tagged_real_nifi_dir(owner_id) / f"inbox_{suffix.strip('.')}") if _src_tagged else (_get_user_real_nifi_dir(owner_id) / f"inbox_{suffix.strip('.')}")
+            user_inbox_dir.mkdir(parents=True, exist_ok=True)
+            dest = user_inbox_dir / filename
+            dest.write_bytes(content_raw)
+            meta = register_existing_file(dest, "json")
+        # v4: 为 NiFi 模式下的用户目录源文件写入元数据，与 Local 模式保持一致
+        extra_source = {"sourceType": "upload"}
+        if hasTag is not None:
+            extra_source["hasTag"] = bool(hasTag)
+        if tagColumn:
+            extra_source["tagColumn"] = tagColumn
+        if tagName:
+            extra_source["tagName"] = tagName
+        if tagRange:
+            try:
+                extra_source["tagRange"] = json.loads(tagRange)
+            except Exception:
+                extra_source["tagRange"] = [t.strip() for t in str(tagRange).split(",") if t.strip()]
+        if failedTag:
+            extra_source["failedTag"] = _coerce_tag_list(failedTag)
+        if categoryId:
+            extra_source["categoryId"] = categoryId
+        if categoryName:
+            extra_source["categoryName"] = categoryName
+        if datasetName:
+            extra_source["datasetName"] = datasetName
+        if description:
+            extra_source["description"] = description
+        try:
+            _write_meta_file(meta, extra_source)
+        except Exception:
+            pass
         target_formats = ["CSV"]
         if convertType == "json_to_tsv":
             target_formats = ["TSV"]
@@ -4677,22 +4909,25 @@ async def upload_inbox_json(
             target_formats=target_formats,
             file_name=filename,
             owner_id=owner_id,
-            username=username,
+            username=owner_id,
+            has_tag=_parse_bool_query(hasTag),
+            dataset_name=datasetName or "",
         )
-        meta = register_existing_file(dest, "json")
         # v4: 手动设置 username 字段，确保文件列表过滤正确
         if meta.get("fileId") and meta["fileId"] in files:
             files[meta["fileId"]]["username"] = _normalize_username(owner_id)
+        # v4: 用户看到的 sourcePath 应该是其个人目录下的副本
+        response_source = str(user_dest) if (NIFI_REAL_EXECUTION and "user_dest" in locals()) else str(dest)
         return ok({
             "fileId": meta.get("fileId", ""),
             "jobId": submitted["task"]["jobId"],
             "status": "PENDING",
             "mode": "nifi",
-            "sourcePath": str(dest),
+            "sourcePath": response_source,
             "sourceFormat": "JSON",
             "targetFormats": target_formats,
         }, trace_id)
-    udirs = _get_user_upload_dirs(owner_id)
+    udirs = _get_user_upload_dirs(owner_id, tagged=_src_tagged)
     dest = udirs["inbox_json"] / filename
     dest.write_bytes(content_raw)
     meta = register_existing_file(dest, "json")
@@ -4715,6 +4950,8 @@ async def upload_inbox_json(
         extra_source["categoryId"] = categoryId
     if categoryName:
         extra_source["categoryName"] = categoryName
+        if datasetName:
+            extra_source["datasetName"] = datasetName
     if description:
         extra_source["description"] = description
     try:
@@ -4753,9 +4990,11 @@ async def upload_inbox_json(
         if objs:
             cols = sorted({k for o in objs for k in o.keys()})
             convert = (convertType or "json_to_csv").lower()
+            _is_tagged = _src_tagged
+            out_dirs = udirs  # udirs 已含 tagged 逻辑
             extra = {"sourceType": "upload"}
             if hasTag is not None:
-                extra["hasTag"] = bool(hasTag)
+                extra["hasTag"] = _is_tagged
             if tagColumn:
                 extra["tagColumn"] = tagColumn
             if tagName:
@@ -4771,12 +5010,14 @@ async def upload_inbox_json(
                 extra["categoryId"] = categoryId
             if categoryName:
                 extra["categoryName"] = categoryName
+                if datasetName:
+                    extra["datasetName"] = datasetName
             if description:
                 extra["description"] = description
 
             if convert == "json_to_tsv":
                 out_name = f"xform_{owner_id}_{stem}_{now_ts()}_json2tsv.tsv"
-                out_path = udirs["json_to_tsv"] / out_name
+                out_path = out_dirs["json_to_tsv"] / out_name
                 _write_tsv(out_path, cols, objs)
                 meta2 = _register_and_return_meta(out_path, "tsv")
                 try:
@@ -4787,7 +5028,7 @@ async def upload_inbox_json(
                 converted_file_id = meta2.get("fileId", "")
             else:
                 out_name = f"xform_{owner_id}_{stem}_{now_ts()}_json2csv.csv"
-                out_path = udirs["json_to_csv"] / out_name
+                out_path = out_dirs["json_to_csv"] / out_name
                 _write_csv(out_path, cols, objs)
                 meta2 = _register_and_return_meta(out_path, "csv")
                 try:
@@ -4857,6 +5098,7 @@ async def upload_inbox_tsv(
     categoryId: Optional[str] = Query(default=None),
     categoryName: Optional[str] = Query(default=None),
     description: Optional[str] = Query(default=None),
+    datasetName: Optional[str] = Query(default=None),
 ):
     trace_id = request.state.trace_id
     ts = now_ts()
@@ -4865,10 +5107,52 @@ async def upload_inbox_tsv(
     content_raw = await file.read()
     suffix = Path(file.filename or "").suffix.lower()
     filename = f"raw_{owner_id}_{stem}_{ts}.{suffix.lstrip('.')}"
-    if _current_backend_mode() == "nifi":
-        dest = _export_output_root("nifi", username=owner_id) / "inbox_tsv" / filename
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        dest.write_bytes(content_raw)
+    _src_tagged = bool(hasTag)
+    if _current_backend_mode(request) == "nifi":
+        # v4: NiFi 真实调用模式下，源文件先写入全局共享目录并复制到用户目录备案
+        if NIFI_REAL_EXECUTION:
+            global_inbox = (NIFI_REAL_BASE_DIR.parent / "tagged_real_nifi_data") / f"inbox_{suffix.strip('.')}" if _src_tagged else NIFI_REAL_BASE_DIR / f"inbox_{suffix.strip('.')}"
+            global_inbox.mkdir(parents=True, exist_ok=True)
+            dest = global_inbox / filename
+            dest.write_bytes(content_raw)
+            user_inbox_dir = (_get_user_tagged_real_nifi_dir(owner_id) / f"inbox_{suffix.strip('.')}") if _src_tagged else (_get_user_real_nifi_dir(owner_id) / f"inbox_{suffix.strip('.')}")
+            user_inbox_dir.mkdir(parents=True, exist_ok=True)
+            user_dest = user_inbox_dir / filename
+            user_dest.write_bytes(content_raw)
+            meta = register_existing_file(user_dest, "tsv")
+        else:
+            user_inbox_dir = (_get_user_tagged_real_nifi_dir(owner_id) / f"inbox_{suffix.strip('.')}") if _src_tagged else (_get_user_real_nifi_dir(owner_id) / f"inbox_{suffix.strip('.')}")
+            user_inbox_dir.mkdir(parents=True, exist_ok=True)
+            dest = user_inbox_dir / filename
+            dest.write_bytes(content_raw)
+            meta = register_existing_file(dest, "tsv")
+        # v4: 为 NiFi 模式下的用户目录源文件写入元数据，与 Local 模式保持一致
+        extra_source = {"sourceType": "upload"}
+        if hasTag is not None:
+            extra_source["hasTag"] = bool(hasTag)
+        if tagColumn:
+            extra_source["tagColumn"] = tagColumn
+        if tagName:
+            extra_source["tagName"] = tagName
+        if tagRange:
+            try:
+                extra_source["tagRange"] = json.loads(tagRange)
+            except Exception:
+                extra_source["tagRange"] = [t.strip() for t in str(tagRange).split(",") if t.strip()]
+        if failedTag:
+            extra_source["failedTag"] = _coerce_tag_list(failedTag)
+        if categoryId:
+            extra_source["categoryId"] = categoryId
+        if categoryName:
+            extra_source["categoryName"] = categoryName
+        if datasetName:
+            extra_source["datasetName"] = datasetName
+        if description:
+            extra_source["description"] = description
+        try:
+            _write_meta_file(meta, extra_source)
+        except Exception:
+            pass
         target_formats = ["JSON"]
         if convertType == "tsv_to_csv":
             target_formats = ["CSV"]
@@ -4878,22 +5162,25 @@ async def upload_inbox_tsv(
             target_formats=target_formats,
             file_name=filename,
             owner_id=owner_id,
-            username=username,
+            username=owner_id,
+            has_tag=_parse_bool_query(hasTag),
+            dataset_name=datasetName or "",
         )
-        meta = register_existing_file(dest, "tsv")
         # v4: 手动设置 username 字段，确保文件列表过滤正确
         if meta.get("fileId") and meta["fileId"] in files:
             files[meta["fileId"]]["username"] = _normalize_username(owner_id)
+        # v4: 用户看到的 sourcePath 应该是其个人目录下的副本
+        response_source = str(user_dest) if (NIFI_REAL_EXECUTION and "user_dest" in locals()) else str(dest)
         return ok({
             "fileId": meta.get("fileId", ""),
             "jobId": submitted["task"]["jobId"],
             "status": "PENDING",
             "mode": "nifi",
-            "sourcePath": str(dest),
+            "sourcePath": response_source,
             "sourceFormat": "TSV",
             "targetFormats": target_formats,
         }, trace_id)
-    udirs = _get_user_upload_dirs(owner_id)
+    udirs = _get_user_upload_dirs(owner_id, tagged=_src_tagged)
     dest = udirs["inbox_tsv"] / filename
     dest.write_bytes(content_raw)
     meta = register_existing_file(dest, "tsv")
@@ -4916,6 +5203,8 @@ async def upload_inbox_tsv(
         extra_source["categoryId"] = categoryId
     if categoryName:
         extra_source["categoryName"] = categoryName
+        if datasetName:
+            extra_source["datasetName"] = datasetName
     if description:
         extra_source["description"] = description
     try:
@@ -4950,9 +5239,11 @@ async def upload_inbox_tsv(
                 }
                 return err(1002401, "tsv has no data rows; if file has no header please provide columns", trace_id)
             convert = (convertType or "tsv_to_json").lower()
+            _is_tagged = _src_tagged
+            out_dirs = udirs  # udirs 已含 tagged 逻辑
             extra = {"sourceType": "upload"}
             if hasTag is not None:
-                extra["hasTag"] = bool(hasTag)
+                extra["hasTag"] = _is_tagged
             if tagColumn:
                 extra["tagColumn"] = tagColumn
             if tagName:
@@ -4968,12 +5259,14 @@ async def upload_inbox_tsv(
                 extra["categoryId"] = categoryId
             if categoryName:
                 extra["categoryName"] = categoryName
+                if datasetName:
+                    extra["datasetName"] = datasetName
             if description:
                 extra["description"] = description
 
             if convert == "tsv_to_csv":
                 out_name = f"xform_{owner_id}_{stem}_{now_ts()}_tsv2csv.csv"
-                out_path = udirs["tsv_to_csv"] / out_name
+                out_path = out_dirs["tsv_to_csv"] / out_name
                 _write_csv(out_path, header, rows)
                 meta2 = _register_and_return_meta(out_path, "csv")
                 try:
@@ -4983,7 +5276,7 @@ async def upload_inbox_tsv(
                 target_path = str(out_path)
             else:
                 out_name = f"xform_{owner_id}_{stem}_{now_ts()}_tsv2json.json"
-                out_path = udirs["tsv_to_json"] / out_name
+                out_path = out_dirs["tsv_to_json"] / out_name
                 _write_ndjson(out_path, header, rows)
                 meta2 = _register_and_return_meta(out_path, "json")
                 try:
@@ -5034,6 +5327,8 @@ class MySQLExportReq(BaseModel):
     where: Optional[str] = Field(default="")
     format: str = Field(default="CSV")
     append_to_latest: bool = Field(default=False)
+    hasTag: bool = Field(default=False)
+    datasetName: str = Field(default="")
 
 
 @app.post("/api/v1/export/mysql")
@@ -5043,10 +5338,11 @@ def export_mysql(req: MySQLExportReq, request: Request, x_trace_id: Optional[str
                  tagName: Optional[str] = Query(default=None),
                  tagRange: Optional[str] = Query(default=None)):
     trace_id = request.state.trace_id
-    mode = _current_backend_mode()
+    mode = _current_backend_mode(request)
     cookie = request.cookies.get("access_token")
     user = _get_current_user_from_token(cookie)
     username = _sanitize_filename_component((user or {}).get("username") or (user or {}).get("user") or (user or {}).get("name") or "manual")
+    _has_tag_export = bool(hasTag)
     if mode == "nifi":
         job = {
             "id": f"export_{now_ts()}_{uuid.uuid4().hex[:6]}",
@@ -5055,6 +5351,8 @@ def export_mysql(req: MySQLExportReq, request: Request, x_trace_id: Optional[str
             "owner_id": username,
             "file_format": req.format.lower(),
             "append_to_latest": req.append_to_latest,
+            "hasTag": _has_tag_export,
+            "datasetName": req.datasetName,
             "db_config": {
                 "db_type": "mysql",
                 "host": req.host,
@@ -5065,10 +5363,11 @@ def export_mysql(req: MySQLExportReq, request: Request, x_trace_id: Optional[str
                 "table": req.table,
                 "where": req.where or "",
             },
-            "payload": {"table": req.table},
+            "payload": {"table": req.table, "hasTag": _has_tag_export},
             "where": req.where or "",
         }
         submitted = _submit_nifi_export_task(job)
+        _tagged_export_root = _get_user_tagged_real_nifi_dir(username) if _has_tag_export else _export_output_root("nifi", username=username)
         request.state.observation = {
             "operation": "export_mysql",
             "status": "SUCCEEDED",
@@ -5082,7 +5381,7 @@ def export_mysql(req: MySQLExportReq, request: Request, x_trace_id: Optional[str
             "jobId": job["id"],
             "status": "PENDING",
             "mode": "nifi",
-            "path": str(_export_output_root("nifi", username=username) / f"output_{job['file_format']}"),
+            "path": str(_tagged_export_root / f"output_{job['file_format']}"),
             "taskPath": submitted.get("taskPath"),
             "task": submitted.get("task"),
         }
@@ -5114,7 +5413,7 @@ def export_mysql(req: MySQLExportReq, request: Request, x_trace_id: Optional[str
     table_safe = _sanitize_filename_component(req.table)
     base_name = f"export_{username}_{table_safe}_{ts}"
 
-    primary_root = _export_output_root(username=username)
+    primary_root = _get_user_tagged_nifi_dir(username) if _has_tag_export else _export_output_root(username=username)
     primary_dir = primary_root / f"output_{fmt}"
     primary_dir.mkdir(parents=True, exist_ok=True)
 
@@ -5228,7 +5527,7 @@ def export_generic(body: Dict[str, Any], request: Request):
     """
     trace_id = request.state.trace_id
     try:
-        mode = _current_backend_mode()
+        mode = _current_backend_mode(request)
         # normalize db_config
         db_conf = body.get("db_config") or {}
         if not db_conf:
@@ -5246,6 +5545,7 @@ def export_generic(body: Dict[str, Any], request: Request):
 
         table = body.get("table") or (body.get("payload") or {}).get("table") or db_conf.get("table")
         fmt = (body.get("format") or body.get("file_format") or "csv").lower()
+        dataset_name = (body.get("datasetName") or body.get("dataset_name") or "").strip()
 
         cookie = request.cookies.get("access_token")
         cookie_user = _get_current_user_from_token(cookie)
@@ -5262,14 +5562,18 @@ def export_generic(body: Dict[str, Any], request: Request):
             "payload": {"table": table} if table else {},
             "append_to_latest": bool(body.get("append_to_latest") or False),
             "where": body.get("where") or "",
+            "hasTag": bool(body.get("hasTag")),
+            "datasetName": dataset_name,
         }
 
+        _is_tagged_export = bool(body.get("hasTag"))
         if mode == "nifi":
             submitted = _submit_nifi_export_task(job)
+            _tagged_export_root = _get_user_tagged_real_nifi_dir(owner_id) if _is_tagged_export else _export_output_root("nifi", username=owner_id)
             return ok({
                 "status": "PENDING",
                 "mode": "nifi",
-                "path": str(_export_output_root("nifi", username=owner_id) / f"output_{fmt}"),
+                "path": str(_tagged_export_root / f"output_{fmt}"),
                 "taskPath": submitted.get("taskPath"),
                 "task": submitted.get("task"),
             }, trace_id)
@@ -5281,25 +5585,41 @@ def export_generic(body: Dict[str, Any], request: Request):
                 # normalize filename for manual-triggered jobs to export_{owner}_{table}_{ts}
                 try:
                     p = Path(res.get("path"))
-                    if str(job.get("id") or "").startswith("manual_") and p.exists():
+                    if p.exists():
                         owner = _sanitize_filename_component(job.get("owner_id") or "manual")
                         payload = job.get("payload") or {}
                         table = payload.get("table") or (job.get("db_config") or {}).get("table") or "data"
                         table_safe = _sanitize_filename_component(table)
                         ts = now_ts()
                         # place manual export into format-specific output dir under the active backend root
-                        desired_dir = _export_output_root(username=owner) / f"output_{fmt}"
+                        _export_base = _get_user_tagged_nifi_dir(owner) if _is_tagged_export else _export_output_root(username=owner)
+                        desired_dir = _export_base / f"output_{fmt}"
                         try:
                             desired_dir.mkdir(parents=True, exist_ok=True)
                         except Exception:
                             pass
                         desired = desired_dir / f"export_{owner}_{table_safe}_{ts}.{fmt}"
                         try:
-                            # move/rename primary output to desired name
-                            p.replace(desired)
-                            res["path"] = str(desired)
+                            if p.is_file() and p.suffix.lower() == ".csv":
+                                # p 是单个 CSV 文件 → 直接移动（export_worker.py 返回文件路径）
+                                p.replace(desired)
+                                res["path"] = str(desired)
+                            elif p.is_dir():
+                                # p 是临时目录 → 遍历 csv 文件逐个移动（旧逻辑）
+                                for csv_file in sorted(p.glob("*.csv")):
+                                    target = desired_dir / csv_file.name
+                                    csv_file.replace(target)
+                                    res["path"] = str(target)
                         except Exception:
                             # fallback: leave as-is
+                            pass
+                        # 清理 exports/ 临时目录残留（主文件已移到 output_csv/）
+                        try:
+                            tmp_dir = p.parent
+                            if tmp_dir.exists() and tmp_dir.name.startswith("manual_"):
+                                import shutil as _sh
+                                _sh.rmtree(tmp_dir, ignore_errors=True)
+                        except Exception:
                             pass
                 except Exception:
                     pass
@@ -5361,6 +5681,8 @@ def export_generic(body: Dict[str, Any], request: Request):
                         extra["categoryId"] = body.get("categoryId")
                     if body.get("categoryName"):
                         extra["categoryName"] = body.get("categoryName")
+                    if dataset_name:
+                        extra["datasetName"] = dataset_name
                     if body.get("description"):
                         extra["description"] = body.get("description")
                     _write_meta_file(meta, extra)
@@ -5430,7 +5752,13 @@ async def auto_tag(request: Request, req: AutoTagReq, x_trace_id: Optional[str] 
         tag_type = "auto-rule"
         if tag_rule and isinstance(tag_rule, dict):
             tag_type = "manual-table"
-            tag_config = {"columns": list(tag_rule.get("mapping", {}).keys()), "mappings": {"row_rules": [{"column": k, "mapping": v} for k, v in tag_rule.get("mapping", {}).items()]}}
+            # tagRule 格式: {'Outcome': {'1':'高风险','0':'低风险'}}
+            # 转换为 worker 需要的 tagConfig
+            rule_mapping = tag_rule.get("mapping", tag_rule)
+            tag_config = {
+                "columns": list(rule_mapping.keys()),
+                "mappings": {"row_rules": [{"column": k, "mapping": v} for k, v in rule_mapping.items()]}
+            }
         else:
             tag_config = {"rules": [{"name": "自动打标", "conditions": [], "then": {"tagColumn": "tag", "tagValue": "已打标"}}]}
         submitted = _submit_nifi_tagging_task(
@@ -5444,11 +5772,26 @@ async def auto_tag(request: Request, req: AutoTagReq, x_trace_id: Optional[str] 
             target_format=req.outputFormat or source_fmt,
         )
         task = submitted.get("task", {})
-        payload = _wait_nifi_task_done(task.get("jobId", ""), "tagging", current_username, timeout_seconds=30.0)
+        payload = _wait_nifi_task_done(task.get("jobId", ""), "tagging", current_username, timeout_seconds=65.0)
         if payload and payload.get("status") == "SUCCEEDED":
             dst_path = payload.get("path") or payload.get("filePath") or ""
-            if dst_path and Path(dst_path).exists():
-                out_meta = files.get(str(register_existing_file(Path(dst_path), _guess_file_format(Path(dst_path)) or "csv").get("fileId")))
+            src = _nifi_container_path_to_host(str(dst_path)) if dst_path else None
+            if src and src.exists() and src.is_file():
+                user_tagged_dir = _get_user_tagged_real_nifi_dir(current_username)
+                # v4: 按原文件所在子目录放置
+                try:
+                    _orig_dir = Path(source_meta.get("storagePath", "")).parent.name if source_meta.get("storagePath") else ""
+                    if _orig_dir and _orig_dir not in ("tagged_nifi_data", "tagged_real_nifi_data", "nifi-data", "real_nifi_data"):
+                        user_tagged_dir = user_tagged_dir / _orig_dir
+                except Exception:
+                    pass
+                user_tagged_dir.mkdir(parents=True, exist_ok=True)
+                dst = user_tagged_dir / src.name
+                try:
+                    shutil.move(str(src), str(dst))
+                except Exception:
+                    dst = src
+                out_meta = files.get(str(register_existing_file(dst, _guess_file_format(dst) or "csv").get("fileId")))
                 if out_meta:
                     job_id = f"job_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:4]}"
                     job = {
@@ -5457,7 +5800,7 @@ async def auto_tag(request: Request, req: AutoTagReq, x_trace_id: Optional[str] 
                         "status": "SUCCEEDED",
                         "progress": 100,
                         "source": {"sourceType": "FILE_UPLOAD", "fileId": req.fileId},
-                        "target": {"format": req.outputFormat.upper() if req.outputFormat else source_fmt.upper(), "outputDir": str(_get_user_real_nifi_dir(current_username) / "tagged_output")},
+                        "target": {"format": req.outputFormat.upper() if req.outputFormat else source_fmt.upper(), "outputDir": str(_get_user_tagged_real_nifi_dir(current_username))},
                         "errorCode": "",
                         "errorMessage": "",
                         "nifiFlowId": task.get("jobId"),
@@ -5509,6 +5852,13 @@ async def auto_tag(request: Request, req: AutoTagReq, x_trace_id: Optional[str] 
             row_count=len(tagged_rows),
             file_size=out_path.stat().st_size if out_path.exists() else 0,
         )
+        # v4: 打标产物继承原文件的 datasetName
+        try:
+            _src_full_meta = meta_json.read_meta(str(source_path))
+            if _src_full_meta.get("datasetName"):
+                new_meta["datasetName"] = _src_full_meta["datasetName"]
+        except Exception:
+            pass
         meta_json.write_meta(str(out_path), new_meta)
     except Exception:
         pass
@@ -5604,11 +5954,19 @@ def _get_training_scan_dirs(username: Optional[str] = None) -> List[Path]:
         for sub in ["inbox_csv", "inbox_json", "inbox_tsv",
                      "csv_to_json", "json_to_csv", "csv_to_tsv",
                      "tsv_to_csv", "json_to_tsv", "tsv_to_json",
-                     "tagged_output", "output_csv", "output_json", "output_tsv"]:
+                     "output_csv", "output_json", "output_tsv"]:
             dirs.append(nifi_root / sub)
+        tagged_nifi = _get_user_tagged_nifi_dir(un)
+        tagged_real = _get_user_tagged_real_nifi_dir(un)
+        for sub in ["inbox_csv", "inbox_json", "inbox_tsv",
+                     "csv_to_json", "json_to_csv", "csv_to_tsv",
+                     "tsv_to_csv", "json_to_tsv", "tsv_to_json",
+                     "output_csv", "output_json", "output_tsv"]:
+            dirs.append(tagged_nifi / sub)
         for sub in ["inbox_csv", "inbox_json", "inbox_tsv",
                      "output_csv", "output_json", "output_tsv"]:
             dirs.append(real_root / sub)
+            dirs.append(tagged_real / sub)
     else:
         # 未指定用户：扫描所有用户目录
         try:
@@ -5619,14 +5977,18 @@ def _get_training_scan_dirs(username: Optional[str] = None) -> List[Path]:
                     un = _normalize_username(u[0])
                     nifi_root = _get_user_nifi_dir(un)
                     real_root = _get_user_real_nifi_dir(un)
+                    tagged_nifi = _get_user_tagged_nifi_dir(un)
+                    tagged_real = _get_user_tagged_real_nifi_dir(un)
                     for sub in ["inbox_csv", "inbox_json", "inbox_tsv",
                                  "csv_to_json", "json_to_csv", "csv_to_tsv",
                                  "tsv_to_csv", "json_to_tsv", "tsv_to_json",
-                                 "tagged_output", "output_csv", "output_json", "output_tsv"]:
+                                 "output_csv", "output_json", "output_tsv"]:
                         dirs.append(nifi_root / sub)
+                        dirs.append(tagged_nifi / sub)
                     for sub in ["inbox_csv", "inbox_json", "inbox_tsv",
                                  "output_csv", "output_json", "output_tsv"]:
                         dirs.append(real_root / sub)
+                        dirs.append(tagged_real / sub)
             finally:
                 sess.close()
         except Exception:

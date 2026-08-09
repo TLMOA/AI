@@ -1445,8 +1445,10 @@ function buildSchedulePayload() {
   const cid = (document.getElementById("dbCategoryId")?.value || "").trim();
   const cname = (document.getElementById("dbCategoryName")?.value || "").trim();
   const desc = (document.getElementById("dbDescription")?.value || "").trim();
+  const dsName = (document.getElementById("dbExportDatasetName")?.value || "").trim();
   if (cid) payload.categoryId = cid;
   if (cname) payload.categoryName = cname;
+  if (dsName) payload.datasetName = dsName;
   if (desc) payload.description = desc;
   return {
     job_name: `db_export_${table}_${Date.now()}`,
@@ -1979,8 +1981,10 @@ if (fileInput && uploadBtn && uploadResult) {
       const upCid = (document.getElementById("uploadCategoryId")?.value || "").trim();
       const upCname = (document.getElementById("uploadCategoryName")?.value || "").trim();
       const upDesc = (document.getElementById("uploadDescription")?.value || "").trim();
+      const upDs = (document.getElementById("uploadDatasetName")?.value || "").trim();
       if (upCid) query.set("categoryId", upCid);
       if (upCname) query.set("categoryName", upCname);
+      if (upDs) query.set("datasetName", upDs);
       if (upDesc) query.set("description", upDesc);
 
       const data = await requestJson(`${selected.endpoint}?${query.toString()}`, {
@@ -1991,14 +1995,18 @@ if (fileInput && uploadBtn && uploadResult) {
         const sourcePath = data?.data?.sourcePath || data?.data?.storagePath || "";
         const targetPath = data?.data?.targetPath || "";
         const convertedFileId = data?.data?.convertedFileId || "";
+        const isNifi = data?.data?.status === "PENDING" || data?.data?.mode === "nifi";
+        const convertType = selected.convertType || "csv_to_json";
         const msgLines = [
-          `上传成功，已执行 ${selected.convertType}，原文件 fileId: ${data.data.fileId}`,
+          `上传成功，已执行 ${convertType}，原文件 fileId: ${data.data.fileId}`,
           sourcePath ? `上传文件路径: ${sourcePath}` : "上传文件路径: （后端未返回）",
           targetPath
             ? `转换文件路径: ${targetPath}${convertedFileId ? ` ｜ 新 fileId: ${convertedFileId}` : ""}`
-            : (sourcePath
-                ? "转换文件路径: （转换未生成目标文件，请检查源 JSON 是否为空/格式错误；后端日志：grep json_to_csv /home/yhz/iot-backend/iot-backend.log）"
-                : "转换文件路径: （后端未返回）"),
+            : (isNifi
+                ? `转换状态: 已提交到 NiFi 容器异步处理，约 30 秒后完成。产物在 tagged_output/${convertType.split("_")[0]}_to_*/ 目录下。`
+                : (sourcePath
+                  ? `转换文件路径: （转换未生成目标文件，请检查源内容是否为空/格式错误）`
+                  : "转换文件路径: （后端未返回）")),
         ];
         uploadResult.innerHTML = msgLines.join("<br>");
         await loadFiles();

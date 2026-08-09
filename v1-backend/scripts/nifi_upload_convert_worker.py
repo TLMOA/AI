@@ -143,9 +143,17 @@ def output_key(source_fmt: str, target_fmt: str) -> str:
     return f"{source_fmt.upper()}_{target_fmt.upper()}"
 
 
-def build_output_path(source_fmt: str, target_fmt: str, file_name: str, ts: str) -> Path:
+def build_output_path(source_fmt: str, target_fmt: str, file_name: str, ts: str, tagged: bool = False) -> Path:
     key = output_key(source_fmt, target_fmt)
-    out_dir = OUTPUT_DIRS.get(key, OUTPUT_DIRS["CSV_JSON"])
+    if tagged:
+        # 有标签：输出到容器内全局顶层 tagged_real_nifi_data（/home/yhz 已挂载到容器）
+        # 宿主机 /home/yhz/tagged_real_nifi_data ↔ 容器 /home/yhz/tagged_real_nifi_data
+        base_dir = Path("/home/yhz/tagged_real_nifi_data")
+        sub = OUTPUT_DIRS.get(key, OUTPUT_DIRS["CSV_JSON"]).name  # csv_to_json 等
+        out_dir = base_dir / sub
+    else:
+        base_dir = DATA_ROOT
+        out_dir = base_dir / OUTPUT_DIRS.get(key, OUTPUT_DIRS["CSV_JSON"]).relative_to(DATA_ROOT)
     basename = Path(file_name).stem
     ext_map = {"CSV": "csv", "JSON": "json", "TSV": "tsv"}
     out_ext = ext_map.get(target_fmt.upper(), "json")
@@ -161,6 +169,8 @@ def write_status(
     outputs: List[str] = None,
     username: str = "",
     owner_id: str = "",
+    has_tag: bool = False,
+    dataset_name: str = "",
 ):
     status_dir.mkdir(parents=True, exist_ok=True)
     payload = {
@@ -170,6 +180,8 @@ def write_status(
         "outputFiles": outputs or [],
         "username": username,
         "ownerId": owner_id,
+        "hasTag": has_tag,
+        "datasetName": dataset_name,
         "finishedAt": now_iso(),
     }
     (status_dir / f"{job_id}.json").write_text(
@@ -195,6 +207,8 @@ def main():
     file_name  = task.get("fileName", "upload")
     username   = task.get("username", "")
     owner_id   = task.get("ownerId", "")
+    has_tag    = bool(task.get("hasTag", False))
+    dataset_name = str(task.get("datasetName") or "")
     ts         = datetime.now().strftime("%Y%m%d_%H%M%S")
 
     try:
@@ -207,13 +221,15 @@ def main():
             f"read source failed: {e}\n{traceback.format_exc()}",
             username=username,
             owner_id=owner_id,
+            has_tag=has_tag,
+            dataset_name=dataset_name,
         )
         sys.exit(1)
 
     outputs = []
     for target_fmt in targets:
         try:
-            out_path = build_output_path(src_fmt, target_fmt, file_name, ts)
+            out_path = build_output_path(src_fmt, target_fmt, file_name, ts, tagged=has_tag)
             write_file(out_path, target_fmt, rows)
             outputs.append(str(out_path))
         except Exception as e:
@@ -224,6 +240,7 @@ def main():
                 f"convert to {target_fmt} failed: {e}\n{traceback.format_exc()}",
                 username=username,
                 owner_id=owner_id,
+                has_tag=has_tag,
             )
             sys.exit(1)
 
@@ -235,6 +252,8 @@ def main():
         outputs,
         username=username,
         owner_id=owner_id,
+        has_tag=has_tag,
+        dataset_name=dataset_name,
     )
     inbox_task = STATUS_INBOX / f"{job_id}.json"
     if inbox_task.exists():

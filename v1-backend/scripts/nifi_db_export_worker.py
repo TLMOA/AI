@@ -390,12 +390,16 @@ def main() -> int:
         out_path = output_path(task, fmt)
         write_rows(out_path, fmt, columns, rows)
         owner_id = str(task.get("ownerId") or task.get("owner") or task.get("factoryId") or "unknown")
+        _has_tag = bool(task.get("hasTag", False))
+        _dataset_name = str(task.get("datasetName") or "")
         status = {
             "jobId": task.get("jobId"),
             "status": "SUCCEEDED",
             "filePath": str(out_path.resolve()),
             "rows": len(rows),
             "message": f"export completed via {task.get('dbType','unknown')} worker",
+            "hasTag": _has_tag,
+            "datasetName": _dataset_name,
             "ownerId": owner_id,
             "factoryId": owner_id,
             "username": owner_id,

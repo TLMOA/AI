@@ -240,6 +240,13 @@ def is_xattr_enabled() -> bool:
     return _using_xattr
 
 
+def list_xattr_keys(file_path: str) -> list:
+    """返回文件的所有 xattr 扩展属性名（供前端展示）。"""
+    if _using_xattr and meta_xattr:
+        return meta_xattr.list_xattr_keys(file_path)
+    return []
+
+
 def has_meta(file_path: str) -> bool:
     """检查文件是否存在元数据。
 

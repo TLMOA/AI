@@ -36,7 +36,7 @@ from typing import Any, Dict, List, Optional
 
 
 DATA_ROOT = Path("/opt/nifi/nifi-current/data/iot")
-TAGGED_OUTPUT_DIR = DATA_ROOT / "tagged_output"
+TAGGED_OUTPUT_DIR = Path("/home/yhz/tagged_real_nifi_data")  # 容器内全局顶层标签目录（/home/yhz 已挂载）
 STATUS_DONE = DATA_ROOT / "tagging_jobs" / "done"
 STATUS_ERROR = DATA_ROOT / "tagging_jobs" / "error"
 
@@ -311,12 +311,20 @@ def main():
         else:
             raise ValueError(f"unsupported tagType: {tag_type}")
 
-        # 3. Write output
-        _ensure_dir(TAGGED_OUTPUT_DIR)
+        # 3. Write output（按原文件所在子目录放置，如原文件在 inbox_csv → tagged_real_nifi_data/inbox_csv/）
+        try:
+            _src_dir = Path(source_path).parent.name if source_path else ""
+            if _src_dir and _src_dir not in ("tagged_real_nifi_data", "tagged_nifi_data", "real_nifi_data", "nifi-data"):
+                _out_root = TAGGED_OUTPUT_DIR / _src_dir
+            else:
+                _out_root = TAGGED_OUTPUT_DIR
+        except Exception:
+            _out_root = TAGGED_OUTPUT_DIR
+        _ensure_dir(_out_root)
         stem = Path(file_name).stem
         ext = target_format.lower()
         output_name = f"tag_{owner_id}_{stem}_{now_ts()}.{ext}"
-        output_path = TAGGED_OUTPUT_DIR / output_name
+        output_path = _out_root / output_name
         write_file_atomic(output_path, target_format, tagged)
 
         # 4. Write success status

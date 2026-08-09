@@ -102,6 +102,14 @@ def has_meta(file_path: str) -> bool:
         return False
 
 
+def list_xattr_keys(file_path: str) -> list:
+    """返回文件的所有 xattr 扩展属性名（供前端展示）。"""
+    try:
+        return list(os.listxattr(file_path))
+    except OSError:
+        return []
+
+
 def delete_meta(file_path: str) -> None:
     """删除文件的 xattr 元数据。"""
     for attr in (XATTR_META, XATTR_CHECKSUM):

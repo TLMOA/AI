@@ -84,6 +84,8 @@
         <strong style="margin-right:12px; color:#555;">手动导出</strong>
         <label>格式</label>
         <select id="dbExportFormat"><option>CSV</option><option>JSON</option><option>TSV</option></select>
+        <label>数据集名称</label>
+        <input id="dbExportDatasetName" placeholder="如：硬盘故障/温度预测" style="width:140px;" />
         <label>追加到 latest</label>
         <input id="dbAppendLatest" type="checkbox" />
         <button id="dbExportBtn">立即导出</button>
@@ -327,6 +329,8 @@
       </div>
       <div class="row" style="margin-top:4px; padding-top:4px; border-top:1px dashed #ccc;">
         <strong style="margin-right:8px; color:#555; font-size:0.9em;">补充信息</strong>
+        <label>数据集名称</label>
+        <input id="uploadDatasetName" type="text" placeholder="如 硬盘故障/温度预测" />
         <label>类别ID</label>
         <input id="uploadCategoryId" type="text" placeholder="如 dev_ops" />
         <label>类别名称</label>

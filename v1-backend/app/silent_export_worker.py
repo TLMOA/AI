@@ -326,17 +326,55 @@ def process_once(tenant_filter: Optional[str] = None):
                 print(f"skipping malformed entry: {entry}")
                 continue
 
+            # v4: NiFi 模式下投递任务给 NiFi 容器执行（复用 DB 导出 flow）
             try:
-                engine = engine_from_config(db_conf)
-            except Exception as e:
-                print(f"failed to connect for db_key={db_key}: {e}")
-                continue
+                from . import nifi_orchestrator as _no
+                _nifi_real = os.getenv("NIFI_REAL_EXECUTION", "false").lower() in ("true", "1", "yes")
+                _mode_file = BASE_DIR / "data" / "generated" / "backend_mode.json"
+                _mode = "local"
+                if _mode_file.exists():
+                    try:
+                        _mode = json.loads(_mode_file.read_text(encoding="utf-8")).get("mode", "local")
+                    except Exception:
+                        pass
+            except Exception:
+                _nifi_real = False
+                _mode = "local"
 
-            try:
-                res = _export_table(engine, tenant, db_key, table, marker_col, None)
-                print(f"exported {db_key}/{table} rows={res['rows_exported'] if res else 0}")
-            except Exception as e:
-                print(f"failed exporting {db_key}/{table}: {e}")
+            if _nifi_real and _mode == "nifi":
+                try:
+                    from .main import _submit_nifi_export_task
+                    job = {
+                        "id": f"silent_{tenant}_{db_key}_{table}_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
+                        "username": tenant,
+                        "owner_id": tenant,
+                        "db_config": db_conf,
+                        "file_format": "csv",
+                        "payload": {"table": table},
+                        "append_to_latest": True,
+                    }
+                    submitted = _submit_nifi_export_task(job)
+                    print(f"[nifi] silent export submitted: tenant={tenant} {db_key}/{table} -> {submitted.get('taskPath','')}")
+                except Exception as e:
+                    print(f"[nifi] silent export submit failed for {db_key}/{table}: {e}, fallback to local")
+                    try:
+                        engine = engine_from_config(db_conf)
+                        res = _export_table(engine, tenant, db_key, table, marker_col, None)
+                        print(f"exported {db_key}/{table} rows={res['rows_exported'] if res else 0}")
+                    except Exception as e2:
+                        print(f"failed exporting {db_key}/{table}: {e2}")
+            else:
+                try:
+                    engine = engine_from_config(db_conf)
+                except Exception as e:
+                    print(f"failed to connect for db_key={db_key}: {e}")
+                    continue
+
+                try:
+                    res = _export_table(engine, tenant, db_key, table, marker_col, None)
+                    print(f"exported {db_key}/{table} rows={res['rows_exported'] if res else 0}")
+                except Exception as e:
+                    print(f"failed exporting {db_key}/{table}: {e}")
 
         processed += 1
 
