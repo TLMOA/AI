@@ -1,0 +1,72 @@
+[
+  {
+    "model": "xgboost",
+    "f1": 0.7778,
+    "acc": 0.7857,
+    "pred_fault": 343,
+    "pred_total": 768
+  },
+  {
+    "model": "LightGBM",
+    "f1": 0.6948,
+    "acc": 0.7338,
+    "pred_fault": 570,
+    "pred_total": 768
+  },
+  {
+    "model": "CatBoost",
+    "f1": 0.6992,
+    "acc": 0.7597,
+    "pred_fault": 881,
+    "pred_total": 768
+  },
+  {
+    "model": "hgb (梯度提升树)",
+    "f1": 0.6667,
+    "acc": 0.7208,
+    "pred_fault": 1179,
+    "pred_total": 768
+  },
+  {
+    "model": "TabNet (表格注意力)",
+    "f1": 0.5917,
+    "acc": 0.6003,
+    "pred_fault": 1568,
+    "pred_total": 768
+  },
+  {
+    "model": "TabTransformer (表格架构)",
+    "f1": 0.4585,
+    "acc": 0.6003,
+    "pred_fault": 1675,
+    "pred_total": 768
+  },
+  {
+    "model": "Deep-MLP (深度全连接)",
+    "f1": 0.55,
+    "acc": 0.7031,
+    "pred_fault": 1727,
+    "pred_total": 768
+  },
+  {
+    "model": "1D-CNN (卷积神经网络)",
+    "f1": 0.7381,
+    "acc": 0.7643,
+    "pred_fault": 1984,
+    "pred_total": 768
+  },
+  {
+    "model": "Bi-LSTM (双向长短期记忆)",
+    "f1": 0.6575,
+    "acc": 0.7396,
+    "pred_fault": 2108,
+    "pred_total": 768
+  },
+  {
+    "model": "Bi-GRU (双向门控循环)",
+    "f1": 0.6575,
+    "acc": 0.7383,
+    "pred_fault": 2235,
+    "pred_total": 768
+  }
+]

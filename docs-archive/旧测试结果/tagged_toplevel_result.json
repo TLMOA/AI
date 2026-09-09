@@ -1,0 +1,90 @@
+{
+  "total": 12,
+  "passed": 12,
+  "results": [
+    {
+      "user": "admin",
+      "mode": "local",
+      "test": "上传源文件→tagged_nifi_data",
+      "ok": true,
+      "detail": "src=/home/yhz/admin/tagged_nifi_data/inbox_csv/raw_admin_pima_20260807_173605.csv"
+    },
+    {
+      "user": "admin",
+      "mode": "local",
+      "test": "转换产物→tagged_nifi_data",
+      "ok": true,
+      "detail": "tgt=/home/yhz/admin/tagged_nifi_data/csv_to_json/xform_admin_pima_20260807_173605_csv2json.json"
+    },
+    {
+      "user": "zzz",
+      "mode": "local",
+      "test": "上传源文件→tagged_nifi_data",
+      "ok": true,
+      "detail": "src=/home/yhz/zzz/tagged_nifi_data/inbox_csv/raw_zzz_p_20260807_173607.csv"
+    },
+    {
+      "user": "zzz",
+      "mode": "local",
+      "test": "转换产物→tagged_nifi_data",
+      "ok": true,
+      "detail": "tgt=/home/yhz/zzz/tagged_nifi_data/csv_to_json/xform_zzz_p_20260807_173607_csv2json.json"
+    },
+    {
+      "user": "admin",
+      "mode": "local",
+      "test": "DB导出→tagged_nifi_data/output_csv",
+      "ok": true,
+      "detail": "tagged_csv=2"
+    },
+    {
+      "user": "admin",
+      "mode": "nifi",
+      "test": "源文件→tagged_real_nifi_data",
+      "ok": true,
+      "detail": "src=/home/yhz/admin/tagged_real_nifi_data/inbox_csv/raw_admin_p_20260807_173609.csv"
+    },
+    {
+      "user": "zzz",
+      "mode": "nifi",
+      "test": "源文件→tagged_real_nifi_data",
+      "ok": true,
+      "detail": "src=/home/yhz/zzz/tagged_real_nifi_data/inbox_csv/raw_zzz_p_20260807_173611.csv"
+    },
+    {
+      "user": "admin",
+      "mode": "nifi",
+      "test": "转换产物在全局或用户 tagged_real_nifi_data",
+      "ok": true,
+      "detail": "global=0 user=15"
+    },
+    {
+      "user": "zzz",
+      "mode": "nifi",
+      "test": "转换产物在全局或用户 tagged_real_nifi_data",
+      "ok": true,
+      "detail": "global=0 user=9"
+    },
+    {
+      "user": "admin",
+      "mode": "nifi",
+      "test": "转换产物路由到用户 tagged_real_nifi_data",
+      "ok": true,
+      "detail": "user=15"
+    },
+    {
+      "user": "zzz",
+      "mode": "nifi",
+      "test": "转换产物路由到用户 tagged_real_nifi_data",
+      "ok": true,
+      "detail": "user=9"
+    },
+    {
+      "user": "admin",
+      "mode": "nifi",
+      "test": "DB导出→tagged_real_nifi_data/output_csv",
+      "ok": true,
+      "detail": "user=11 global=0"
+    }
+  ]
+}

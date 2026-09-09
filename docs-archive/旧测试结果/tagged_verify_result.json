@@ -1,0 +1,55 @@
+{
+  "total": 7,
+  "passed": 1,
+  "results": [
+    {
+      "user": "admin",
+      "mode": "local",
+      "test": "上传hasTag=true",
+      "ok": false,
+      "detail": "tagged=0 普通=0"
+    },
+    {
+      "user": "admin",
+      "mode": "local",
+      "test": "上传hasTag=false",
+      "ok": false,
+      "detail": "tagged=0 普通=0"
+    },
+    {
+      "user": "admin",
+      "mode": "local",
+      "test": "DB导出hasTag=true",
+      "ok": false,
+      "detail": "tagged_output csv=0"
+    },
+    {
+      "user": "userb_1785903026",
+      "mode": "local",
+      "test": "上传hasTag=true",
+      "ok": true,
+      "detail": "文件=1"
+    },
+    {
+      "user": "admin",
+      "mode": "nifi",
+      "test": "上传hasTag=true",
+      "ok": false,
+      "detail": "超时70s"
+    },
+    {
+      "user": "admin",
+      "mode": "nifi",
+      "test": "DB导出hasTag=true",
+      "ok": false,
+      "detail": "超时70s"
+    },
+    {
+      "user": "userc_1785903026",
+      "mode": "nifi",
+      "test": "上传hasTag=true",
+      "ok": false,
+      "detail": "超时70s"
+    }
+  ]
+}

@@ -1,0 +1,58 @@
+{
+  "total": 6,
+  "passed": 6,
+  "results": [
+    {
+      "user": "admin",
+      "module": "DB导出",
+      "item": "SQLite pima 导出",
+      "pass": true,
+      "detail": "NiFi done=SUCCEEDED, 产出 export_admin_pima_20260805_032443.csv 24055B 769行"
+    },
+    {
+      "user": "admin",
+      "module": "上传转换",
+      "item": "CSV→JSON",
+      "pass": true,
+      "detail": "NiFi done=SUCCEEDED, 产出 xform_raw_admin_pima_verify_20260804_165050_20260804_165052_csv2json.meta.json 539B JSONL格式=False"
+    },
+    {
+      "user": "admin",
+      "module": "自动打标",
+      "item": "Outcome规则打标",
+      "pass": true,
+      "detail": "NiFi done=SUCCEEDED, 768行, Outcome列标签分布={'低风险': 500, '高风险': 268}"
+    },
+    {
+      "user": "pimauser_1785871472",
+      "module": "上传转换",
+      "item": "CSV→TSV",
+      "pass": true,
+      "detail": "NiFi done=SUCCEEDED, xform_raw_pimauser_1785871101_pima_20260805_031919_20260805_031943_csv2tsv.tsv 23875B TSV格式=True"
+    },
+    {
+      "user": "pimauser_1785871472",
+      "module": "DB导出",
+      "item": "SQLite pima 导出",
+      "pass": true,
+      "detail": "NiFi done=SUCCEEDED, export_pimauser_1785871472_pima_20260805_032543.csv 24055B"
+    },
+    {
+      "user": "pimauser_1785871472",
+      "module": "自动打标",
+      "item": "Outcome规则打标",
+      "pass": true,
+      "detail": "NiFi done=SUCCEEDED, 768行, 标签={'低风险': 500, '高风险': 268}"
+    }
+  ],
+  "nifi_tasks_before": {
+    "iot_convert_command_v1": 1,
+    "iot_auto_tagging_command_v1": 1,
+    "iot_db_export_command_v1": 1
+  },
+  "nifi_tasks_after": {
+    "iot_convert_command_v1": 2,
+    "iot_auto_tagging_command_v1": 2,
+    "iot_db_export_command_v1": 2
+  }
+}

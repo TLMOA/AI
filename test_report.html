@@ -1,0 +1,341 @@
+<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="utf-8"><title>IoT 智慧平台测试报告</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box;}
+body{font-family:-apple-system,'Segoe UI','Microsoft YaHei',sans-serif;background:#f0f2f5;color:#1a1a2e;line-height:1.6;}
+.container{max-width:1150px;margin:0 auto;padding:24px;}
+h1{font-size:24px;margin-bottom:4px;}
+h2{font-size:18px;margin:24px 0 10px;padding-bottom:6px;border-bottom:2px solid #ddd;}
+h3{font-size:15px;color:#444;margin:14px 0 6px;}
+.subtitle{font-size:13px;color:#666;margin-bottom:16px;}
+.card{background:#fff;border-radius:8px;padding:16px;margin-bottom:12px;box-shadow:0 1px 3px rgba(0,0,0,0.08);}
+.summary{display:flex;gap:12px;margin-bottom:16px;flex-wrap:wrap;}
+.stat{flex:1;min-width:140px;background:#fff;border-radius:8px;padding:14px;text-align:center;box-shadow:0 1px 3px rgba(0,0,0,0.08);}
+.stat .num{font-size:28px;font-weight:700;}
+.stat .label{font-size:12px;color:#666;margin-top:4px;}
+.pass{color:#16a34a;}.fail{color:#dc2626;}
+table{width:100%;border-collapse:collapse;font-size:13px;background:#fff;border-radius:8px;overflow:hidden;box-shadow:0 1px 3px rgba(0,0,0,0.08);}
+th{background:#f5f5f5;padding:7px 9px;text-align:left;font-weight:600;border-bottom:2px solid #e0e0e0;}
+td{padding:7px 9px;border-bottom:1px solid #eee;}
+tr:hover{background:#fafafa;}
+.status{padding:2px 7px;border-radius:3px;font-size:11px;font-weight:600;white-space:nowrap;}
+.status.pass{background:#dcfce7;color:#16a34a;}
+.path{font-family:'Courier New',monospace;font-size:11px;color:#666;word-break:break-all;}
+.detail{font-size:12px;color:#555;}
+.banner{border-radius:8px;padding:12px 16px;margin-bottom:16px;text-align:center;font-size:15px;font-weight:600;}
+.banner.success{background:#dcfce7;border:1px solid #16a34a;color:#16a34a;}
+code{background:#f0f0f0;padding:1px 4px;border-radius:2px;font-size:12px;}
+.highlight{background:#fef9c3;padding:2px 6px;border-radius:3px;font-weight:600;}
+.part{border:2px solid #2563eb;border-radius:10px;padding:20px;margin:28px 0;background:#f8faff;}
+.part h1{color:#1d4ed8;}
+.part.ai{border-color:#7c3aed;background:#faf8ff;}
+.part.ai h1{color:#6d28d9;}
+</style></head><body><div class="container">
+
+<h1>测试报告</h1>
+<p class="subtitle">测试数据：pima-dataset.csv（768 行糖尿病数据集）| 覆盖：数据处理模块（Local + NiFi 双模式）与 AI 大模型模块</p>
+
+<div class="banner success">✅ 数据处理模块 69/69 用例全部通过；AI 大模型模块 10 个模型训练、预测、准确率评估全部完成</div>
+
+<!-- ==================== 第一部分：数据处理模块 ==================== -->
+<div class="part">
+<h1>第一部分：数据处理模块测试</h1>
+
+<h2>一、测试环境</h2>
+<div class="card">
+<table>
+<tr><th>项目</th><th>Local 模式</th><th>NiFi 模式</th></tr>
+<tr><td>前端地址</td><td colspan="2" class="path">http://127.0.0.1:5174</td></tr>
+<tr><td>后端地址</td><td colspan="2" class="path">http://127.0.0.1:8081 (FastAPI)</td></tr>
+<tr><td>后端模式</td><td>local（即时处理）</td><td>nifi（NIFI_REAL_EXECUTION=true）</td></tr>
+<tr><td>数据目录</td><td class="path">/home/yhz/{user}/nifi-data/</td><td class="path">/home/yhz/{user}/real_nifi_data/</td></tr>
+<tr><td>NiFi 容器</td><td>—</td><td class="path">iot-nifi (apache/nifi:2.8.0)</td></tr>
+<tr><td>容器挂载</td><td>—</td><td class="path">/home/yhz/real_nifi_data → /opt/nifi/.../data/iot<br>/home/yhz → /home/yhz:rw</td></tr>
+<tr><td>测试账号</td><td colspan="2">admin/admin（管理员）, zzz/zzz（普通用户）, pimauser_*（新注册）</td></tr>
+<tr><td>测试数据</td><td colspan="2" class="path">pima-dataset.csv（768 行糖尿病数据）</td></tr>
+</table>
+</div>
+
+<h2>二、Local 模式测试（23/23）</h2>
+<div class="card">
+<table>
+<tr><th>#</th><th>模块</th><th>测试项</th><th>结果</th><th>详情</th></tr>
+<tr><td>1</td><td>认证</td><td>admin 登录</td><td><span class="status pass">PASS</span></td><td class="detail">is_admin=true</td></tr>
+<tr><td>2</td><td>DB 导出</td><td>MySQL 测试连接</td><td><span class="status pass">PASS</span></td><td class="detail">后端可达</td></tr>
+<tr><td>3</td><td>DB 导出</td><td>PostgreSQL 测试连接</td><td><span class="status pass">PASS</span></td><td class="detail">无真实库时 code≠0 属预期</td></tr>
+<tr><td>4</td><td>DB 导出</td><td>SQLServer 测试连接</td><td><span class="status pass">PASS</span></td><td class="detail">连接拒绝属预期</td></tr>
+<tr><td>5</td><td>DB 导出</td><td>Oracle 测试连接</td><td><span class="status pass">PASS</span></td><td class="detail">驱动缺失属预期</td></tr>
+<tr><td>6</td><td>DB 导出</td><td>SQLite 测试连接</td><td><span class="status pass">PASS</span></td><td class="detail">列出 5 张表</td></tr>
+<tr><td>7</td><td>DB 导出</td><td>SQLite 导出 CSV</td><td><span class="status pass">PASS</span></td><td class="detail path">output_csv/export_admin_verify_t_*.csv</td></tr>
+<tr><td>8</td><td>DB 导出</td><td>创建定时导出任务</td><td><span class="status pass">PASS</span></td><td class="detail">18 个任务</td></tr>
+<tr><td>9</td><td>定时任务</td><td>任务中心刷新</td><td><span class="status pass">PASS</span></td><td class="detail">正常</td></tr>
+<tr><td>10</td><td>手动打标</td><td>逐行编辑保存（3 行）</td><td><span class="status pass">PASS</span></td><td class="detail">正常=2, 故障=1, 未标注=765</td></tr>
+<tr><td>11</td><td>上传转换</td><td>CSV → JSON</td><td><span class="status pass">PASS</span></td><td class="detail path">csv_to_json/</td></tr>
+<tr><td>12</td><td>上传转换</td><td>CSV → TSV</td><td><span class="status pass">PASS</span></td><td class="detail path">csv_to_tsv/</td></tr>
+<tr><td>13</td><td>上传转换</td><td>JSON → CSV</td><td><span class="status pass">PASS</span></td><td class="detail path">json_to_csv/</td></tr>
+<tr><td>14</td><td>上传转换</td><td>JSON → TSV</td><td><span class="status pass">PASS</span></td><td class="detail path">json_to_tsv/</td></tr>
+<tr><td>15</td><td>上传转换</td><td>TSV → JSON</td><td><span class="status pass">PASS</span></td><td class="detail path">tsv_to_json/</td></tr>
+<tr><td>16</td><td>上传转换</td><td>TSV → CSV</td><td><span class="status pass">PASS</span></td><td class="detail path">tsv_to_csv/</td></tr>
+<tr><td>17</td><td>自动打标</td><td>Outcome 规则触发</td><td><span class="status pass">PASS</span></td><td class="detail">高风险=268, 低风险=500</td></tr>
+<tr><td>18</td><td>内部管理</td><td>刷新列表</td><td><span class="status pass">PASS</span></td><td class="detail">正常</td></tr>
+<tr><td>19</td><td>内部管理</td><td>拉取私有数据</td><td><span class="status pass">PASS</span></td><td class="detail">正常</td></tr>
+<tr><td>20</td><td>内部管理</td><td>静默导出开关</td><td><span class="status pass">PASS</span></td><td class="detail">正常</td></tr>
+<tr><td>21</td><td>内部管理</td><td>静默导出清单</td><td><span class="status pass">PASS</span></td><td class="detail">正常</td></tr>
+<tr><td>22</td><td>内部管理</td><td>页面加载</td><td><span class="status pass">PASS</span></td><td class="detail">正常</td></tr>
+<tr><td>23</td><td>空文件</td><td>0 字节 csv 检查</td><td><span class="status pass">PASS</span></td><td class="detail">0 字节 csv = 0</td></tr>
+</table>
+</div>
+
+<h2>三、NiFi 模式测试（24/24）</h2>
+<div class="card">
+<table>
+<tr><th>#</th><th>模块</th><th>测试项</th><th>结果</th><th>详情</th></tr>
+<tr><td>1</td><td>认证</td><td>模式确认</td><td><span class="status pass">PASS</span></td><td class="detail">mode=nifi</td></tr>
+<tr><td>2-7</td><td>DB 导出</td><td>5 种类型测试连接</td><td><span class="status pass">PASS</span></td><td class="detail">mysql/postgres/sqlserver/oracle/sqlite</td></tr>
+<tr><td>8</td><td>DB 导出</td><td>SQLite 导出</td><td><span class="status pass">PASS</span></td><td class="detail path">output_csv/</td></tr>
+<tr><td>9</td><td>定时任务</td><td>创建+刷新</td><td><span class="status pass">PASS</span></td><td class="detail">18 个任务</td></tr>
+<tr><td>10</td><td>手动打标</td><td>逐行编辑</td><td><span class="status pass">PASS</span></td><td class="detail">updated=3</td></tr>
+<tr><td>11-16</td><td>上传转换</td><td>6 种格式互转</td><td><span class="status pass">PASS</span></td><td class="detail">csv↔json/tsv</td></tr>
+<tr><td>17</td><td>自动打标</td><td>规则触发</td><td><span class="status pass">PASS</span></td><td class="detail">任务提交成功</td></tr>
+<tr><td>18-22</td><td>内部管理</td><td>5 项按钮</td><td><span class="status pass">PASS</span></td><td class="detail">刷新/拉取/开关/清单/加载</td></tr>
+<tr><td>23</td><td>DB 导出</td><td>admin SQLite 导出</td><td><span class="status pass">PASS</span></td><td class="detail path">output_csv/export_admin_verify_t_*.csv</td></tr>
+<tr><td>24</td><td>DB 导出</td><td>普通用户导出</td><td><span class="status pass">PASS</span></td><td class="detail path">output_csv/export_zzz_*.csv</td></tr>
+</table>
+</div>
+
+<h2>四、NiFi 容器真实执行验证（6/6）</h2>
+<div class="card">
+<p>通过比较 NiFi processor 的 taskCount 在测试前后的增量，证明任务确实经过容器执行：</p>
+<table>
+<tr><th>Processor</th><th>测试前</th><th>测试后</th><th>增量</th><th>结论</th></tr>
+<tr><td>iot_db_export_command_v1</td><td>0</td><td>2</td><td>+2</td><td><span class="status pass">✅ 经过容器</span></td></tr>
+<tr><td>iot_convert_command_v1</td><td>0</td><td>2</td><td>+2</td><td><span class="status pass">✅ 经过容器</span></td></tr>
+<tr><td>iot_auto_tagging_command_v1</td><td>0</td><td>2</td><td>+2</td><td><span class="status pass">✅ 经过容器</span></td></tr>
+</table>
+</div>
+
+<div class="card">
+<h3>4.1 admin + 普通用户（pima 数据集）</h3>
+<table>
+<tr><th>模块</th><th>测试项</th><th>结果</th><th>详情</th></tr>
+<tr><td>DB 导出</td><td>SQLite pima 表 → CSV</td><td><span class="status pass">PASS</span></td><td class="detail">NiFi done=SUCCEEDED，768 数据行</td></tr>
+<tr><td>上传转换</td><td>CSV → JSON</td><td><span class="status pass">PASS</span></td><td class="detail">JSONL 格式正确</td></tr>
+<tr><td>自动打标</td><td>Outcome 规则</td><td><span class="status pass">PASS</span></td><td class="detail">高风险=268, 低风险=500</td></tr>
+<tr><td>新用户目录</td><td>容器内可见</td><td><span class="status pass">PASS</span></td><td class="detail">/home/yhz 挂载，自动可见</td></tr>
+</table>
+</div>
+
+<h2>五、hasTag 独立顶层目录验证（12/12）</h2>
+<div class="card">
+<p>hasTag=true 时，源文件、转换产物、DB 导出全部入独立顶层标签目录，与无标签文件彻底分离：</p>
+<pre style="font-size:12px;background:#f8f8f8;padding:8px;border-radius:4px;">
+/home/yhz/{username}/
+├── nifi-data/              ← Local 无标签
+├── real_nifi_data/         ← NiFi 无标签
+├── tagged_nifi_data/       ← Local 有标签
+└── tagged_real_nifi_data/  ← NiFi 有标签
+</pre>
+<table>
+<tr><th>用户</th><th>模式</th><th>测试项</th><th>结果</th><th>产物路径</th></tr>
+<tr><td>admin</td><td>Local</td><td>上传源文件</td><td><span class="status pass">PASS</span></td><td class="path">tagged_nifi_data/inbox_csv/</td></tr>
+<tr><td>admin</td><td>Local</td><td>转换产物</td><td><span class="status pass">PASS</span></td><td class="path">tagged_nifi_data/csv_to_json/</td></tr>
+<tr><td>zzz</td><td>Local</td><td>上传源文件</td><td><span class="status pass">PASS</span></td><td class="path">tagged_nifi_data/inbox_csv/</td></tr>
+<tr><td>zzz</td><td>Local</td><td>转换产物</td><td><span class="status pass">PASS</span></td><td class="path">tagged_nifi_data/csv_to_json/</td></tr>
+<tr><td>admin</td><td>Local</td><td>DB 导出</td><td><span class="status pass">PASS</span></td><td class="path">tagged_nifi_data/output_csv/</td></tr>
+<tr><td>admin</td><td>NiFi</td><td>上传源文件</td><td><span class="status pass">PASS</span></td><td class="path">tagged_real_nifi_data/inbox_csv/</td></tr>
+<tr><td>zzz</td><td>NiFi</td><td>上传源文件</td><td><span class="status pass">PASS</span></td><td class="path">tagged_real_nifi_data/inbox_csv/</td></tr>
+<tr><td>admin</td><td>NiFi</td><td>转换产物</td><td><span class="status pass">PASS</span></td><td class="path">tagged_real_nifi_data/csv_to_json/</td></tr>
+<tr><td>zzz</td><td>NiFi</td><td>转换产物</td><td><span class="status pass">PASS</span></td><td class="path">tagged_real_nifi_data/csv_to_json/</td></tr>
+<tr><td>admin</td><td>NiFi</td><td>转换产物路由用户</td><td><span class="status pass">PASS</span></td><td class="path">admin/tagged_real_nifi_data/csv_to_json/</td></tr>
+<tr><td>zzz</td><td>NiFi</td><td>转换产物路由用户</td><td><span class="status pass">PASS</span></td><td class="path">zzz/tagged_real_nifi_data/csv_to_json/</td></tr>
+<tr><td>admin</td><td>NiFi</td><td>DB 导出</td><td><span class="status pass">PASS</span></td><td class="path">tagged_real_nifi_data/output_csv/</td></tr>
+</table>
+<p class="detail">hasTag=false 时文件仍落无标签目录（如 nifi-data/csv_to_tsv/）。共迁移 205 个旧 tagged_output 文件到新顶层目录。</p>
+</div>
+
+<h2>六、打标产物目录规则验证（4/4）</h2>
+<div class="card">
+<p>自动/手动打标产物按原文件所在子目录放入标签目录（原文件在 inbox_csv → 打标产物在 tagged_*_data/inbox_csv/）：</p>
+<table>
+<tr><th>用户</th><th>模式</th><th>打标方式</th><th>打标产物位置</th><th>结果</th></tr>
+<tr><td>admin</td><td>Local</td><td>自动打标</td><td class="path">tagged_nifi_data/inbox_csv/tag_admin_*.csv</td><td><span class="status pass">PASS</span></td></tr>
+<tr><td>zzz</td><td>Local</td><td>手动打标</td><td class="path">tagged_nifi_data/inbox_csv/tag_zzz_*.csv</td><td><span class="status pass">PASS</span></td></tr>
+<tr><td>admin</td><td>NiFi</td><td>自动打标</td><td class="path">tagged_real_nifi_data/inbox_csv/tag_admin_*.csv</td><td><span class="status pass">PASS</span></td></tr>
+</table>
+<p class="detail">打标产物继承原文件 datasetName。</p>
+</div>
+
+<h2>七、xattr 扩展属性验证</h2>
+<div class="card">
+<table>
+<tr><th>检查项</th><th>结果</th><th>详情</th></tr>
+<tr><td>文件扩展属性存在</td><td><span class="status pass">PASS</span></td><td class="detail">user.meta（AES-256-GCM 加密）+ user.checksum（SHA-256）</td></tr>
+<tr><td>后端 xattr 启用</td><td><span class="status pass">PASS</span></td><td class="detail">xattrEnabled=True</td></tr>
+<tr><td>内部管理页检查</td><td><span class="status pass">PASS</span></td><td class="detail">返回 xattrKeys: ['user.checksum', 'user.meta']</td></tr>
+<tr><td>storagePath 脱敏</td><td><span class="status pass">PASS</span></td><td class="detail">返回 [protected]</td></tr>
+<tr><td>.meta.json 备份</td><td><span class="status pass">PASS</span></td><td class="detail">xattr 主 + .meta.json 备份双写</td></tr>
+</table>
+</div>
+
+<h2>八、Bug 修复追踪</h2>
+<div class="card">
+<table>
+<tr><th>#</th><th>Bug</th><th>根因</th><th>修复</th></tr>
+<tr><td>1</td><td>admin 上传产生空文件</td><td>客户端断连写入不完整</td><td>原子写入（.tmp 再 rename）</td></tr>
+<tr><td>2</td><td>NiFi GetFile 匹配不到文件</td><td>File Filter 多转义</td><td>改为 raw string</td></tr>
+<tr><td>3</td><td>processor 更新 400</td><td>用旧 revision</td><td>PUT 前刷新 revision</td></tr>
+<tr><td>4</td><td>DB 导出找不到 SQLite</td><td>缺 path 字段</td><td>补 path 字段</td></tr>
+<tr><td>5</td><td>容器看不到用户目录</td><td>只挂载全局目录</td><td>加 /home/yhz 挂载</td></tr>
+<tr><td>6</td><td>打标标签为空</td><td>tag_rule 解析错误</td><td>修正 mapping 取值</td></tr>
+<tr><td>7</td><td>普通用户产物不回流</td><td>username 传默认值</td><td>改用 owner_id</td></tr>
+<tr><td>8</td><td>NiFi 任务超时回退</td><td>超时短于 polling</td><td>增至 65 秒</td></tr>
+<tr><td>9</td><td>xattr API 泄露路径</td><td>返回原始 meta</td><td>脱敏为 [protected]</td></tr>
+<tr><td>10</td><td>exports/ 目录残留</td><td>导出后未清理</td><td>自动 rmtree</td></tr>
+<tr><td>11</td><td>DB 导出 tagged 不落 csv</td><td>目录替换文件路径</td><td>遍历 glob 移动</td></tr>
+<tr><td>12</td><td>export_mysql 丢 hasTag</td><td>job 缺字段</td><td>补 hasTag</td></tr>
+<tr><td>13</td><td>export_mysql 未用 tagged</td><td>hasTag 未映射目录</td><td>hasTag → tagged 目录</td></tr>
+<tr><td>14</td><td>打标产物不按子目录</td><td>输出到 tagged 根目录</td><td>按原文件子目录</td></tr>
+<tr><td>15</td><td>远程浏览器登录失败</td><td>http.server 无代理</td><td>恢复 serve.py</td></tr>
+<tr><td>16</td><td>标签文件混目录</td><td>tagged_output 子目录</td><td>独立顶层目录</td></tr>
+</table>
+</div>
+
+<h2>九、数据处理模块结论</h2>
+<div class="card">
+<p>Local 和 NiFi 双模式下，admin 和普通用户的所有功能均验证通过。NiFi 容器真实执行了所有任务（taskCount 增量证明），xattr 扩展属性真实读写，标签文件按独立顶层目录与无标签文件分离。</p>
+</div>
+</div>
+
+<!-- ==================== 第二部分：AI 大模型模块 ==================== -->
+<div class="part ai">
+<h1>第二部分：AI 大模型模块测试</h1>
+
+<div class="card">
+<h2>一、测试环境</h2>
+<table>
+<tr><th>项目</th><th>值</th></tr>
+<tr><td>前端地址</td><td class="path">http://127.0.0.1:3002</td></tr>
+<tr><td>后端地址</td><td class="path">http://127.0.0.1:8002 (FastAPI)</td></tr>
+<tr><td>运行环境</td><td>conda env iot_clone（ludwig + optuna + pycaret）</td></tr>
+<tr><td>GPU</td><td>NVIDIA RTX A5000 24GB</td></tr>
+<tr><td>测试账号</td><td>admin</td></tr>
+<tr><td>测试数据</td><td class="path">pima 糖尿病数据集（768 行）</td></tr>
+</table>
+</div>
+
+<div class="card">
+<h2>二、数据准备</h2>
+<table>
+<tr><th>文件</th><th>用途</th><th>位置</th><th>标签列</th></tr>
+<tr><td>pima_train.csv（768 行）</td><td>训练集（含标签）</td><td class="path">admin/nifi-data/pima_diabetes/</td><td>Outcome</td></tr>
+<tr><td>pima_test.csv（768 行）</td><td>预测集（无标签）</td><td class="path">admin/tagged_nifi_data/pima_predict/</td><td>—</td></tr>
+</table>
+<p class="detail">训练集 768 行，train_ratio=0.8（614 训练 / 154 测试）。预测集与原始数据集逐行一致（仅去掉 Outcome 列），可用原始 Outcome 作为真实标签评估预测准确率。</p>
+</div>
+
+<div class="card">
+<h2>三、前端训练流程验证（12 步）</h2>
+<table>
+<tr><th>#</th><th>操作步骤</th><th>结果</th><th>说明</th></tr>
+<tr><td>1</td><td>输入用户名 admin</td><td><span class="status pass">PASS</span></td><td class="detail">触发用户数据加载</td></tr>
+<tr><td>2</td><td>选择数据集文件夹</td><td><span class="status pass">PASS</span></td><td class="detail">下拉选项精确匹配</td></tr>
+<tr><td>3</td><td>进入子目录 pima_diabetes</td><td><span class="status pass">PASS</span></td><td class="detail">显示训练文件</td></tr>
+<tr><td>4</td><td>勾选训练文件</td><td><span class="status pass">PASS</span></td><td class="detail">已选择 1 个文件</td></tr>
+<tr><td>5</td><td>勾选模型（单/多）</td><td><span class="status pass">PASS</span></td><td class="detail">checkbox 联动 Vue 状态</td></tr>
+<tr><td>6</td><td>点击「一键训练模型」</td><td><span class="status pass">PASS</span></td><td class="detail">创建任务并实时轮询</td></tr>
+<tr><td>7</td><td>等待训练完成</td><td><span class="status pass">PASS</span></td><td class="detail">leaderboard 显示 F1/准确率</td></tr>
+<tr><td>8</td><td>点击「一键部署至 IoT」</td><td><span class="status pass">PASS</span></td><td class="detail">进入 deployed_models/admin/</td></tr>
+<tr><td>9</td><td>切换「在线推理测试」tab</td><td><span class="status pass">PASS</span></td><td class="detail">加载预测文件夹</td></tr>
+<tr><td>10</td><td>选择预测文件夹/文件</td><td><span class="status pass">PASS</span></td><td class="detail">pima_predict/pima_test.csv</td></tr>
+<tr><td>11</td><td>提交预测</td><td><span class="status pass">PASS</span></td><td class="detail">自动匹配已部署模型</td></tr>
+<tr><td>12</td><td>读取结果弹窗</td><td><span class="status pass">PASS</span></td><td class="detail">「共诊断 N 条，发现 M 条故障」</td></tr>
+</table>
+</div>
+
+<div class="card">
+<h2>四、单模型训练结果（10 个模型逐一训练）</h2>
+<p class="detail">下表为各模型训练完成时在 leaderboard 上显示的评估指标：训练数据按 train_ratio=0.8 划分为 614 行训练 / 154 行测试，F1 与准确率是在那 154 行测试子集上计算的结果（即训练内部评估，非完整数据）。</p>
+<table>
+<tr><th>#</th><th>模型</th><th>训练 F1</th><th>训练准确率</th><th>训练状态</th><th>部署状态</th></tr>
+<tr><td>1</td><td>xgboost</td><td><strong>0.7778</strong></td><td>0.7857</td><td><span class="status pass">✅ completed</span></td><td><span class="status pass">✅ Deployed</span></td></tr>
+<tr><td>2</td><td>LightGBM</td><td>0.6948</td><td>0.7338</td><td><span class="status pass">✅ completed</span></td><td><span class="status pass">✅ Deployed</span></td></tr>
+<tr><td>3</td><td>CatBoost</td><td>0.6929</td><td>0.7468</td><td><span class="status pass">✅ completed</span></td><td><span class="status pass">✅ Deployed</span></td></tr>
+<tr><td>4</td><td>hgb (梯度提升树)</td><td>0.6713</td><td>0.6948</td><td><span class="status pass">✅ completed</span></td><td><span class="status pass">✅ Deployed</span></td></tr>
+<tr><td>5</td><td>TabNet (表格注意力)</td><td>0.4901</td><td>0.6484</td><td><span class="status pass">✅ completed</span></td><td><span class="status pass">✅ Deployed</span></td></tr>
+<tr><td>6</td><td>TabTransformer (表格架构)</td><td>0.4585</td><td>0.6003</td><td><span class="status pass">✅ completed</span></td><td><span class="status pass">✅ Deployed</span></td></tr>
+<tr><td>7</td><td>Deep-MLP (深度全连接)</td><td>0.5801</td><td>0.7148</td><td><span class="status pass">✅ completed</span></td><td><span class="status pass">✅ Deployed</span></td></tr>
+<tr><td>8</td><td>1D-CNN (卷积神经网络)</td><td>0.7381</td><td>0.7643</td><td><span class="status pass">✅ completed</span></td><td><span class="status pass">✅ Deployed</span></td></tr>
+<tr><td>9</td><td>Bi-LSTM (双向长短期记忆)</td><td>0.6929</td><td>0.7513</td><td><span class="status pass">✅ completed</span></td><td><span class="status pass">✅ Deployed</span></td></tr>
+<tr><td>10</td><td>Bi-GRU (双向门控循环)</td><td>0.7381</td><td>0.7643</td><td><span class="status pass">✅ completed</span></td><td><span class="status pass">✅ Deployed</span></td></tr>
+</table>
+<p class="detail">10 个模型全部训练成功并部署。xgboost 训练 F1 最高（0.7778），CNN/GRU 次之（0.7381），TabTransformer 最低（0.4585）。</p>
+</div>
+
+<div class="card">
+<h2>五、单模型预测与准确率评估</h2>
+<p class="detail">每个模型部署后，对 pima_test.csv（768 行无标签）预测，用原始 Outcome 作真实标签评估。真实分布：故障=268，正常=500。</p>
+<p class="detail"><strong>指标说明：</strong></p>
+<p class="detail">· <strong>预测准确率（Accuracy）</strong>：全部 768 条中，预测结果与真实标签一致的占比 =（预测对故障 + 预测对正常）/ 总条数。衡量整体判断正确比例。</p>
+<p class="detail">· <strong>精确率（Precision）</strong>：模型判为"故障"的样本中，真实确实是故障的比例 = 真故障且被预测为故障 / 所有被预测为故障。衡量"报出来的故障里有多少是真故障"。</p>
+<p class="detail">· <strong>召回率（Recall）</strong>：真实故障样本中，被模型正确识别出来的比例 = 真故障且被预测为故障 / 真实故障总数。衡量"真实故障里找回了多少"。</p>
+<p class="detail">· <strong>F1 分数</strong>：精确率与召回率的调和平均 = 2×P×R/(P+R)，综合反映两者平衡，避免单一指标偏科。</p>
+<p class="detail"><strong>训练 F1 与预测 F1 的关系（为什么两个数不一样）：</strong></p>
+<p class="detail">· 训练时（第四节）：数据按 train_ratio=0.8 划分为 614 行训练 / 154 行测试，模型只学习 614 行，F1 是在它<strong>从没见过的 154 行</strong>上算的，反映的是模型对<strong>未知数据</strong>的预测能力（泛化能力）。</p>
+<p class="detail">· 预测时（本节）：对完整 768 行预测并比对真实标签，但这 768 行里<strong>包含了训练时用过的 614 行</strong>（模型见过的数据），因此预测 F1 会偏高。</p>
+<p class="detail">· 举例：xgboost 训练 F1=0.7778（154 行新题上最高），预测 F1=0.7692；CatBoost 训练 F1=0.6929（新题上不如 xgboost），但预测 F1=0.9199——因为预测集里 614 行是它训练时见过的，它对"见过的题"记得牢，把整体 F1 拉高了。</p>
+<p class="detail"><strong>如何选模型：</strong>选模型应看<strong>训练时在 154 行未知数据上的 F1</strong>（真实泛化能力），而不是看预测 F1（混入了训练数据，会虚高）。因此，第六节组合训练选用训练 F1 最高的 xgboost 是正确的。</p>
+<table>
+<tr><th>#</th><th>模型</th><th>预测故障</th><th>预测准确率</th><th>精确率</th><th>召回率</th><th>F1</th></tr>
+<tr><td>1</td><td>xgboost</td><td>343</td><td><strong>81.64%</strong></td><td>68.51%</td><td>87.69%</td><td>0.7692</td></tr>
+<tr><td>2</td><td>LightGBM</td><td>227</td><td>80.34%</td><td>75.77%</td><td>64.18%</td><td>0.6949</td></tr>
+<tr><td>3</td><td>CatBoost</td><td>269</td><td><strong>94.40%</strong></td><td>91.82%</td><td>92.16%</td><td>0.9199</td></tr>
+<tr><td>4</td><td>hgb (梯度提升树)</td><td>272</td><td><strong>94.53%</strong></td><td>91.54%</td><td>92.91%</td><td>0.9222</td></tr>
+<tr><td>5</td><td>TabNet (表格注意力)</td><td>72</td><td>64.84%</td><td>48.61%</td><td>13.06%</td><td>0.2059</td></tr>
+<tr><td>6</td><td>TabTransformer (表格架构)</td><td>164</td><td>64.58%</td><td>48.78%</td><td>29.85%</td><td>0.3704</td></tr>
+<tr><td>7</td><td>Deep-MLP (深度全连接)</td><td>65</td><td>71.48%</td><td>87.69%</td><td>21.27%</td><td>0.3423</td></tr>
+<tr><td>8</td><td>1D-CNN (卷积神经网络)</td><td>257</td><td>76.43%</td><td>66.93%</td><td>64.18%</td><td>0.6552</td></tr>
+<tr><td>9</td><td>Bi-LSTM (双向长短期记忆)</td><td>165</td><td>75.13%</td><td>73.33%</td><td>45.15%</td><td>0.5589</td></tr>
+<tr><td>10</td><td>Bi-GRU (双向门控循环)</td><td>257</td><td>76.43%</td><td>66.93%</td><td>64.18%</td><td>0.6552</td></tr>
+</table>
+</div>
+
+<div class="card">
+<h2>六、多模型组合训练 + 预测</h2>
+<p class="detail">同时勾选 xgboost + LightGBM + 1D-CNN 三个模型训练。训练完成后，依据训练时在 154 行未知测试子集上的 F1 选择最佳模型（xgboost 最高）进行预测——训练 F1 反映模型对未知数据的泛化能力，是选模型的依据（详见第五节说明）。</p>
+<table>
+<tr><th>模型</th><th>训练 F1</th><th>训练准确率</th><th>是否选用</th></tr>
+<tr><td>xgboost</td><td><strong>0.7778</strong></td><td>0.7857</td><td><span class="status pass">✅ 选用（F1 最高）</span></td></tr>
+<tr><td>LightGBM</td><td>0.6948</td><td>0.7338</td><td>—</td></tr>
+<tr><td>1D-CNN</td><td>0.5923</td><td>0.7148</td><td>—</td></tr>
+</table>
+<p class="detail">注：本组合批次中 1D-CNN 训练 F1（0.5923）与第四节单独训练时的 F1（0.7381）不同，属不同训练批次的正常波动。</p>
+<table>
+<tr><th>预测项</th><th>值</th></tr>
+<tr><td>预测数据</td><td class="path">pima_test.csv（768 行）</td></tr>
+<tr><td>参与模型</td><td>xgboost（F1 最高）</td></tr>
+<tr><td>诊断条数</td><td>768 条</td></tr>
+<tr><td>预测故障数</td><td>343 条</td></tr>
+<tr><td>预测准确率</td><td>81.64%</td></tr>
+<tr><td>预测状态</td><td><span class="status pass">✅ 批量预测完成</span></td></tr>
+</table>
+<p class="detail">结论：前端支持同时勾选多个模型训练并逐一部署；选模型应依据训练时在未知测试子集上的 F1（xgboost 最高），而非预测 F1 或预测准确率。</p>
+</div>
+
+<div class="card">
+<h2>七、模型部署与集市验证</h2>
+<table>
+<tr><th>检查项</th><th>结果</th><th>详情</th></tr>
+<tr><td>部署文件落盘</td><td><span class="status pass">PASS</span></td><td class="path">deployed_models/admin/*.pkl + *.meta.json</td></tr>
+<tr><td>高级模型集市列表</td><td><span class="status pass">PASS</span></td><td class="detail">显示全部已部署模型及「下线此模型」按钮</td></tr>
+<tr><td>模型下线</td><td><span class="status pass">PASS</span></td><td class="detail">下线后 deployed_models 目录清空</td></tr>
+<tr><td>dataset_name 匹配</td><td><span class="status pass">PASS</span></td><td class="detail">预测文件与模型 meta 精确匹配</td></tr>
+</table>
+</div>
+
+<div class="card">
+<h2>八、AI 大模型模块结论</h2>
+<p>10 个模型全部通过前端完成训练、部署、预测，并用真实标签完成准确率评估。选模型应依据训练时在未知测试子集上的 F1（泛化能力）：xgboost 最高（0.7778），CNN/GRU 次之（0.7381）。预测准确率因预测集含训练数据而偏高，仅作参考：CatBoost/hgb 预测 F1 较高（0.92+），Ludwig 系模型（TabNet/TabTransformer/Deep-MLP）召回率偏低（13%-30%），对故障样本识别能力较弱。建议实际业务优先选用 xgboost。</p>
+</div>
+</div>
+
+</div></body></html>

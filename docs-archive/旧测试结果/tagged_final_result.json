@@ -1,0 +1,55 @@
+{
+  "total": 7,
+  "passed": 6,
+  "results": [
+    {
+      "user": "admin",
+      "mode": "local",
+      "test": "上传hasTag=true→tagged_output",
+      "ok": true,
+      "detail": "path=xform_admin_pima_20260805_121522_csv2json.json exists=True"
+    },
+    {
+      "user": "admin",
+      "mode": "local",
+      "test": "上传hasTag=false→普通目录",
+      "ok": true,
+      "detail": "path=xform_admin_pima_20260805_121522_csv2tsv.tsv exists=True"
+    },
+    {
+      "user": "admin",
+      "mode": "local",
+      "test": "DB导出hasTag=true→tagged_output",
+      "ok": false,
+      "detail": "tagged_output_csv=0"
+    },
+    {
+      "user": "norm_user_1785903322",
+      "mode": "local",
+      "test": "上传hasTag=true→tagged_output",
+      "ok": true,
+      "detail": "path=xform_norm_user_1785903322_pima_20260805_121524_csv2json.json exists=True"
+    },
+    {
+      "user": "admin",
+      "mode": "nifi",
+      "test": "上传hasTag=true→tagged_output",
+      "ok": true,
+      "detail": "global=1 user=0"
+    },
+    {
+      "user": "admin",
+      "mode": "nifi",
+      "test": "DB导出hasTag=true→tagged_output",
+      "ok": true,
+      "detail": "global=0 user=7 norm=16"
+    },
+    {
+      "user": "nf_user_1785903351",
+      "mode": "nifi",
+      "test": "上传hasTag=true→tagged_output",
+      "ok": true,
+      "detail": "global=1 user=0"
+    }
+  ]
+}
