@@ -45,6 +45,9 @@ hive(pyhive+thrift)、hbase(happybase+thriftpy2)、hdfs(WebHDFS) —— 驱动�
 - 打包：`make_offline_package.sh`（**白名单**：v1-backend/v1-frontend/docker/real_nifi_conf/deploy-kit；
   排除 `*.run`/`*.sha256`/`.venv`/`data/app.db`/`data/generated`/`__pycache__`）→ `make_selfextract.sh <tgz> <out.run>`
   （**不生成 .sha256，要手工补**；默认输出到 `/home/yhz/` = 工作区上一级，必须显式指定路径，否则出现两个同名 .run）
+- 🗄️ **仓库约定**：`deploy-kit/offline-assets/` **不入库**（已加 `.gitignore`；2.2G = deb 455M + wheel 114M +
+  镜像 tar 1.6G，全由 prepare 脚本生成）。仓库只提交**生成脚本与工具包本体**；`.run/.tgz/.tar/.sha256` 同样忽略。
+  远端 `origin = git@github-yhz:TLMOA/AI.git`，分支 `main`（2026-09-19 已推送到 `9d9a760`）
 - 资产：`prepare_offline_assets.sh`（py3.10~3.13 wheel 各一套 + NiFi 镜像 tar ×1.6G）；
   `prepare_sysdeps.sh` + `tools/container_fetch_debs.sh`（sysdeps deb：ubuntu-20.04/22.04/24.04 = 135/108/83 个，419M）；
   `prepare_odbc_assets.sh` + `tools/container_fetch_odbc.sh`（ODBC 闭包：20.04/22.04/24.04 = 35/39/23 个 deb，共 35M）
