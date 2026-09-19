@@ -194,7 +194,9 @@ def _get_all_nifi_db_users() -> List[Dict[str, Any]]:
         engine = _build_engine_from_env()
     except Exception:
         return []
-    candidate_tables = ["iot_users", "users", "user", "accounts", "admin_users", "nifi_users", "account"]
+    # 只为平台真实用户表 iot_users 扫描，避免把 accounts/users 等
+    # 非平台表（测试遗留/重复副本）当作用户拉进内部管理页。
+    candidate_tables = ["iot_users"]
     user_cols = ["username", "user_name", "login", "account", "name"]
     admin_cols = ["is_admin", "isAdmin", "admin", "is_superuser"]
     mode_cols = ["deployment_mode", "deploymentMode"]
@@ -547,24 +549,16 @@ def register(req: LoginReq):
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"无法初始化 NiFi DB 连接: {e}")
 
-        candidate_tables = ["users", "iot_users", "accounts", "account"]
+        # v5: 统一写入 MySQL iot_users（单一用户表），不再散落到 users/accounts 等表
+        candidate_tables = ["iot_users"]
         with engine.begin() as conn:
-            # check if user exists in any candidate table
+            # check if user exists
             for table in candidate_tables:
-                try:
-                    row = conn.execute(sqlalchemy.text(f"SELECT 1 FROM {table} WHERE username = :u LIMIT 1"), {"u": req.username}).fetchone()
-                    if row:
-                        raise HTTPException(status_code=400, detail="用户名已存在")
-                except sqlalchemy.exc.ProgrammingError:
-                    # table might not exist, skip
-                    continue
-                except HTTPException:
-                    raise
-                except Exception:
-                    # other DB error, skip this table
-                    continue
+                row = conn.execute(sqlalchemy.text(f"SELECT 1 FROM {table} WHERE username = :u LIMIT 1"), {"u": req.username}).fetchone()
+                if row:
+                    raise HTTPException(status_code=400, detail="用户名已存在")
 
-            # try to insert into an existing candidate table or create a new one
+            # try to insert into iot_users（不存在则自动建表）
             for table in candidate_tables:
                 try:
                     # ensure table exists with expected columns (safe CREATE IF NOT EXISTS)
@@ -579,11 +573,10 @@ def register(req: LoginReq):
                     return {"success": True, "message": "注册成功", "table": table, "deployment_mode": deployment_mode, "ceph_endpoint": ceph_endpoint}
                 except sqlalchemy.exc.IntegrityError:
                     raise HTTPException(status_code=400, detail="用户名已存在")
-                except Exception:
-                    # try next candidate
-                    continue
+                except Exception as _e:
+                    raise HTTPException(status_code=500, detail=f"在 NiFi DB 中写入用户失败: {_e}")
 
-        raise HTTPException(status_code=500, detail="在 NiFi DB 中写入用户失败")
+        raise HTTPException(status_code=500, detail="在 NiFi DB 中写入用户失败: 未知错误")
 
     # Default: write to local application SQLite
     sess = SessionLocal()

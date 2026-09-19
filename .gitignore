@@ -32,6 +32,8 @@ logs/
 *.tar
 *.tar.gz
 *.tgz
+*.run
+*.sha256
 *.7z
 *.rar
 *.pdf
@@ -59,3 +61,7 @@ out/
 
 # Local scratch files
 ai.txt
+
+# deploy-kit 离线资产：由 prepare_offline_assets.sh / prepare_sysdeps.sh / prepare_odbc_assets.sh 生成
+# （deb 455M + wheel 114M + 镜像 tar 1.6G），仓库只存生成脚本，不存产物
+deploy-kit/offline-assets/

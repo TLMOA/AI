@@ -1,0 +1,20 @@
+[Unit]
+Description=IoT V1 Frontend (serve.py with /api/v1 proxy)
+After=network-online.target iot-backend.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=__APP_USER__
+WorkingDirectory=__CODE_DIR__/v1-frontend
+Environment=V1_BACKEND_HOST=127.0.0.1
+Environment=V1_BACKEND_PORT=__BACKEND_PORT__
+Environment=V1_FRONTEND_HOST=__FRONTEND_BIND__
+Environment=V1_FRONTEND_PORT=__FRONTEND_PORT__
+# 解释器路径由部署时探测得到（不同发行版 python3 不一定在 /usr/bin/python3）
+ExecStart=__PYTHON3__ __CODE_DIR__/v1-frontend/serve.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

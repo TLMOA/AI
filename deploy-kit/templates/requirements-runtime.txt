@@ -1,0 +1,47 @@
+# ============================================================
+# 运行时依赖（完整版）
+#
+# 为什么需要这个文件：
+# v1-backend/requirements.txt 遗漏了多个运行时必需的库，其中
+#   - sqlalchemy / PyJWT 缺失 => 后端直接起不来
+#   - bcrypt       缺失 => 注册时 hash 失败，密码以明文存库（严重）
+#   - cryptography 缺失 => xattr 元数据加密不可用
+#   - APScheduler  缺失 => 定时任务不可用
+# 本清单在已验证环境（Ubuntu + Python3.11）上整理，部署时用它替代原文件。
+# ============================================================
+
+# ---- 原 requirements.txt ----
+fastapi==0.116.1
+uvicorn[standard]==0.35.0
+pydantic==2.11.7
+pymysql==1.1.2
+psycopg2-binary==2.9.10
+pyodbc==5.3.0
+oracledb==3.4.2
+pyhive==0.6.4
+thrift==0.16.0
+hdfs==2.7.3
+happybase==1.2.0
+# 注意：刻意不含 `sasl`。
+#   - `sasl` 是 C 扩展，安装需要 libsasl2-dev + 编译环境，离线机器上会失败
+#   - 已验证本机环境（未装 sasl）运行完全正常
+#   - `thrift-sasl` 依赖 `sasl` 或 `pure-sasl`，用 pure-sasl 即可（纯 Python，无需编译）
+pure-sasl==0.6.2
+thrift-sasl==0.4.3
+
+# ---- 补齐：运行时必需但原文件遗漏 ----
+SQLAlchemy==2.0.48
+PyJWT==2.10.1
+bcrypt==5.0.0
+cryptography==48.0.0
+APScheduler==3.11.1
+# python-multipart：FastAPI 处理 Form/File（文件上传接口）的必需依赖。
+#   它不是 fastapi 的强依赖，装了 fastapi 也不会自动带 ——
+#   缺了后端会在「注册路由」阶段直接崩，报
+#   RuntimeError: Form data requires "python-multipart" to be installed.
+python-multipart==0.0.20
+# tzdata：main.py 里 `ZoneInfo("Asia/Shanghai")` 需要时区数据。
+#   正常情况下用操作系统的 /usr/share/zoneinfo；但精简系统/容器里可能没有，
+#   那样每个请求都会 500（ZoneInfoNotFoundError）。
+#   装上这个纯 Python 包后，zoneinfo 会自动回退到它，与操作系统是否带时区库无关。
+tzdata==2026.3

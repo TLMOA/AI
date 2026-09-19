@@ -1,0 +1,18 @@
+services:
+  iot-nifi:
+    image: iot-nifi-python:latest
+    container_name: iot-nifi
+    restart: unless-stopped
+    ports:
+      - "__NIFI_PORT__:8443"
+    volumes:
+      - __CODE_DIR__/real_nifi_conf:/opt/nifi/nifi-current/conf
+      - __APP_HOME__/real_nifi_data:/opt/nifi/nifi-current/data/iot
+      - __APP_HOME__:__APP_HOME__:rw
+      - /etc/localtime:/etc/localtime:ro
+    environment:
+      - TZ=Asia/Shanghai
+      - NIFI_WEB_HTTPS_PORT=8443
+      # 注意：不要保留上一台机器的 IP，必须为当前站点设置
+      - NIFI_WEB_PROXY_HOST=__NIFI_PROXY_HOST__
+      - NIFI_WEB_PROXY_CONTEXT_PATH=/nifi
